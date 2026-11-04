@@ -1,0 +1,69 @@
+# Model Forge — hackathon scope
+
+**Deadline: 5PM EST, Tue Nov 11, 2026** (Hermes Plugin Hackathon).
+Entry = catalog PR + demo video on X (@NousResearch tag) + form.
+
+Judges score **usefulness, reliability, polish, creativity** and favor
+plugins that do "more than a prompt or a skill could". Model Forge qualifies:
+it manages engine lifecycles and hardware-aware serving — runtime behavior no
+skill can emulate.
+
+## Storyboard (the demo, ~90s)
+
+One gaming PC, no cloud, chained modality unlocks:
+
+1. `model_forge_status` → "you have a 24 GB GPU, here's what runs"
+2. chat model picked → Hermes chats on it
+3. want an image → image model + engine pulled and served → generated
+4. edit it → image-edit model pulled → edited
+5. 3D-print it → Hunyuan3D pulls → GLB out
+6. promo video → i2v model pulls → video out
+7. voice + soundtrack → TTS/voice clone + music/SFX pulls → alive
+
+World model = honest stub slot in the UI ("engine wanted") — show the seam,
+don't fake the capability.
+
+## Build order
+
+- **D0 (done):** repo, plugin skeleton, capability registry (11 modalities),
+  hardware probe, llama.cpp/Ollama/Strata detection, `model_forge_status` +
+  `model_forge_browse` tools, tests.
+- **D1:** Strata adapter full (install hint, `strata launch` orchestration via
+  CLI, connect as provider), Maya adapter (detect + Models-page API).
+- **D2:** model-provider plugin surface: register engine endpoints as Hermes
+  providers (`model_setup_flow`, `model_capabilities`, live `fetch_models`).
+- **D3:** ComfyUI + vLLM-Omni adapters; `model_forge_install` (pull with
+  progress) + `model_forge_activate` (serve + wire) tools.
+- **D4:** image-gen + video-gen provider plugins (OpenAI images API, video job
+  API) so `image_generate`/`video_generate` hit local engines.
+- **D5:** 3D + audio (music/SFX/voice) as custom tools; cockpit desktop pane
+  (engines, models, VRAM, jobs).
+- **D6:** end-to-end rehearsal of the storyboard on real hardware; demo video
+  recording (≤ 90s).
+- **D7 (Nov 11):** catalog PR (`plugin-catalog/model-forge.yaml`, SHA-pinned),
+  `hermes plugins validate` green, form submitted, video posted on X.
+
+## Non-goals for the hackathon
+
+- Multi-host / LAN orchestration (broker territory — future plugin)
+- Rebuilding core's GGUF pricing/catalog (we complement it)
+- World model inference (no local open engine with a stable API yet)
+
+## Submission checklist
+
+- [ ] Public GitHub repo (mirror from Gitea; Gitea stays the dev home)
+- [ ] `hermes plugins validate <path> --install-deps` green
+- [ ] README disclosure lines match reality
+- [ ] plugin-catalog entry: full 40-char SHA pin, quoted version,
+      `requires_hermes` SemVer floor
+- [ ] Demo video ≤ 90s on X tagging @NousResearch
+- [ ] Typeform links submitted
+
+## Risk register
+
+- **Scope:** 6 modalities fully wired beats 12 half-wired. Cut audio before
+  cutting the 3D step (3D-print → video is the memorable beat).
+- **Catalog rules:** engine installs are shell commands — disclose; no
+  bundled binaries (engine installers run from upstream sources, pinned).
+- **GPU contention during demo:** pre-stage the two biggest models before
+  recording; the video shows pulls for the smaller ones.

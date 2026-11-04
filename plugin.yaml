@@ -1,0 +1,12 @@
+name: model-forge
+version: 0.1.0
+description: >-
+  Local models for every modality. Find your GPU, pick a model — chat, vision,
+  image, image edit, video, 3D, music, SFX, voice, OCR — and Model Forge finds
+  the right inference engine, pulls the model, serves it, and wires it into
+  Hermes.
+author: anai (Charles / Pewpy)
+license: MIT
+provides_tools:
+  - model_forge_status
+  - model_forge_browse
