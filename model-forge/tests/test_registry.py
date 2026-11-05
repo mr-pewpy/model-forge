@@ -31,10 +31,12 @@ def test_models_for_filters():
 def test_fit_verdicts():
     big = HardwareProfile(gpus=({"name": "RTX 4090", "vram_gb": 24.0},),
                           total_vram_gb=24.0, ram_gb=64.0, platform="linux")
-    small = HardwareProfile(gpus=(), total_vram_gb=0.0, ram_gb=8.0, platform="linux")
 
     hunyuan = next(m for m in MODELS if m.id == "hunyuan3d-2")
     assert fit_verdict(hunyuan, big) == "fits_gpu"
+    # small real GPU: 4 GB VRAM + 8 GB RAM cannot hold the 5 GB model
+    small = HardwareProfile(gpus=({"name": "GTX 1650", "vram_gb": 4.0},),
+                            total_vram_gb=4.0, ram_gb=8.0, platform="linux")
     assert fit_verdict(hunyuan, small) == "too_big"
 
     flash = next(m for m in MODELS if m.id == "qwen3.8-flash-next")
@@ -48,6 +50,10 @@ def test_fit_verdicts():
     mid = HardwareProfile(gpus=({"name": "GTX 1660", "vram_gb": 6.0},),
                           total_vram_gb=6.0, ram_gb=32.0, platform="linux")
     assert fit_verdict(deepseek, mid) == "fits_memory"
+
+    # no GPU at all: a GPU-bound model must not read as "fits_memory"
+    nogpu = HardwareProfile(gpus=(), total_vram_gb=0.0, ram_gb=64.0, platform="linux")
+    assert fit_verdict(hunyuan, nogpu) == "needs_gpu"
 
 
 def test_strata_launch_cmd():

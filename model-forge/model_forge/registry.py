@@ -292,7 +292,8 @@ def models_for(modality: str | None = None, engine: str | None = None) -> list[M
 
 
 def fit_verdict(m: ModelEntry, hw: HardwareProfile) -> str:
-    """Advisory fit verdict: fits_gpu | fits_memory | too_big | engine_managed | unknown."""
+    """Advisory fit verdict: fits_gpu | fits_memory | needs_gpu | too_big |
+    engine_managed | unknown | unavailable."""
     if m.status == "stub":
         return "unavailable"
     if m.engine_managed_fit:
@@ -301,6 +302,8 @@ def fit_verdict(m: ModelEntry, hw: HardwareProfile) -> str:
         return "unknown"
     if m.vram_gb_min and hw.total_vram_gb >= m.vram_gb_min:
         return "fits_gpu"
+    if m.vram_gb_min and hw.total_vram_gb == 0:
+        return "needs_gpu"
     if m.size_gb <= hw.budget_gb:
         return "fits_memory"
     return "too_big"
