@@ -173,23 +173,37 @@ MODELS: tuple[ModelEntry, ...] = (
         id="qwen-image-2.1",
         name="Qwen-Image 2.1",
         modality="image",
-        engines=("vllm-omni", "comfyui"),
+        engines=("vllm", "comfyui"),
         source="Qwen/Qwen-Image-2.1",
         size_gb=25.0,
         vram_gb_min=20.0,
         status="validated",
-        note="Native 2K, typography, RGBA transparency.",
+        note="Native 2K, typography, RGBA transparency. vLLM form = vLLM-Omni "
+             "(vllm serve <model> --omni); ComfyUI workflow lane also works.",
     ),
     ModelEntry(
         id="qwen-image-2.1-edit",
         name="Qwen-Image 2.1 Edit",
         modality="image_edit",
-        engines=("vllm-omni",),
+        engines=("vllm", "comfyui"),
         source="Qwen/Qwen-Image-2.1",
         size_gb=25.0,
         vram_gb_min=20.0,
         status="validated",
         note="Up to 4 reference images; ordinal <image1>.. phrase binding.",
+    ),
+    ModelEntry(
+        id="flux-2-klein-4b",
+        name="FLUX.2 Klein 4B (edit / outpaint)",
+        modality="image_edit",
+        engines=("sglang", "vllm", "comfyui"),
+        source="black-forest-labs/FLUX.2-klein-4B",
+        size_gb=4.0,
+        vram_gb_min=8.0,
+        status="validated",
+        note="Apache-2.0, edit-native (image+mask inpainting/outpainting). "
+             "SGLang Diffusion: sglang serve --tp-size N --num-gpus N; "
+             "vLLM-Omni has a native FLUX.2-klein inpaint test.",
     ),
     # --- video ---
     ModelEntry(

@@ -1,5 +1,5 @@
 name: model-forge
-version: 0.1.0
+version: 0.2.0
 description: >-
   Local models for every modality. Find your GPU, pick a model — chat, vision,
   image, image edit, video, 3D, music, SFX, voice, OCR — and Model Forge finds
@@ -7,6 +7,21 @@ description: >-
   Hermes.
 author: anai (Charles / Pewpy)
 license: MIT
+config_schema:
+  hf_token:
+    type: secret
+    env: HF_TOKEN
+    label: "Hugging Face token"
+    description: >-
+      Optional. Authenticated pulls from huggingface.co — unlocks gated repos
+      and full-speed downloads. Sent only to huggingface.co hosts.
+  modelscope_token:
+    type: secret
+    env: MODELSCOPE_API_TOKEN
+    label: "ModelScope token"
+    description: >-
+      Optional. Authenticated pulls from ModelScope mirrors. Sent only to
+      modelscope.cn hosts.
 provides_tools:
   - model_forge_status
   - model_forge_browse

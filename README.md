@@ -51,8 +51,10 @@ desktop pane land in the next milestones — see [SCOPE.md](SCOPE.md).
 | Ollama | chat, vision, ocr | adapter done |
 | Strata | chat, vision (125B MoE on consumer GPUs) | adapter done (detect + `strata launch`) |
 | Project Maya | chat, vision, ocr (321B–748B MoE, 1–16 GPUs) | adapter done (detect + Models-page API) |
-| vLLM / vLLM-Omni | vision, ocr, image, image_edit | adapter next |
-| ComfyUI | image, video, 3d | adapter next |
+| vLLM / vLLM-Omni | chat, vision, ocr, image, image_edit | adapter done (detect + omni route probe) |
+| SGLang / SGLang Diffusion | chat, vision, image, image_edit | adapter done (detect + diffusion route probe) |
+| ComfyUI | image, image_edit, video, 3d | adapter done (detect) |
+| Any OpenAI-compatible endpoint | chat, vision, ocr, image | generic detector (never mislabels the engine) |
 | Python engines (ACE-Step, Chatterbox, AudioGen, MusicGen) | music, sfx, voice_clone | adapter next |
 
 GGUF chat models are served by Hermes' core Local Models catalog — Model Forge
@@ -65,18 +67,35 @@ registers `strata` and `maya` as first-class Hermes model providers (keyless,
 local — the LM Studio profile pattern), so `hermes model` / `--provider strata`
 can run Hermes directly on those engines.
 
+## Pull credentials (Hugging Face / ModelScope)
+
+**Settings → Plugins → Model Forge** has two optional masked fields:
+
+- **Hugging Face token** (`HF_TOKEN`) — unlocks gated repos, full-speed pulls
+- **ModelScope token** (`MODELSCOPE_API_TOKEN`) — authenticated mirror pulls
+
+Both are optional; without them everything public still works. Tokens are
+stored through Hermes' credential route (never in config files), read only
+via the secret scope, and sent **only** to their own host family
+(`huggingface.co` / `modelscope.cn` — enforced in code, unit-tested).
+`model_forge_status` reports which tokens are configured (booleans only).
+
 ## Disclosure (what this plugin does on your machine)
 
-- **Network:** probes `127.0.0.1` engine endpoints (llama-server `/props`,
-  Ollama `/api/tags`, Strata `/v1/models`) — local only, no external calls
-  from the plugin itself. Model downloads are performed by the engines' own
-  tooling when you ask for them.
+- **Network:** probes compute-target engine endpoints (llama-server `/props`,
+  Ollama `/api/tags`, Maya `/api/catalog`, ComfyUI `/system_stats`, vLLM
+  `/version`, SGLang `/get_model_info`, OpenAI-compatible `/v1/models` +
+  image-route existence) — engine APIs only, no external calls from the
+  plugin itself. Model downloads are performed by the engines' own tooling
+  when you ask for them. If pull credentials are configured, they are sent
+  only to `huggingface.co` / `modelscope.cn` hosts.
 - **Shell:** runs `nvidia-smi` (read-only GPU query) and checks `PATH` for
   engine CLIs (`strata`, later `maya`, `comfyui`). Future install/serve tools
   will run engine-provided installers/launchers and will say so here first.
 - **Files:** reads no files outside its own plugin data dir today.
-- **Credentials:** none required. Secrets (if ever needed for remote engines)
-  go through Hermes `requires_env` / secret scope only.
+- **Credentials:** none required. HF/ModelScope tokens are optional, stored
+  through Hermes' credential route (`Settings → Plugins`), read only via the
+  secret scope.
 - **Telemetry:** none.
 
 ## Requirements

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 
+from .credentials import status as credentials_status
 from .engines import detect_engines
 from .engines import maya as maya_adapter
 from .engines import strata as strata_adapter
@@ -149,7 +150,8 @@ def model_forge_status(args: dict | None = None, **kwargs) -> str:
                     for e in detect_engines("" if t.kind == "local" else t.base_url)
                 ],
             })
-        return _dump({"targets": targets_out})
+        return _dump({"targets": targets_out,
+                      "pull_credentials": credentials_status()})
     except Exception as exc:
         return _err(exc)
 

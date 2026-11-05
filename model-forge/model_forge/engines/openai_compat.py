@@ -14,7 +14,7 @@ import json
 import urllib.error
 import urllib.request
 
-from .base import EngineStatus, root_url
+from .base import EngineStatus, route_exists, root_url
 
 _TIMEOUT_S = 2.0
 
@@ -36,6 +36,9 @@ def detect(base_url: str = "") -> EngineStatus:
     root = root_url(base_url)
     models = served_models(base_url)
     if models:
+        modalities = ["chat", "vision", "ocr"]
+        if route_exists(root, "/v1/images/generations"):
+            modalities += ["image", "image_edit"]
         return EngineStatus(
             id="openai-compatible",
             display_name="OpenAI-compatible endpoint",
@@ -43,7 +46,7 @@ def detect(base_url: str = "") -> EngineStatus:
             endpoint=root,
             detail=f"serving {', '.join(models)} — engine identity unknown; "
                    "could be vLLM, Strata, llama-swap, a broker, ...",
-            modalities=("chat", "vision", "ocr"),
+            modalities=tuple(modalities),
             models_loaded=tuple(m for m in models if m),
         )
     return EngineStatus(

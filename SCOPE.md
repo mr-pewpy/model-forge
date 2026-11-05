@@ -33,12 +33,17 @@ don't fake the capability.
   pull/pull_status/cancel/delete), `models_loaded` surfaced in status,
   `model-forge-providers` package (strata + maya as keyless local Hermes
   providers, LM Studio profile pattern).
-- **D2:** provider polish: model-setup flow, live model listing when engines
-  are up, capability metadata per served model.
-- **D3:** ComfyUI + vLLM-Omni adapters; `model_forge_install` (pull with
-  progress) + `model_forge_activate` (serve + wire) tools.
-- **D4:** image-gen + video-gen provider plugins (OpenAI images API, video job
-  API) so `image_generate`/`video_generate` hit local engines.
+- **D2 (done):** compute targets (local/lan/cloud) with declared budgets,
+  target-aware status/browse, `model_forge_target_add`; keyless local
+  providers (strata, maya).
+- **D3 (done):** engine adapters v2 — ComfyUI, vLLM(-Omni via images-route
+  probe), SGLang(+Diffusion probe), honest generic OpenAI-compatible
+  detector; `model_forge_install` + `model_forge_activate` (plan-only unless
+  apply=true); HF/ModelScope pull credentials via Desktop Settings →
+  Plugins (secret-scope backed, host-scoped in code).
+- **D4:** install orchestration depth: ComfyUI/vLLM/SGLang pulls, download
+  progress jobs; image-gen + video-gen provider plugins (OpenAI images API,
+  video job API) so `image_generate`/`video_generate` hit local engines.
 - **D5:** 3D + audio (music/SFX/voice) as custom tools; cockpit desktop pane
   (engines, models, VRAM, jobs).
 - **D6:** end-to-end rehearsal of the storyboard on real hardware; demo video
