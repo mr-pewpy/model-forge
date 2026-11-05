@@ -39,6 +39,8 @@ def detect(base_url: str = "") -> EngineStatus:
         modalities = ["chat", "vision", "ocr"]
         if route_exists(root, "/v1/images/generations"):
             modalities += ["image", "image_edit"]
+        if route_exists(root, "/v1/videos"):
+            modalities += ["video"]
         return EngineStatus(
             id="openai-compatible",
             display_name="OpenAI-compatible endpoint",

@@ -41,9 +41,12 @@ don't fake the capability.
   detector; `model_forge_install` + `model_forge_activate` (plan-only unless
   apply=true); HF/ModelScope pull credentials via Desktop Settings →
   Plugins (secret-scope backed, host-scoped in code).
-- **D4:** install orchestration depth: ComfyUI/vLLM/SGLang pulls, download
-  progress jobs; image-gen + video-gen provider plugins (OpenAI images API,
-  video job API) so `image_generate`/`video_generate` hit local engines.
+- **D4 (done):** image-gen + video-gen provider packages (any OpenAI-
+  compatible images API / video job API; Settings → Plugins endpoint
+  fields); pull depth — credential-aware streaming downloader with resume +
+  progress jobs (`job_id` polling), local file pulls + run-on-target
+  instructions for remote; activate emits media_setup wiring commands;
+  video-route probing on generic endpoints.
 - **D5:** 3D + audio (music/SFX/voice) as custom tools; cockpit desktop pane
   (engines, models, VRAM, jobs).
 - **D6:** end-to-end rehearsal of the storyboard on real hardware; demo video

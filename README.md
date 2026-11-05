@@ -60,12 +60,20 @@ desktop pane land in the next milestones — see [SCOPE.md](SCOPE.md).
 GGUF chat models are served by Hermes' core Local Models catalog — Model Forge
 never duplicates that pricing; it complements it.
 
-## Bundled provider plugin
+## Bundled provider plugins
 
-This repo also ships **`model-forge-providers/`** (`kind: model-provider`):
-registers `strata` and `maya` as first-class Hermes model providers (keyless,
-local — the LM Studio profile pattern), so `hermes model` / `--provider strata`
-can run Hermes directly on those engines.
+This repo also ships three provider packages:
+
+- **`model-forge-providers/`** (`kind: model-provider`): registers `strata`
+  and `maya` as first-class Hermes model providers (keyless, local — the LM
+  Studio profile pattern), so `hermes model` / `--provider strata` can run
+  Hermes directly on those engines.
+- **`model-forge-image/`** (`kind: backend`): routes `image_generate` to ANY
+  OpenAI-compatible images API (weights broker, vLLM-Omni, SGLang Diffusion)
+  — endpoint via **Settings → Plugins** or `MODEL_FORGE_IMAGE_BASE_URL`.
+- **`model-forge-video/`** (`kind: backend`): routes `video_generate` to any
+  OpenAI video job API — endpoint via **Settings → Plugins** or
+  `MODEL_FORGE_VIDEO_BASE_URL`.
 
 ## Pull credentials (Hugging Face / ModelScope)
 

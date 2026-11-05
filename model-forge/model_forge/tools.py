@@ -82,6 +82,28 @@ def install_plan(entry: ModelEntry, target: ComputeTarget,
                 "command": strata_adapter.launch_cmd(family, pack),
                 "detail": f"run this ON {target.label} ({target.base_url}); "
                           "add --plan first to see the memory plan"}
+    if engine in ("comfyui", "vllm", "sglang", "python"):
+        if target.kind == "local" and entry.source:
+            if not engine_model:
+                return {"ok": False, "action": "needs_engine_model",
+                        "detail": "pass engine_model=<file path inside the "
+                                  "source repo> (e.g. model.safetensors), "
+                                  "and optionally dest=<absolute path>"}
+            fname = engine_model.rstrip("/").rsplit("/", 1)[-1]
+            return {"ok": True, "action": "hf_download",
+                    "url": f"https://huggingface.co/{entry.source}"
+                           f"/resolve/main/{engine_model}",
+                    "dest_default": f"downloads/{entry.id}/{fname}",
+                    "detail": "plugin-side download with a progress job "
+                              "(credentials applied per host); pass dest to "
+                              "land in an engine models dir directly, then "
+                              "link/move into the right subdir "
+                              "(ComfyUI: models/diffusion_models etc.)"}
+        return {"ok": True, "action": "run_on_target",
+                "command": ["hf", "download", entry.source, engine_model or
+                            "--include", "*"],
+                "detail": f"run on {target.label} and place the files in the "
+                          f"engine's models dir there; source: {entry.source}"}
     return {"ok": False, "action": "adapter_pending",
             "detail": f"engine '{engine}' install orchestration lands with "
                       "its adapter; model source: " + entry.source}
@@ -227,9 +249,13 @@ def model_forge_target_add(args: dict | None = None, **kwargs) -> str:
 
 
 def model_forge_install(args: dict | None = None, **kwargs) -> str:
-    """Pull a model on a compute target (Maya: HTTP pull; Strata: CLI)."""
+    """Pull a model on a compute target (Maya: HTTP pull; HF download: job;
+    Strata: CLI). Pass job_id to poll a download."""
     args = args or {}
     try:
+        from . import pull
+        if args.get("job_id"):
+            return _dump(pull.job_status(str(args["job_id"])))
         entry = next((m for m in models_for()
                       if m.id == args.get("model_id")), None)
         if entry is None:
@@ -249,6 +275,16 @@ def model_forge_install(args: dict | None = None, **kwargs) -> str:
                                  "on that target?")
             else:
                 plan["pull_response"] = result
+        elif plan.get("action") == "hf_download":
+            dest = str(args.get("dest") or "")
+            if not dest:
+                from plugins.plugin_storage import plugin_data_dir
+                dest = str(plugin_data_dir("model-forge")
+                           / plan["dest_default"])
+            started = pull.start_download(plan["url"], dest,
+                                          sha256=str(args.get("sha256", "")))
+            plan.update(started)
+            plan["dest"] = dest
         return _dump(plan)
     except Exception as exc:
         return _err(exc)
@@ -269,9 +305,26 @@ def model_forge_activate(args: dict | None = None, **kwargs) -> str:
         if target is None:
             return _dump({"error": f"unknown target: {args.get('target')}"})
         base = "" if target.kind == "local" else target.base_url
-        available = [e.id for e in detect_engines(base) if e.available]
+        statuses = detect_engines(base)
+        available = [e.id for e in statuses if e.available]
         plan = activation_plan(entry, target, available,
                                engine_model=str(args.get("engine_model", "")))
+        if plan.get("ok"):
+            mods = {m for e in statuses if e.available for m in e.modalities}
+            base_v1 = root_url(target.base_url) + "/v1"
+            media = {}
+            if "image" in mods:
+                media["image_gen"] = (
+                    "hermes config set plugins.entries.model-forge-image"
+                    f".settings.base_url {base_v1} && hermes config set "
+                    "image_gen.provider model-forge")
+            if "video" in mods:
+                media["video_gen"] = (
+                    "hermes config set plugins.entries.model-forge-video"
+                    f".settings.base_url {base_v1} && hermes config set "
+                    "video_gen.provider model-forge")
+            if media:
+                plan["media_setup"] = media
         if plan.get("ok") and args.get("apply") is True:
             try:
                 from hermes_cli.model_setup import persist_model_selection

@@ -55,12 +55,46 @@ def test_install_plan_strata():
     assert plan["ok"] is False and plan["action"] == "needs_engine_model"
 
 
+def test_install_plan_file_pull():
+    from model_forge.pull import download_plan
+
+    # local target + diffusion engine + repo file -> plugin-side download
+    plan = install_plan(_entry("hunyuan3d-2"), _LOCAL,
+                        engine_model="checkpoints/hunyuan3d-dit-v2_fp16.safetensors")
+    assert plan["ok"] is True and plan["action"] == "hf_download"
+    assert plan["url"] == ("https://huggingface.co/"
+                           "Comfy-Org/hunyuan3D_2.0_repackaged/resolve/main/"
+                           "checkpoints/hunyuan3d-dit-v2_fp16.safetensors")
+    assert plan["dest_default"].endswith("hunyuan3d-dit-v2_fp16.safetensors")
+    # without a file path it asks instead of guessing
+    assert install_plan(_entry("hunyuan3d-2"), _LOCAL)["action"] \
+        == "needs_engine_model"
+    # remote target -> run-on-target instructions
+    plan = install_plan(_entry("hunyuan3d-2"), _LXC,
+                        engine_model="checkpoints/x.safetensors")
+    assert plan["ok"] is True and plan["action"] == "run_on_target"
+    # download_plan validation (pure)
+    ok = download_plan("https://huggingface.co/x/resolve/main/y.bin",
+                       "/tmp/y.bin")
+    assert ok["ok"] is True
+    assert download_plan("ftp://x/y", "/tmp/y")["ok"] is False
+    assert download_plan("https://x/y", "relative/path")["ok"] is False
+
+
 def test_install_plan_edges():
+    from model_forge.registry import ModelEntry
+
     assert install_plan(_entry("core-gguf-catalog"), _LOCAL)["action"] \
         == "use_core_local_models"
     assert install_plan(_entry("world-model-slot"), _LOCAL)["action"] \
         == "unavailable"
-    pending = install_plan(_entry("hunyuan3d-2"), _LXC)
+    # remote diffusion target without a file path -> run-on-target help
+    plan = install_plan(_entry("hunyuan3d-2"), _LXC)
+    assert plan["ok"] is True and plan["action"] == "run_on_target"
+    # unknown engine family still falls through to adapter_pending
+    weird = ModelEntry(id="weird", name="Weird", modality="chat",
+                       engines=("weird-engine",), source="x/y")
+    pending = install_plan(weird, _LXC)
     assert pending["ok"] is False and pending["action"] == "adapter_pending"
 
 

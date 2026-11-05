@@ -115,7 +115,8 @@ INSTALL = {
         "properties": {
             "model_id": {
                 "type": "string",
-                "description": "Registry model id from model_forge_browse.",
+                "description": "Registry model id from model_forge_browse "
+                               "(required unless polling with job_id).",
             },
             "target": {
                 "type": "string",
@@ -125,12 +126,28 @@ INSTALL = {
                 "type": "string",
                 "description": (
                     "Engine-native model id when the registry has none: a "
-                    "Maya setup id (e.g. glm-maya-s) or, for Strata, "
-                    "<family>:<pack> (e.g. deepseek41:ist-das-2.00bpw)."
+                    "Maya setup id (e.g. glm-maya-s), for Strata "
+                    "<family>:<pack> (e.g. deepseek41:ist-das-2.00bpw), or "
+                    "for engine file pulls the file path inside the source "
+                    "repo (e.g. model.safetensors)."
                 ),
             },
+            "dest": {
+                "type": "string",
+                "description": "Absolute destination path for a file download "
+                               "(default: the plugin's downloads dir).",
+            },
+            "sha256": {
+                "type": "string",
+                "description": "Optional sha256 to verify a downloaded file.",
+            },
+            "job_id": {
+                "type": "string",
+                "description": "Poll a running download job instead of "
+                               "starting an install.",
+            },
         },
-        "required": ["model_id"],
+        "required": [],
     },
 }
 
