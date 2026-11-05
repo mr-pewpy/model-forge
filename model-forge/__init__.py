@@ -23,3 +23,21 @@ def register(ctx):
         schema=schemas.BROWSE,
         handler=tools.model_forge_browse,
     )
+    ctx.register_tool(
+        name="model_forge_target_add",
+        toolset="model_forge",
+        schema=schemas.TARGET_ADD,
+        handler=tools.model_forge_target_add,
+    )
+    ctx.register_tool(
+        name="model_forge_install",
+        toolset="model_forge",
+        schema=schemas.INSTALL,
+        handler=tools.model_forge_install,
+    )
+    ctx.register_tool(
+        name="model_forge_activate",
+        toolset="model_forge",
+        schema=schemas.ACTIVATE,
+        handler=tools.model_forge_activate,
+    )

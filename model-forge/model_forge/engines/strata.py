@@ -13,15 +13,16 @@ import shutil
 import urllib.error
 import urllib.request
 
-from .base import EngineStatus
+from .base import EngineStatus, root_url
 
-ENDPOINT = "http://127.0.0.1:8080/v1/models"
+DEFAULT_ROOT = "http://127.0.0.1:8080"
 _TIMEOUT_S = 2.0
 
 
-def served_models() -> list[str]:
+def served_models(base_url: str = "") -> list[str]:
+    root = root_url(base_url) or DEFAULT_ROOT
     try:
-        with urllib.request.urlopen(ENDPOINT, timeout=_TIMEOUT_S) as resp:
+        with urllib.request.urlopen(f"{root}/v1/models", timeout=_TIMEOUT_S) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
         return [m.get("id", "") for m in data.get("data", [])][:5]
     except (urllib.error.URLError, OSError, ValueError):
@@ -39,15 +40,29 @@ def launch_cmd(family: str, model: str, plan_only: bool = False) -> list[str]:
     return cmd
 
 
-def detect() -> EngineStatus:
+def detect(base_url: str = "") -> EngineStatus:
     cli = shutil.which("strata")
-    models = served_models()
+    local = not base_url
+    root = root_url(base_url) or DEFAULT_ROOT
+    if not local:
+        # Remote: /v1/models is served by many engines — never claim "Strata"
+        # from it (openai_compat covers the endpoint generically).
+        return EngineStatus(
+            id="strata",
+            display_name="Strata",
+            available=False,
+            detail=f"Strata is identified on the local machine only (via its "
+                   f"CLI); {root} shows up as a generic openai-compatible "
+                   "endpoint if it answers /v1/models",
+            modalities=("chat", "vision"),
+        )
+    models = served_models(base_url)
     if models:
         return EngineStatus(
             id="strata",
             display_name="Strata",
             available=True,
-            endpoint="http://127.0.0.1:8080",
+            endpoint=root,
             detail=f"serving {', '.join(models)}"
                    + ("" if cli else " (CLI not on PATH)"),
             modalities=("chat", "vision"),

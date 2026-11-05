@@ -54,6 +54,7 @@ class ModelEntry:
     engine_managed_fit: bool = False  # engine sizes itself (Strata/Maya style)
     status: str = "known"           # validated | known | stub
     note: str = ""
+    engine_models: dict = field(default_factory=dict)  # engine id -> engine-native model id
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,33 @@ MODELS: tuple[ModelEntry, ...] = (
         note="Strata streams experts RAM->GPU; 12 GB VRAM cards work as hot cache.",
     ),
     ModelEntry(
+        id="deepseek-v4.1-flash",
+        name="DeepSeek-V4.1-Flash-1017 (748B MoE)",
+        modality="chat",
+        engines=("strata", "maya"),
+        source="deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        size_gb=277.0,
+        ram_gb_min=64.0,
+        engine_managed_fit=True,
+        status="known",
+        note="Maya tiers run it from 128 GB machines upward; Strata on PC/Mac.",
+        engine_models={"maya": "deepseek-maya-s"},
+    ),
+    ModelEntry(
+        id="minimax-m3.1-flash",
+        name="MiniMax-M3.1-Flash (428B MoE)",
+        modality="chat",
+        engines=("maya",),
+        source="MiniMaxAI/MiniMax-M3.1-Flash",
+        size_gb=93.0,
+        ram_gb_min=64.0,
+        engine_managed_fit=True,
+        status="known",
+        note="Maya-XS fits a 128 GB machine; vision + thinking levels; "
+             "MiniMax Community License (check commercial terms).",
+        engine_models={"maya": "minimax-maya-xs"},
+    ),
+    ModelEntry(
         id="glm-5.3-flash",
         name="GLM-5.3 Flash (321B MoE)",
         modality="chat",
@@ -104,6 +132,7 @@ MODELS: tuple[ModelEntry, ...] = (
         engine_managed_fit=True,
         status="known",
         note="Maya tiers (XS..L) self-select from your memory pool; vision capable.",
+        engine_models={"maya": "glm-maya-s"},
     ),
     # --- vision / ocr ---
     ModelEntry(

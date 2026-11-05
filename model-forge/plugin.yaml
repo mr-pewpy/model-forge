@@ -10,3 +10,6 @@ license: MIT
 provides_tools:
   - model_forge_status
   - model_forge_browse
+  - model_forge_target_add
+  - model_forge_install
+  - model_forge_activate
