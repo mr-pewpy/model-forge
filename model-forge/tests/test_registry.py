@@ -48,3 +48,25 @@ def test_fit_verdicts():
     mid = HardwareProfile(gpus=({"name": "GTX 1660", "vram_gb": 6.0},),
                           total_vram_gb=6.0, ram_gb=32.0, platform="linux")
     assert fit_verdict(deepseek, mid) == "fits_memory"
+
+
+def test_strata_launch_cmd():
+    from model_forge.engines import strata as strata_adapter
+
+    cmd = strata_adapter.launch_cmd("deepseek41", "ist-das-2.00bpw", plan_only=True)
+    assert cmd == ["strata", "launch", "--family", "deepseek41",
+                   "--model", "ist-das-2.00bpw", "--plan"]
+    assert strata_adapter.launch_cmd("qwen38", "pack") == [
+        "strata", "launch", "--family", "qwen38", "--model", "pack"]
+    try:
+        strata_adapter.launch_cmd("", "pack")
+        assert False, "empty family must raise"
+    except ValueError:
+        pass
+
+
+def test_engine_status_defaults():
+    from model_forge.engines.base import EngineStatus
+
+    e = EngineStatus(id="x", display_name="X", available=False)
+    assert e.models_loaded == () and e.modalities == ()

@@ -35,6 +35,7 @@ def model_forge_status(args: dict | None = None, **kwargs) -> str:
                     "endpoint": e.endpoint,
                     "detail": e.detail,
                     "modalities": list(e.modalities),
+                    "models_loaded": list(e.models_loaded),
                 }
                 for e in engines
             ],

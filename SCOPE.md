@@ -28,10 +28,13 @@ don't fake the capability.
 - **D0 (done):** repo, plugin skeleton, capability registry (11 modalities),
   hardware probe, llama.cpp/Ollama/Strata detection, `model_forge_status` +
   `model_forge_browse` tools, tests.
-- **D1:** Strata adapter full (install hint, `strata launch` orchestration via
-  CLI, connect as provider), Maya adapter (detect + Models-page API).
-- **D2:** model-provider plugin surface: register engine endpoints as Hermes
-  providers (`model_setup_flow`, `model_capabilities`, live `fetch_models`).
+- **D1 (done):** Strata adapter full (detect + `strata launch` argv builder),
+  Maya adapter (detect via /api/catalog + Models-page API: catalog/loaded/
+  pull/pull_status/cancel/delete), `models_loaded` surfaced in status,
+  `model-forge-providers` package (strata + maya as keyless local Hermes
+  providers, LM Studio profile pattern).
+- **D2:** provider polish: model-setup flow, live model listing when engines
+  are up, capability metadata per served model.
 - **D3:** ComfyUI + vLLM-Omni adapters; `model_forge_install` (pull with
   progress) + `model_forge_activate` (serve + wire) tools.
 - **D4:** image-gen + video-gen provider plugins (OpenAI images API, video job

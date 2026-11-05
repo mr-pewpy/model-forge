@@ -1,0 +1,6 @@
+name: model-forge-providers
+kind: model-provider
+version: 0.1.0
+description: Local engine providers for Model Forge (Strata, Project Maya) — run Hermes on local MoE engines
+author: anai (Charles / Pewpy)
+license: MIT

@@ -37,6 +37,7 @@ def detect() -> EngineStatus:
                 endpoint=f"http://127.0.0.1:{port}",
                 detail=f"serving {model}" if model else "running",
                 modalities=("chat", "vision"),
+                models_loaded=(model,) if model else (),
             )
         tags = _get_json(f"http://127.0.0.1:{port}/api/tags")
         if isinstance(tags, dict) and "models" in tags:
@@ -48,6 +49,7 @@ def detect() -> EngineStatus:
                 endpoint=f"http://127.0.0.1:{port}",
                 detail=f"models: {', '.join(names)}" if names else "running",
                 modalities=("chat", "vision", "ocr"),
+                models_loaded=tuple(n for n in names if n),
             )
     return EngineStatus(
         id="llamacpp",

@@ -13,3 +13,4 @@ class EngineStatus:
     endpoint: str = ""
     detail: str = ""
     modalities: tuple[str, ...] = ()
+    models_loaded: tuple[str, ...] = ()

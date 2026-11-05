@@ -10,7 +10,7 @@ internals.
 from __future__ import annotations
 
 from .base import EngineStatus
-from . import llamacpp, strata
+from . import llamacpp, maya, strata
 
 __all__ = ["EngineStatus", "detect_engines"]
 
@@ -18,7 +18,7 @@ __all__ = ["EngineStatus", "detect_engines"]
 def detect_engines() -> list[EngineStatus]:
     """Probe every adapter; never raises."""
     out = []
-    for detect in (llamacpp.detect, strata.detect):
+    for detect in (llamacpp.detect, strata.detect, maya.detect):
         try:
             out.append(detect())
         except Exception as exc:  # a broken probe must not sink the tool call

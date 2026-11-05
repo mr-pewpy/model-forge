@@ -47,16 +47,23 @@ desktop pane land in the next milestones — see [SCOPE.md](SCOPE.md).
 
 | Engine | Modalities | Status |
 |--------|-----------|--------|
-| llama.cpp / llama-server (incl. Hermes' managed runtime) | chat, vision | detection done |
-| Ollama | chat, vision, ocr | detection done |
-| Strata | chat, vision (125B MoE on consumer GPUs) | detection done |
-| Project Maya | chat, vision (321B–748B MoE, 1–16 GPUs) | adapter next |
+| llama.cpp / llama-server (incl. Hermes' managed runtime) | chat, vision | adapter done |
+| Ollama | chat, vision, ocr | adapter done |
+| Strata | chat, vision (125B MoE on consumer GPUs) | adapter done (detect + `strata launch`) |
+| Project Maya | chat, vision, ocr (321B–748B MoE, 1–16 GPUs) | adapter done (detect + Models-page API) |
 | vLLM / vLLM-Omni | vision, ocr, image, image_edit | adapter next |
 | ComfyUI | image, video, 3d | adapter next |
 | Python engines (ACE-Step, Chatterbox, AudioGen, MusicGen) | music, sfx, voice_clone | adapter next |
 
 GGUF chat models are served by Hermes' core Local Models catalog — Model Forge
 never duplicates that pricing; it complements it.
+
+## Bundled provider plugin
+
+This repo also ships **`model-forge-providers/`** (`kind: model-provider`):
+registers `strata` and `maya` as first-class Hermes model providers (keyless,
+local — the LM Studio profile pattern), so `hermes model` / `--provider strata`
+can run Hermes directly on those engines.
 
 ## Disclosure (what this plugin does on your machine)
 
@@ -87,10 +94,16 @@ hermes plugins install <this repo>
 
 ## Development
 
+The repo holds two installable packages: `model-forge/` (general plugin,
+tools) and `model-forge-providers/` (`kind: model-provider`).
+
 ```bash
+cd model-forge          # the tools plugin
 hermes plugins doctor . --ci        # load-test in isolation
-hermes plugins validate . --install-deps   # the catalog CI check
-python -m pytest tests/ -q          # registry + fit tests
+hermes plugins validate .           # the catalog CI check
+python3 tests/run.py                # registry + adapter tests (stdlib runner)
+cd ../model-forge-providers
+hermes plugins doctor . --ci && hermes plugins validate .
 ```
 
 MIT license. Built by [anai](https://anaisoftware.com).
