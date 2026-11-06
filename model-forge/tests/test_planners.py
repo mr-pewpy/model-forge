@@ -81,6 +81,17 @@ def test_install_plan_file_pull():
     assert download_plan("https://x/y", "relative/path")["ok"] is False
 
 
+def test_media_plan():
+    from model_forge.media import media_plan
+
+    plan = media_plan("3d", "http://192.168.1.62:8080/v1")
+    # route probe is real network here; on a powered-off target it must fail
+    # closed with route_missing or no_endpoint — never crash:
+    assert plan["action"] in ("submit_job", "route_missing")
+    assert media_plan("music", "")["action"] == "no_endpoint"
+    assert media_plan("world_model", "http://x:1")["action"] == "unknown_modality"
+
+
 def test_install_plan_edges():
     from model_forge.registry import ModelEntry
 

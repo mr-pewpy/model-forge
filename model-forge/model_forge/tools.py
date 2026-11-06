@@ -14,6 +14,7 @@ from .engines import maya as maya_adapter
 from .engines import strata as strata_adapter
 from .engines.base import root_url
 from .hardware import probe_hardware
+from .media import media_plan
 from .registry import MODALITY_LABELS, ModelEntry, fit_verdict, models_for
 from .targets import ComputeTarget, add_target, get_target, load_targets
 
@@ -342,3 +343,82 @@ def model_forge_activate(args: dict | None = None, **kwargs) -> str:
         return _dump(plan)
     except Exception as exc:
         return _err(exc)
+
+
+def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
+    """Generate 3D models / music / SFX through a compute target's engine
+    API. 3d submits a job (poll with job_id); music/sfx return audio."""
+    args = args or {}
+    try:
+        import json as _json
+        import urllib.request
+        modality = str(args.get("modality", ""))
+        target = get_target(args.get("target"))
+        if target is None:
+            return _dump({"error": f"unknown target: {args.get('target')}"})
+        plan = media_plan(modality, target.base_url)
+        if not plan.get("ok"):
+            return _dump(plan)
+        root = root_url(target.base_url)
+        if modality == "3d":
+            if args.get("job_id"):
+                req = urllib.request.Request(
+                    f"{root}/jobs/{args['job_id']}")
+                with urllib.request.urlopen(req, timeout=30.0) as resp:
+                    return _dump({"job": _json.loads(
+                        resp.read().decode("utf-8", "replace"))})
+            model = str(args.get("model", "")).strip()
+            image = str(args.get("image", "")).strip()
+            if not model or not image:
+                return _dump({"ok": False, "action": "needs_args",
+                              "detail": "3d needs model (e.g. gen/3d) and "
+                                        "image (URL or local file path)"})
+            body = {"model": model, "image": _as_data_url(image)}
+            if args.get("prompt"):
+                body["prompt"] = str(args["prompt"])
+            req = urllib.request.Request(
+                plan["submit"], data=_json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=60.0) as resp:
+                    out = _json.loads(resp.read().decode("utf-8", "replace"))
+            except Exception as exc:  # noqa: BLE001
+                return _dump({"ok": False, "action": "submit_failed",
+                              "error": f"{type(exc).__name__}: {exc}"})
+            return _dump({"ok": True, "action": "submitted",
+                          "submitted": out,
+                          "poll": f"model_forge_generate_media with "
+                                  f"modality=3d, target={target.id}, "
+                                  f"job_id={out.get('id', '')}"})
+        # music / sfx: sync POST returning audio
+        model = str(args.get("model", "")).strip()
+        prompt = str(args.get("prompt", "")).strip()
+        if not model or not prompt:
+            return _dump({"ok": False, "action": "needs_args",
+                          "detail": f"{modality} needs model and prompt"})
+        body = {"model": model, "prompt": prompt}
+        req = urllib.request.Request(
+            plan["submit"], data=_json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=600.0) as resp:
+                out = _json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception as exc:  # noqa: BLE001
+            return _dump({"ok": False, "action": "submit_failed",
+                          "error": f"{type(exc).__name__}: {exc}"})
+        return _dump({"ok": True, "action": "done", "result": out})
+    except Exception as exc:
+        return _err(exc)
+
+
+def _as_data_url(value: str) -> str:
+    """Local image path -> data: URL (engines on other hosts need bytes)."""
+    if value.startswith(("data:", "http://", "https://")):
+        return value
+    import base64
+    from pathlib import Path
+    p = Path(value)
+    if not p.exists():
+        return value
+    mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
+    return f"data:{mime};base64," + base64.b64encode(p.read_bytes()).decode()

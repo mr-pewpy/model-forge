@@ -47,15 +47,43 @@ def _store_path(base_dir: Path | None) -> Path:
 
 
 def load_targets(base_dir: Path | None = None) -> list[ComputeTarget]:
-    """Always contains the local target first; never raises."""
+    """Always contains the local target first; never raises. Desktop settings
+    (config_schema targets_json) merge in — they win on id conflicts, so the
+    Desktop JSON editor and the target_add tool share one list."""
     try:
         raw = json.loads(_store_path(base_dir).read_text(encoding="utf-8"))
         targets = [ComputeTarget(**t) for t in raw if t.get("id")]
     except (OSError, ValueError, TypeError):
         targets = []
+    for t in _settings_targets():
+        targets = [x for x in targets if x.id != t.id]
+        targets.append(t)
     if not any(t.id == LOCAL_ID for t in targets):
         targets.insert(0, default_local())
     return targets
+
+
+def _settings_targets() -> list[ComputeTarget]:
+    """Targets declared in Desktop settings (config_schema targets_json)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        entries = (cfg.get("plugins") or {}).get("entries") or {}
+        settings = (entries.get("model-forge") or {}).get("settings") or {}
+        rows = settings.get("targets_json") or []
+        out = []
+        for t in rows:
+            if isinstance(t, dict) and t.get("id") and t.get("base_url"):
+                out.append(ComputeTarget(
+                    id=str(t["id"]), label=str(t.get("label") or t["id"]),
+                    base_url=str(t["base_url"]),
+                    kind=str(t.get("kind") or "lan"),
+                    vram_gb=float(t.get("vram_gb") or 0.0),
+                    ram_gb=float(t.get("ram_gb") or 0.0),
+                    note=str(t.get("note") or "")))
+        return out
+    except Exception:
+        return []
 
 
 def save_targets(targets: list[ComputeTarget], base_dir: Path | None = None) -> None:

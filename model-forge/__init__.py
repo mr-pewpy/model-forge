@@ -41,3 +41,9 @@ def register(ctx):
         schema=schemas.ACTIVATE,
         handler=tools.model_forge_activate,
     )
+    ctx.register_tool(
+        name="model_forge_generate_media",
+        toolset="model_forge",
+        schema=schemas.GENERATE_MEDIA,
+        handler=tools.model_forge_generate_media,
+    )

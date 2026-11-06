@@ -47,8 +47,13 @@ don't fake the capability.
   progress jobs (`job_id` polling), local file pulls + run-on-target
   instructions for remote; activate emits media_setup wiring commands;
   video-route probing on generic endpoints.
-- **D5:** 3D + audio (music/SFX/voice) as custom tools; cockpit desktop pane
-  (engines, models, VRAM, jobs).
+- **D5 (done):** `model_forge_generate_media` (3d/music/sfx — verified live:
+  image→GLB through a broker's Hunyuan3D lane, glTF 2.0 confirmed); TTS/
+  voice-clone command provider script (`tts/model_forge_tts.py`); cockpit
+  desktop pane (`model-forge-desktop/`) — targets with live engine probes;
+  `targets_json` setting (Desktop JSON editor feeds tools + pane); route
+  probing hardened (openapi-first — the broker 404s wrong-method GETs and
+  empty POSTs on routes that exist).
 - **D6:** end-to-end rehearsal of the storyboard on real hardware; demo video
   recording (≤ 90s).
 - **D7 (Nov 11):** catalog PR (`plugin-catalog/model-forge.yaml`, SHA-pinned),

@@ -37,11 +37,17 @@ Each step visibly downloads and self-hosts the model it needs.
 
 | Tool | What it does |
 |------|--------------|
-| `model_forge_status` | GPUs, VRAM, RAM, and which local engines are running |
-| `model_forge_browse` | Models by modality with an advisory fit verdict for your machine |
+| `model_forge_status` | GPUs, VRAM, RAM, engines per compute target, pull credentials |
+| `model_forge_browse` | Models by modality with an advisory fit verdict per target |
+| `model_forge_target_add` | Register a compute target (LAN LXC, cloud GPU box) |
+| `model_forge_install` | Pull a model (Maya HTTP pull, HF download job, engine CLI) |
+| `model_forge_activate` | Connect a running chat model as Hermes' default (plan-only) |
+| `model_forge_generate_media` | 3D (image→GLB), music, SFX via engine job APIs |
 
-More tools (`model_forge_install`, `model_forge_activate`) and the cockpit
-desktop pane land in the next milestones — see [SCOPE.md](SCOPE.md).
+Plus `tts/model_forge_tts.py` — a config-driven TTS/voice-clone command
+provider for any OpenAI-style `/v1/audio/speech` endpoint (see `tts/`), and
+a **cockpit desktop pane** (`model-forge-desktop/`) showing every compute
+target with live engine probes and model counts.
 
 ## Engines
 

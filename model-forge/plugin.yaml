@@ -8,6 +8,15 @@ description: >-
 author: anai (Charles / Pewpy)
 license: MIT
 config_schema:
+  targets_json:
+    type: list
+    default: []
+    label: "Compute targets"
+    description: >-
+      Extra compute targets as JSON, e.g. [{"id": "ai-lxc", "label": "AI LXC",
+      "base_url": "http://192.168.1.62:8080", "kind": "lan", "vram_gb": 48,
+      "ram_gb": 96}]. The model_forge_target_add tool stores targets too;
+      entries here win on id conflicts. 'local' is always present.
   hf_token:
     type: secret
     env: HF_TOKEN
@@ -28,3 +37,4 @@ provides_tools:
   - model_forge_target_add
   - model_forge_install
   - model_forge_activate
+  - model_forge_generate_media

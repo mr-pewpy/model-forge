@@ -151,6 +151,49 @@ INSTALL = {
     },
 }
 
+GENERATE_MEDIA = {
+    "name": "model_forge_generate_media",
+    "description": (
+        "Generate 3D models, music, or sound effects through a compute "
+        "target's engine API. 3d: image to GLB (submit job, then poll with "
+        "job_id). music/sfx: prompt to audio. Use when the user wants a 3D "
+        "model, soundtrack, or sound effect generated locally."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "modality": {
+                "type": "string",
+                "description": "What to generate.",
+                "enum": ["3d", "music", "sfx"],
+            },
+            "model": {
+                "type": "string",
+                "description": "Engine lane/model id, e.g. 'gen/3d' on a "
+                               "weights-broker target.",
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Text prompt (required for music/sfx; "
+                               "optional for 3d).",
+            },
+            "image": {
+                "type": "string",
+                "description": "Source image for 3d: URL or local file path.",
+            },
+            "target": {
+                "type": "string",
+                "description": "Compute target id (default 'local').",
+            },
+            "job_id": {
+                "type": "string",
+                "description": "Poll a submitted 3d job instead of starting.",
+            },
+        },
+        "required": ["modality"],
+    },
+}
+
 ACTIVATE = {
     "name": "model_forge_activate",
     "description": (
