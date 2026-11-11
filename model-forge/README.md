@@ -131,10 +131,12 @@ The repo holds two installable packages: `model-forge/` (general plugin,
 tools) and `model-forge-providers/` (`kind: model-provider`).
 
 ```bash
+cd /path/to/model-forge             # repo root
+python3 tests/run.py                # stdlib runner, no deps
+pytest -q                           # same suite under pytest (root config: pytest.ini)
 cd model-forge          # the tools plugin
 hermes plugins doctor . --ci        # load-test in isolation
 hermes plugins validate .           # the catalog CI check
-python3 tests/run.py                # registry + adapter tests (stdlib runner)
 cd ../model-forge-providers
 hermes plugins doctor . --ci && hermes plugins validate .
 ```

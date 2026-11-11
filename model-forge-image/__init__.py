@@ -88,6 +88,43 @@ def _as_data_url(value: str) -> str:
     return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode()
 
 
+def _resolve_model(explicit: Optional[str]) -> str:
+    """Model id: explicit arg, else settings default, else the live catalog's
+    first row. Empty string when nothing names a model (caller reports it)."""
+    if explicit:
+        return explicit
+    default = _default_model()
+    if default:
+        return default
+    models = _live_models()
+    return models[0].get("id", "") if models else ""
+
+
+def _extra_body(image_url: Optional[str],
+                reference_image_urls: Optional[list]) -> Dict[str, Any]:
+    """Build the OpenAI extra_body: the edit input plus up to 4 reference
+    images, local file paths converted to data: URLs first."""
+    extra: Dict[str, Any] = {}
+    if image_url:
+        extra["image_url"] = _as_data_url(str(image_url))
+    if reference_image_urls:
+        extra["reference_image_urls"] = [
+            _as_data_url(str(u)) for u in reference_image_urls[:4]]
+    return extra
+
+
+def _datum_image(datum: Any) -> tuple:
+    """(url, b64_json) from a response datum — SDK object or plain dict."""
+    if datum is None:
+        return "", ""
+    image = getattr(datum, "url", None) or ""
+    b64 = getattr(datum, "b64_json", None) or ""
+    if isinstance(datum, dict):
+        image = image or datum.get("url") or ""
+        b64 = b64 or datum.get("b64_json") or ""
+    return image, b64
+
+
 class ModelForgeImageGenProvider(ImageGenProvider):
     @property
     def name(self) -> str:
@@ -155,21 +192,14 @@ class ModelForgeImageGenProvider(ImageGenProvider):
                        f"export {_ENV_BASE_URL}"),
                 error_type="missing_credentials", provider=self.name,
                 prompt=prompt, aspect_ratio=aspect)
-        models = _live_models()
-        model_id = (kwargs.get("model") or _default_model()
-                    or (models[0]["id"] if models else ""))
+        model_id = _resolve_model(kwargs.get("model"))
         if not model_id:
             return error_response(
                 error=f"no image model available at {base}/models",
                 error_type="no_model", provider=self.name, prompt=prompt,
                 aspect_ratio=aspect)
 
-        extra: Dict[str, Any] = {}
-        if image_url:
-            extra["image_url"] = _as_data_url(str(image_url))
-        if reference_image_urls:
-            refs = [_as_data_url(str(u)) for u in reference_image_urls[:4]]
-            extra["reference_image_urls"] = refs
+        extra = _extra_body(image_url, reference_image_urls)
         try:
             import openai
             client = openai.OpenAI(api_key="local-endpoint", base_url=base,
@@ -191,14 +221,7 @@ class ModelForgeImageGenProvider(ImageGenProvider):
                 prompt=prompt, aspect_ratio=aspect)
 
         datum = (resp.data or [None])[0]
-        image = ""
-        b64 = ""
-        if datum is not None:
-            image = getattr(datum, "url", None) or ""
-            b64 = getattr(datum, "b64_json", None) or ""
-            if isinstance(datum, dict):
-                image = image or datum.get("url") or ""
-                b64 = b64 or datum.get("b64_json") or ""
+        image, b64 = _datum_image(datum)
         if not image and b64:
             from agent.image_gen_provider import save_b64_image
             image = str(save_b64_image(str(b64)))
