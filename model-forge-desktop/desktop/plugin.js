@@ -17,9 +17,18 @@ const DEFAULT_TARGETS = [
 async function readTargets() {
   try {
     const res = await host.request("plugins.manage", { action: "list" });
-    const entries = (res && (res.entries || res.plugins)) || {};
-    const entry = entries["model-forge"] || {};
-    const rows = (entry.settings || {}).targets_json || [];
+    // v6 rows: an array of { key, name, settings_schema: [{ key, value }] };
+    // older shims: an entries dict with .settings. Support both shapes.
+    let raw = null;
+    if (res && Array.isArray(res.plugins)) {
+      const entry = res.plugins.find((r) => r && (r.key === "model-forge" || r.name === "model-forge")) || {};
+      const field = (entry.settings_schema || []).find((f) => f && f.key === "targets_json") || {};
+      raw = field.value;
+    } else {
+      const entries = (res && res.entries) || {};
+      raw = ((entries["model-forge"] || {}).settings || {}).targets_json;
+    }
+    const rows = Array.isArray(raw) ? raw : [];
     const targets = rows
       .filter((t) => t && t.id && t.base_url)
       .map((t) => ({
