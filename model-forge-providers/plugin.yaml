@@ -3,5 +3,5 @@ kind: model-provider
 version: 1.0.0
 requires_hermes: ">=0.23.0"
 description: Local engine providers for Model Forge (Strata, Project Maya) — run Hermes on local MoE engines
-author: anai (Charles / Pewpy)
+author: anai (Pewpy)
 license: MIT

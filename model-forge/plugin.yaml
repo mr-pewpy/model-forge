@@ -7,7 +7,7 @@ description: >-
   the right inference engine, pulls the model (or hands you the exact run
   command), and wires it into
   Hermes.
-author: anai (Charles / Pewpy)
+author: anai (Pewpy)
 license: MIT
 config_schema:
   targets_json:

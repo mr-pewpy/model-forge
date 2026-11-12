@@ -3,7 +3,7 @@ kind: backend
 version: 1.0.0
 requires_hermes: ">=0.23.0"
 description: "Model Forge local image generation backend — routes image_generate to any OpenAI-compatible images API (media gateway, vLLM-Omni, SGLang Diffusion)."
-author: anai (Charles / Pewpy)
+author: anai (Pewpy)
 license: MIT
 python_dependencies:
   - "openai>=1,<3"

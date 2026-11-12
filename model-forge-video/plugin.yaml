@@ -3,7 +3,7 @@ kind: backend
 version: 1.0.0
 requires_hermes: ">=0.23.0"
 description: "Model Forge local video generation backend — routes video_generate to any OpenAI-compatible video job API (media gateway, engines with /v1/videos)."
-author: anai (Charles / Pewpy)
+author: anai (Pewpy)
 license: MIT
 python_dependencies:
   - "httpx>=0.27,<1"
