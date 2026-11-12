@@ -40,6 +40,14 @@ MODALITY_LABELS: dict[str, str] = {
     "world_model": "World simulation",
 }
 
+# Engine ids the registry may list but the plugin cannot run: entries with a
+# "python" engine need a custom Python environment the plugin does not manage
+# (no detector, no runner). Such engines never count as available and are
+# never auto-selected for install — but the entries stay listed, honestly
+# labeled, so the models remain discoverable.
+PHANTOM_ENGINES: frozenset[str] = frozenset({"python"})
+PHANTOM_ENGINE_NOTE = "custom Python environment the plugin does not manage"
+
 
 @dataclass(frozen=True)
 class ModelEntry:
@@ -55,6 +63,7 @@ class ModelEntry:
     status: str = "known"           # validated | known | stub
     note: str = ""
     engine_models: dict = field(default_factory=dict)  # engine id -> engine-native model id
+    released: str = ""              # release date (YYYY-MM-DD) where known; "" = unknown
 
 
 @dataclass(frozen=True)
@@ -238,7 +247,10 @@ MODELS: tuple[ModelEntry, ...] = (
         size_gb=5.0,
         vram_gb_min=10.0,
         status="validated",
-        note="Single-view image to textured mesh; printable after repair.",
+        note="Single-view image to textured mesh; printable after repair. "
+             "ComfyUI-native 3D job flow is not implemented in Model Forge "
+             "yet — model_forge_generate_media needs a weights-broker lane "
+             "(/v1/videos/generations).",
     ),
     ModelEntry(
         id="trellis.2-4b",
@@ -249,7 +261,8 @@ MODELS: tuple[ModelEntry, ...] = (
         size_gb=8.0,
         vram_gb_min=12.0,
         status="known",
-        note="Image to 3D, GLB/PLY output.",
+        note="Image to 3D, GLB/PLY output. The 'python' lane needs a "
+             + PHANTOM_ENGINE_NOTE + ".",
     ),
     # --- audio family ---
     ModelEntry(
@@ -261,7 +274,8 @@ MODELS: tuple[ModelEntry, ...] = (
         size_gb=8.0,
         vram_gb_min=8.0,
         status="validated",
-        note="Text-to-music; also serves on CPU via an OpenAI-style audio API.",
+        note="Text-to-music; also serves on CPU via an OpenAI-style audio API. "
+             "Needs a " + PHANTOM_ENGINE_NOTE + ".",
     ),
     ModelEntry(
         id="musicgen-small",
@@ -272,7 +286,8 @@ MODELS: tuple[ModelEntry, ...] = (
         size_gb=2.0,
         vram_gb_min=4.0,
         status="known",
-        note="Lightweight text-to-music baseline.",
+        note="Lightweight text-to-music baseline. Needs a "
+             + PHANTOM_ENGINE_NOTE + ".",
     ),
     ModelEntry(
         id="audiogen",
@@ -283,7 +298,7 @@ MODELS: tuple[ModelEntry, ...] = (
         size_gb=4.0,
         vram_gb_min=6.0,
         status="known",
-        note="Text-to-sound-effects.",
+        note="Text-to-sound-effects. Needs a " + PHANTOM_ENGINE_NOTE + ".",
     ),
     ModelEntry(
         id="stable-audio-open",
@@ -294,7 +309,8 @@ MODELS: tuple[ModelEntry, ...] = (
         size_gb=6.0,
         vram_gb_min=10.0,
         status="known",
-        note="Open SFX and short music generation.",
+        note="Open SFX and short music generation. Needs a "
+             + PHANTOM_ENGINE_NOTE + ".",
     ),
     ModelEntry(
         id="chatterbox-t3-turbo",
@@ -305,7 +321,8 @@ MODELS: tuple[ModelEntry, ...] = (
         size_gb=3.0,
         vram_gb_min=6.0,
         status="validated",
-        note="TTS with voice clone via reference audio.",
+        note="TTS with voice clone via reference audio. Needs a "
+             + PHANTOM_ENGINE_NOTE + ".",
     ),
     # --- world model: honest empty slot ---
     ModelEntry(
@@ -334,11 +351,47 @@ def models_for(modality: str | None = None, engine: str | None = None) -> list[M
     return out
 
 
-def fit_verdict(m: ModelEntry, hw: HardwareProfile) -> str:
-    """Advisory fit verdict: fits_gpu | fits_memory | needs_gpu | too_big |
-    engine_managed | unknown | unavailable."""
+def _ram_short(m: ModelEntry, hw: HardwareProfile) -> bool:
+    """True when the entry declares a RAM floor the target demonstrably misses.
+
+    ram_gb == 0 means 'unknown' (probe failure / undeclared target) and never
+    raises an advisory on its own."""
+    return bool(m.ram_gb_min and hw.ram_gb and hw.ram_gb < m.ram_gb_min)
+
+
+def engine_match(m: ModelEntry,
+                 available_engines: list[str] | tuple[str, ...] | None) -> str:
+    """First of the entry's engines the target can actually run ("" if none).
+
+    Phantom engines never match — the plugin cannot run them on any target —
+    so an entry served only by 'python' is honestly 'nothing can run this'."""
+    for e in m.engines:
+        if e in PHANTOM_ENGINES:
+            continue
+        if available_engines and e in available_engines:
+            return e
+    return ""
+
+
+def fit_verdict(m: ModelEntry, hw: HardwareProfile,
+                available_engines: list[str] | tuple[str, ...] | None = None) \
+        -> str:
+    """Advisory fit verdict: fits_gpu | fits_memory | needs_gpu | needs_ram |
+    too_big | engine_managed | engine_unavailable | unknown | unavailable.
+
+    available_engines=None keeps the historical hardware-only scoring (fully
+    backward compatible). Pass the target's detected engine ids and the
+    verdict also reflects whether any engine there can serve the model at
+    all: a hardware 'fits_gpu' for a model no installed engine can run reads
+    engine_unavailable instead of misleading."""
     if m.status == "stub":
         return "unavailable"
+    if available_engines is not None and not engine_match(m, available_engines):
+        return "engine_unavailable"
+    if _ram_short(m, hw):
+        # engine_managed entries used to hide this behind 'engine_managed';
+        # an unmet declared RAM floor is the same honest advisory for them.
+        return "needs_ram"
     if m.engine_managed_fit:
         return "engine_managed"
     if not m.size_gb:
@@ -350,3 +403,30 @@ def fit_verdict(m: ModelEntry, hw: HardwareProfile) -> str:
     if m.size_gb <= hw.budget_gb:
         return "fits_memory"
     return "too_big"
+
+
+def fit_report(m: ModelEntry, hw: HardwareProfile,
+               available_engines: list[str] | tuple[str, ...] | None = None) \
+        -> dict:
+    """Row-ready fit block for browse rows: the verdict plus the engine
+    availability and RAM signals a bare verdict string cannot carry."""
+    matched = engine_match(m, available_engines)
+    verdict = fit_verdict(m, hw, available_engines)
+    advisory = ""
+    if verdict == "engine_unavailable":
+        needed = ", ".join(e for e in m.engines if e not in PHANTOM_ENGINES)
+        advisory = ("no engine that can serve this model was detected on "
+                    f"the target (needs: {needed or 'an engine'})")
+        if set(m.engines) & PHANTOM_ENGINES:
+            advisory += ("; 'python' entries need a " + PHANTOM_ENGINE_NOTE)
+    elif verdict == "needs_ram":
+        managed = " (engine-managed fit)" if m.engine_managed_fit else ""
+        advisory = (f"declares {m.ram_gb_min:g} GB RAM minimum{managed}; "
+                    f"the target has {hw.ram_gb:g} GB")
+    return {
+        "verdict": verdict,
+        "engine_available": bool(matched),
+        "engine": matched,
+        "ram_gb_min": m.ram_gb_min,
+        "advisory": advisory,
+    }

@@ -15,7 +15,10 @@ from .engines import strata as strata_adapter
 from .engines.base import root_url
 from .hardware import probe_hardware
 from .media import media_plan
-from .registry import MODALITY_LABELS, ModelEntry, fit_verdict, models_for
+from .registry import (
+    MODALITY_LABELS, PHANTOM_ENGINE_NOTE, PHANTOM_ENGINES, ModelEntry,
+    fit_report, fit_verdict, models_for,
+)
 from .targets import ComputeTarget, add_target, get_target, load_targets
 
 _CHAT_MODALITIES = ("chat", "vision")
@@ -94,67 +97,132 @@ def _hw_for_target(target: ComputeTarget):
 
 # --- pure planners -----------------------------------------------------------
 
+def _engine_listing(m: ModelEntry) -> list[str]:
+    """Engine ids for a browse row, with honest labeling for phantom engines —
+    'python' is never presented as if the plugin could run it."""
+    return [f"{e} (needs a {PHANTOM_ENGINE_NOTE})" if e in PHANTOM_ENGINES
+            else e for e in m.engines]
+
+
+def _select_engine(entry: ModelEntry, requested: str,
+                   available_engines: list[str] | None) -> tuple[str, str]:
+    """(engine, honest note) for an install plan.
+
+    An explicit override wins; otherwise the first of entry.engines detected
+    on the target; otherwise entry.engines[0] with a fallback note when
+    detection ran and found nothing. Phantom engines are never auto-selected.
+    """
+    requested = (requested or "").strip()
+    detected = available_engines is not None
+    if requested:
+        if detected and requested not in available_engines:
+            return requested, (f"caller-specified engine '{requested}' was "
+                               "not detected on this target — install and "
+                               "serve it first")
+        return requested, ""
+    for e in entry.engines:
+        if e not in PHANTOM_ENGINES and available_engines \
+                and e in available_engines:
+            return e, ""
+    if entry.engines:
+        if detected:
+            return entry.engines[0], (
+                f"none of {list(entry.engines)} was detected on this target; "
+                f"falling back to '{entry.engines[0]}' — install and serve it "
+                "first")
+        return entry.engines[0], ""
+    return "", ""
+
+
 def install_plan(entry: ModelEntry, target: ComputeTarget,
-                 engine_model: str = "") -> dict:
-    """What model_forge_install would do — no side effects (unit-tested)."""
-    engine = entry.engines[0] if entry.engines else ""
-    engine_model = engine_model or entry.engine_models.get(engine, "")
+                 engine_model: str = "", engine: str = "",
+                 available_engines: list[str] | None = None) -> dict:
+    """What model_forge_install would do — no side effects (unit-tested).
+
+    Engine selection: explicit `engine` override (validated against the
+    entry), else the first of entry.engines detected on the target, else
+    engines[0] with an honest fallback note when detection found nothing."""
     if entry.status == "stub":
-        return {"ok": False, "action": "unavailable",
+        return {"ok": False, "action": "unavailable", "engine": "",
+                "engine_note": "",
                 "detail": "no engine exists for this modality yet"}
-    if entry.id == "core-gguf-catalog" or engine == "llamacpp":
-        return {"ok": True, "action": "use_core_local_models",
-                "detail": "GGUF chat models are priced and installed by "
-                          "Hermes' built-in Local Models pane (Settings -> "
-                          "Providers -> Local Models, or `hermes model`); "
-                          "Model Forge does not duplicate it"}
-    if engine == "maya":
+    requested = (engine or "").strip()
+    if requested and requested not in entry.engines:
+        return {"ok": False, "action": "engine_mismatch", "engine": requested,
+                "engine_note": "",
+                "detail": f"engine '{requested}' cannot serve {entry.id}; "
+                          f"this model runs on {list(entry.engines)}"}
+    chosen, engine_note = _select_engine(entry, requested, available_engines)
+
+    def _plan(**kw):
+        kw.setdefault("engine", chosen)
+        kw.setdefault("engine_note", engine_note)
+        return kw
+
+    engine_model = engine_model or entry.engine_models.get(chosen, "")
+    if entry.id == "core-gguf-catalog" or chosen == "llamacpp":
+        return _plan(ok=True, action="use_core_local_models",
+                     detail="GGUF chat models are priced and installed by "
+                            "Hermes' built-in Local Models pane (Settings -> "
+                            "Providers -> Local Models, or `hermes model`); "
+                            "Model Forge does not duplicate it")
+    if chosen == "maya":
         if not engine_model:
-            return {"ok": False, "action": "needs_engine_model",
-                    "detail": "pass engine_model=<Maya setup id>, e.g. "
-                              "glm-maya-s (see Maya docs/MODELS.md)"}
-        return {"ok": True, "action": "maya_pull",
-                "model": engine_model,
-                "endpoint": root_url(target.base_url) + "/api/pull",
-                "poll": root_url(target.base_url) + "/api/pull/status",
-                "detail": "POST /api/pull {name, detach:true}; poll "
-                          "/api/pull/status for byte progress"}
-    if engine == "strata":
+            return _plan(ok=False, action="needs_engine_model",
+                         detail="pass engine_model=<Maya setup id>, e.g. "
+                                "glm-maya-s (see Maya docs/MODELS.md)")
+        return _plan(ok=True, action="maya_pull",
+                     model=engine_model,
+                     endpoint=root_url(target.base_url) + "/api/pull",
+                     poll=root_url(target.base_url) + "/api/pull/status",
+                     detail="POST /api/pull {name, detach:true}; poll "
+                            "/api/pull/status for byte progress")
+    if chosen == "strata":
         if not engine_model or ":" not in engine_model:
-            return {"ok": False, "action": "needs_engine_model",
-                    "detail": "pass engine_model=<family>:<pack> (from "
-                              "`strata launch` docs), e.g. deepseek41:"
-                              "ist-das-2.00bpw"}
+            return _plan(ok=False, action="needs_engine_model",
+                         detail="pass engine_model=<family>:<pack> (from "
+                                "`strata launch` docs), e.g. deepseek41:"
+                                "ist-das-2.00bpw")
         family, _, pack = engine_model.partition(":")
-        return {"ok": True, "action": "run_cli_on_target",
-                "command": strata_adapter.launch_cmd(family, pack),
-                "detail": f"run this ON {target.label} ({target.base_url}); "
-                          "add --plan first to see the memory plan"}
-    if engine in ("comfyui", "vllm", "sglang", "python"):
+        return _plan(ok=True, action="run_cli_on_target",
+                     command=strata_adapter.launch_cmd(family, pack),
+                     detail=f"run this ON {target.label} ({target.base_url}); "
+                            "add --plan first to see the memory plan")
+    if chosen == "python":
+        return _plan(ok=False, action="custom_env_unmanaged",
+                     detail=f"'{entry.name}' needs a {PHANTOM_ENGINE_NOTE} — "
+                            "Model Forge cannot install or serve it. Get the "
+                            f"weights from {entry.source or 'the model card'} "
+                            "and run them in that environment yourself.")
+    if chosen in ("comfyui", "vllm", "sglang"):
         if target.kind == "local" and entry.source:
             if not engine_model:
-                return {"ok": False, "action": "needs_engine_model",
-                        "detail": "pass engine_model=<file path inside the "
-                                  "source repo> (e.g. model.safetensors), "
-                                  "and optionally dest=<absolute path>"}
+                return _plan(ok=False, action="needs_engine_model",
+                             detail="pass engine_model=<file path inside the "
+                                    "source repo> (e.g. model.safetensors), "
+                                    "and optionally dest=<absolute path>")
             fname = engine_model.rstrip("/").rsplit("/", 1)[-1]
-            return {"ok": True, "action": "hf_download",
-                    "url": f"https://huggingface.co/{entry.source}"
-                           f"/resolve/main/{engine_model}",
-                    "dest_default": f"downloads/{entry.id}/{fname}",
-                    "detail": "plugin-side download with a progress job "
-                              "(credentials applied per host); pass dest to "
-                              "land in an engine models dir directly, then "
-                              "link/move into the right subdir "
-                              "(ComfyUI: models/diffusion_models etc.)"}
-        return {"ok": True, "action": "run_on_target",
-                "command": ["hf", "download", entry.source, engine_model or
-                            "--include", "*"],
-                "detail": f"run on {target.label} and place the files in the "
-                          f"engine's models dir there; source: {entry.source}"}
-    return {"ok": False, "action": "adapter_pending",
-            "detail": f"engine '{engine}' install orchestration lands with "
-                      "its adapter; model source: " + entry.source}
+            return _plan(ok=True, action="hf_download",
+                         url=f"https://huggingface.co/{entry.source}"
+                             f"/resolve/main/{engine_model}",
+                         dest_default=f"downloads/{entry.id}/{fname}",
+                         detail="plugin-side download with a progress job "
+                                "(credentials applied per host); pass dest to "
+                                "land in an engine models dir directly, then "
+                                "link/move into the right subdir "
+                                "(ComfyUI: models/diffusion_models etc.)")
+        cmd = ["hf", "download", entry.source]
+        if engine_model:
+            cmd.append(engine_model.rstrip("/"))
+        else:
+            cmd += ["--include", "*"]
+        return _plan(ok=True, action="run_on_target",
+                     command=cmd,
+                     detail=f"run on {target.label} and place the files in the "
+                            f"engine's models dir there; source: {entry.source}")
+    return _plan(ok=False, action="adapter_pending",
+                 detail=f"engine '{chosen}' install orchestration lands with "
+                        "its adapter; model source: " + entry.source)
 
 
 def activation_plan(entry: ModelEntry, target: ComputeTarget,
@@ -234,9 +302,11 @@ def model_forge_browse(args: dict | None = None, **kwargs) -> str:
         if target is None:
             return _dump({"error": f"unknown target: {args.get('target')}"})
         hw = _hw_for_target(target)
+        base = "" if target.kind == "local" else target.base_url
+        available = [e.id for e in detect_engines(base) if e.available]
         entries = models_for(modality=args.get("modality") or None,
                              engine=args.get("engine") or None)
-        return _dump({
+        out = {
             "target": target.id,
             "hardware_budget_gb": hw.budget_gb,
             "models": [
@@ -245,23 +315,59 @@ def model_forge_browse(args: dict | None = None, **kwargs) -> str:
                     "name": m.name,
                     "modality": m.modality,
                     "modality_label": MODALITY_LABELS.get(m.modality, m.modality),
-                    "engines": list(m.engines),
+                    "engines": _engine_listing(m),
                     "source": m.source,
                     "engine_models": m.engine_models,
                     "size_gb": m.size_gb,
                     "vram_gb_min": m.vram_gb_min,
-                    "fit": fit_verdict(m, hw),
+                    "fit": fit_report(m, hw, available),
                     "status": m.status,
                     "note": m.note,
                 }
                 for m in entries
             ],
-            "note": "Fit verdicts are advisory; engines do authoritative "
-                    "memory sizing at launch. GGUF chat models: use Hermes' "
-                    "built-in Local Models pane (hardware-priced catalog).",
-        })
+            "note": "Fit verdicts are advisory and cross-check the engines "
+                    "detected on the target (see each row's fit block); "
+                    "engines do authoritative memory sizing at launch. GGUF "
+                    "chat models: use Hermes' built-in Local Models pane "
+                    "(hardware-priced catalog).",
+        }
+        out.update(_fresh_section(args, entries))
+        return _dump(out)
     except Exception as exc:
         return _err(exc)
+
+
+def _fresh_section(args: dict, entries: list[ModelEntry]) -> dict:
+    """Live HuggingFace freshness block for browse: newest-first rows with
+    dates, honest 'fresh/unvetted' labeling, fail-soft to an unavailable
+    marker. Pass fresh=false for curated-only output (no network call)."""
+    if args.get("fresh") is False:
+        return {
+            "live_discovery": "disabled",
+            "fresh": [],
+            "fresh_note": "Live discovery skipped (fresh=false); "
+                          "curated catalog only.",
+        }
+    from . import discovery
+    res = discovery.fresh_models(args.get("modality") or None)
+    if res.get("live_discovery") != "ok":
+        return {
+            "live_discovery": res.get("live_discovery", "unavailable"),
+            "fresh": [],
+            "fresh_note": "Live HuggingFace discovery unavailable "
+                          f"({res.get('error') or 'no network'}); "
+                          "showing the curated catalog only.",
+        }
+    curated_sources = {m.source for m in entries if m.source}
+    return {
+        "live_discovery": "ok",
+        "fresh": [r for r in res["models"] if r["id"] not in curated_sources],
+        "fresh_note": "Fresh = live HuggingFace results, newest first "
+                      "(unvetted: no fit estimate, no engine mapping). "
+                      "Curated entries above are hand-maintained and "
+                      "fit-priced.",
+    }
 
 
 def model_forge_target_add(args: dict | None = None, **kwargs) -> str:
@@ -311,8 +417,12 @@ def model_forge_install(args: dict | None = None, **kwargs) -> str:
         target = get_target(args.get("target"))
         if target is None:
             return _dump({"error": f"unknown target: {args.get('target')}"})
+        base = "" if target.kind == "local" else target.base_url
+        available = [e.id for e in detect_engines(base) if e.available]
         plan = install_plan(entry, target,
-                            engine_model=str(args.get("engine_model", "")))
+                            engine_model=str(args.get("engine_model", "")),
+                            engine=str(args.get("engine", "")),
+                            available_engines=available)
         if plan.get("action") == "maya_pull":
             result = maya_adapter.pull(plan["model"], detach=True,
                                        base_url=target.base_url)

@@ -8,7 +8,7 @@ live calls only, no mockups. Screen-capture the desktop app + terminal.
 | 1 | 0:00–0:08 | Title + the ask | Desktop with Model Forge cockpit pane open (targets + live engines) | "One GPU box. Every kind of model. Watch." |
 | 2 | 0:08–0:20 | Find the hardware | Agent calls `model_forge_status` → ai-lxc target, 48 GB VRAM, engines + loaded models | "Hermes finds the GPU — even when it lives in another machine." |
 | 3 | 0:20–0:32 | Pick + chat | `model_forge_browse` (chat rows, fit verdicts) → chat answer on the local model | "Pick a model by what fits. Chat runs on it." |
-| 4 | 0:32–0:46 | Make an image | `image_generate` → real image appears (cuts to result while it renders) | "An image? The plugin pulls the engine and generates." |
+| 4 | 0:32–0:46 | Make an image | `image_generate` → real image appears (cuts to result while it renders) | "An image? The plugin pulls the model and generates." |
 | 5 | 0:46–0:56 | Edit it | one-line edit request → edited image | "Edit it. Same stack, edit model." |
 | 6 | 0:56–1:08 | 3D-print it | `model_forge_generate_media` 3d → GLB lands (show file/mesh) | "Turn it into a printable 3D model." |
 | 7 | 1:08–1:22 | Promo video | i2v job submitted → timelapse of result | "Promo video from the render. All local." |

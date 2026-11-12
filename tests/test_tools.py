@@ -114,7 +114,9 @@ def test_probe_hardware_returns_profile(monkeypatch):
     prof = hardware.probe_hardware()
     assert prof.gpus == ()
     assert prof.total_vram_gb == 0.0
-    assert prof.platform in ("linux", "darwin", "macos", "windows")
+    # platform labels may carry an arch suffix (e.g. "darwin-arm64")
+    assert prof.platform.split("-")[0] in ("linux", "darwin", "macos",
+                                           "windows")
     assert prof.ram_gb >= 0.0
 
 

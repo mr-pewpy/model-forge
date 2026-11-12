@@ -52,6 +52,15 @@ BROWSE = {
                     "See model_forge_status for the list."
                 ),
             },
+            "fresh": {
+                "type": "boolean",
+                "description": (
+                    "Include the live HuggingFace freshness section (newest "
+                    "models per modality, sorted by last-modified date). "
+                    "Default true; false = curated catalog only, no "
+                    "HuggingFace call (target engine detection still runs)."
+                ),
+            },
         },
     },
 }
@@ -121,6 +130,15 @@ INSTALL = {
             "target": {
                 "type": "string",
                 "description": "Compute target id (default 'local').",
+            },
+            "engine": {
+                "type": "string",
+                "description": (
+                    "Which engine to install for when the model supports "
+                    "several (e.g. 'vllm' or 'comfyui' for qwen-image-2.1). "
+                    "Default: auto-select from the engines detected on the "
+                    "target; must be one of the model's engines."
+                ),
             },
             "engine_model": {
                 "type": "string",

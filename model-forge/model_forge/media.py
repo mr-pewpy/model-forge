@@ -38,7 +38,11 @@ def media_plan(modality: str, base_url: str) -> dict:
     if not route_exists(root, route):
         return {"ok": False, "action": "route_missing",
                 "detail": f"{root} does not serve {route} — no {modality} "
-                          "lane on this endpoint"}
+                          "lane on this endpoint. ComfyUI-native job flow is "
+                          "not implemented yet; what works today is a "
+                          "weights-broker target exposing the "
+                          "/v1/videos/generations (3d), /v1/audio/music "
+                          "(music) and /v1/audio/sfx (sfx) lanes."}
     return {
         "ok": True,
         "action": "submit_job" if modality == "3d" else "submit",

@@ -5,8 +5,10 @@ Entry = catalog PR + demo video on X (@NousResearch tag) + form.
 
 Judges score **usefulness, reliability, polish, creativity** and favor
 plugins that do "more than a prompt or a skill could". Model Forge qualifies:
-it manages engine lifecycles and hardware-aware serving — runtime behavior no
-skill can emulate.
+it is a hardware-aware model catalog with engine detection, download
+orchestration, and approval-gated activation — runtime behavior no skill can
+emulate. (Honest scoping: it never installs or starts engines; it pulls
+model files and emits exact run commands.)
 
 ## Storyboard (the demo, ~90s)
 
@@ -14,7 +16,7 @@ One gaming PC, no cloud, chained modality unlocks:
 
 1. `model_forge_status` → "you have a 24 GB GPU, here's what runs"
 2. chat model picked → Hermes chats on it
-3. want an image → image model + engine pulled and served → generated
+3. want an image → image model pulled (engine already warm) → generated
 4. edit it → image-edit model pulled → edited
 5. 3D-print it → Hunyuan3D pulls → GLB out
 6. promo video → i2v model pulls → video out
@@ -54,6 +56,14 @@ don't fake the capability.
   `targets_json` setting (Desktop JSON editor feeds tools + pane); route
   probing hardened (openapi-first — the broker 404s wrong-method GETs and
   empty POSTs on routes that exist).
+- **Post-D5 hardening (done):** live discovery layer (`discovery.py`) —
+  curated catalog + unvetted live HuggingFace freshness in
+  `model_forge_browse` (`fresh=false` opt-out, 1-hour cache, fail-soft
+  offline, see `docs/model-discovery.md`); hardware probe v2 (AMD via
+  rocm-smi/sysfs, Apple Silicon unified memory, Windows RAM fallback);
+  download hardening (sha256 + resume + destination confinement via
+  `download_roots`, symlinks refused); human-approval policy hook on
+  `model_forge_target_add` and `model_forge_activate apply=true`.
 - **D6:** end-to-end rehearsal of the storyboard on real hardware; demo video
   recording (≤ 90s).
 - **D7 (Nov 11):** catalog PR (`plugin-catalog/model-forge.yaml`, SHA-pinned),
