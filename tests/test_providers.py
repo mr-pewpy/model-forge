@@ -169,12 +169,12 @@ def test_image_live_models_empty_when_unconfigured(image_pkg):
 
 def test_image_base_url_from_settings(image_pkg, monkeypatch):
     cfg = {"plugins": {"entries": {"model-forge-image": {
-        "settings": {"base_url": "http://192.168.1.62:8080/v1/"}}}}}
+        "settings": {"base_url": "http://gpu-box.example.com:8080/v1/"}}}}}
     monkeypatch.setitem(sys.modules, "hermes_cli.config",
                         types.SimpleNamespace(
                             load_config_readonly=lambda: cfg))
     # settings win and are rstripped of trailing slash
-    assert image_pkg._base_url() == "http://192.168.1.62:8080/v1"
+    assert image_pkg._base_url() == "http://gpu-box.example.com:8080/v1"
     assert image_pkg._default_model() == ""
 
 

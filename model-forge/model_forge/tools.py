@@ -371,7 +371,7 @@ def _fresh_section(args: dict, entries: list[ModelEntry]) -> dict:
 
 
 def model_forge_target_add(args: dict | None = None, **kwargs) -> str:
-    """Register a compute target (this machine, a LAN LXC, a cloud box)."""
+    """Register a compute target (this machine, a remote host, a cloud GPU box)."""
     args = args or {}
     try:
         tid = str(args.get("id", "")).strip()
@@ -382,7 +382,7 @@ def model_forge_target_add(args: dict | None = None, **kwargs) -> str:
             return _dump({"error": "id is required and cannot be 'local'"})
         if not (base_url.startswith("http://") or base_url.startswith("https://")):
             return _dump({"error": "base_url must be http(s), e.g. "
-                                   "http://192.168.1.62:8080"})
+                                   "http://gpu-box.example.com:8080"})
         t = ComputeTarget(
             id=tid, label=label, base_url=base_url, kind=kind,
             vram_gb=float(args.get("vram_gb") or 0.0),

@@ -29,7 +29,7 @@ import urllib.request
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--endpoint", required=True, help="engine root, e.g. http://192.168.1.62:11434")
+    ap.add_argument("--endpoint", required=True, help="engine root, e.g. http://gpu-box.example.com:11434")
     ap.add_argument("--voice", default="default")
     ap.add_argument("--reference", default="", help="voice-clone reference audio file")
     ap.add_argument("--in", dest="infile", default="-")

@@ -249,7 +249,7 @@ MODELS: tuple[ModelEntry, ...] = (
         status="validated",
         note="Single-view image to textured mesh; printable after repair. "
              "ComfyUI-native 3D job flow is not implemented in Model Forge "
-             "yet — model_forge_generate_media needs a weights-broker lane "
+             "yet — model_forge_generate_media needs a media gateway lane "
              "(/v1/videos/generations).",
     ),
     ModelEntry(

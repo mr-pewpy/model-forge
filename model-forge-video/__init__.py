@@ -1,8 +1,8 @@
 """Model Forge video generation backend.
 
 Routes the native ``video_generate`` tool to ANY endpoint speaking the OpenAI
-video job API (``POST /v1/videos`` -> poll -> content) — a weights broker,
-Sora-style engines — configured via Desktop Settings -> Plugins (or the
+video job API (``POST /v1/videos`` -> poll -> content) — an OpenAI-compatible
+media gateway, Sora-style engines — configured via Desktop Settings -> Plugins (or the
 ``MODEL_FORGE_VIDEO_BASE_URL`` env var). ``image_url`` rides through as the
 image-to-video input.
 """
@@ -101,11 +101,11 @@ class ModelForgeVideoGenProvider(OpenAICompatibleVideoGenProvider):
         return {
             "name": "Model Forge (local)",
             "badge": "local",
-            "tag": "any OpenAI-compatible video job API — broker, Sora-style "
-                   "engines. Set the endpoint in Settings -> Plugins.",
+            "tag": "any OpenAI-compatible video job API — media gateway, "
+                   "Sora-style engines. Set the endpoint in Settings -> Plugins.",
             "env_vars": [{
                 "key": _ENV_BASE_URL,
-                "prompt": "Video endpoint base URL (e.g. http://192.168.1.62:8080/v1)",
+                "prompt": "Video endpoint base URL (e.g. http://gpu-box.example.com:8080/v1)",
                 "url": "",
             }],
         }

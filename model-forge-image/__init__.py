@@ -1,7 +1,8 @@
 """Model Forge image generation backend.
 
 Routes the native ``image_generate`` tool to ANY OpenAI-compatible images
-endpoint — a weights broker, vLLM-Omni (``vllm serve <model> --omni``),
+endpoint — an OpenAI-compatible media gateway, vLLM-Omni
+(``vllm serve <model> --omni``),
 SGLang Diffusion — configured via Desktop Settings -> Plugins (or the
 ``MODEL_FORGE_IMAGE_BASE_URL`` env var). The endpoint speaks the OpenAI sync
 shape (``POST /v1/images/generations`` -> ``{"data": [{"url": ...}]}``);
@@ -175,11 +176,11 @@ class ModelForgeImageGenProvider(ImageGenProvider):
         return {
             "name": "Model Forge (local)",
             "badge": "local",
-            "tag": "any OpenAI-compatible images API — broker, vLLM-Omni, "
-                   "SGLang Diffusion. Set the endpoint in Settings -> Plugins.",
+            "tag": "any OpenAI-compatible images API — media gateway, "
+                   "vLLM-Omni, SGLang Diffusion. Set the endpoint in Settings -> Plugins.",
             "env_vars": [{
                 "key": _ENV_BASE_URL,
-                "prompt": "Images endpoint base URL (e.g. http://192.168.1.62:8080/v1)",
+                "prompt": "Images endpoint base URL (e.g. http://gpu-box.example.com:8080/v1)",
                 "url": "",
             }],
         }

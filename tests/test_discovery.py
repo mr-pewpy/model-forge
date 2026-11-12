@@ -223,8 +223,8 @@ def _browse_env(tmp_path, monkeypatch, fetch):
     _stub_plugins(monkeypatch, tmp_path)
     from model_forge import tools
     from model_forge.targets import ComputeTarget, add_target, get_target
-    add_target(ComputeTarget(id="ai-lxc", label="AI LXC", kind="lan",
-                             base_url="http://192.168.1.62:8080",
+    add_target(ComputeTarget(id="gpu-box", label="GPU Box", kind="lan",
+                             base_url="http://gpu-box.example.com:8080",
                              vram_gb=48.0, ram_gb=96.0),
                base_dir=tmp_path)
     monkeypatch.setattr(tools, "get_target",
@@ -239,10 +239,10 @@ def test_browse_curated_block_unchanged_plus_fresh_block(tmp_path, monkeypatch):
         _item("org/fresh-new", "2026-03-01"),
     ])
     tools = _browse_env(tmp_path, monkeypatch, fetch)
-    out = json.loads(tools.model_forge_browse({"target": "ai-lxc",
+    out = json.loads(tools.model_forge_browse({"target": "gpu-box",
                                                "modality": "3d"}))
     # curated block: unchanged shape
-    assert out["target"] == "ai-lxc"
+    assert out["target"] == "gpu-box"
     assert out["hardware_budget_gb"] == 136.0
     assert isinstance(out["models"], list) and out["models"]
     for m in out["models"]:
@@ -262,7 +262,7 @@ def test_browse_offline_curated_only_with_unavailable_marker(tmp_path,
                                                              monkeypatch):
     fetch = _fake_fetch(exc=urllib.error.URLError("offline"))
     tools = _browse_env(tmp_path, monkeypatch, fetch)
-    out = json.loads(tools.model_forge_browse({"target": "ai-lxc",
+    out = json.loads(tools.model_forge_browse({"target": "gpu-box",
                                                "modality": "3d"}))
     assert out["live_discovery"] == "unavailable"
     assert out["fresh"] == []
@@ -277,7 +277,7 @@ def test_browse_fresh_false_skips_network(tmp_path, monkeypatch):
     def no_network(url, timeout=None):
         raise AssertionError("network must not be touched when fresh=false")
     tools = _browse_env(tmp_path, monkeypatch, no_network)
-    out = json.loads(tools.model_forge_browse({"target": "ai-lxc",
+    out = json.loads(tools.model_forge_browse({"target": "gpu-box",
                                                "modality": "3d",
                                                "fresh": False}))
     assert out["live_discovery"] == "disabled"
@@ -291,7 +291,7 @@ def test_browse_fresh_dedupes_against_curated_sources(tmp_path, monkeypatch):
         _item("org/novel", "2026-02-01"),
     ])
     tools = _browse_env(tmp_path, monkeypatch, fetch)
-    out = json.loads(tools.model_forge_browse({"target": "ai-lxc",
+    out = json.loads(tools.model_forge_browse({"target": "gpu-box",
                                                "modality": "3d"}))
     assert [r["id"] for r in out["fresh"]] == ["org/novel"]
 

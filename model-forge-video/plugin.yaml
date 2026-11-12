@@ -1,7 +1,7 @@
 name: model-forge-video
 kind: backend
 version: 0.1.0
-description: "Model Forge local video generation backend — routes video_generate to any OpenAI-compatible video job API (weights broker, engines with /v1/videos)."
+description: "Model Forge local video generation backend — routes video_generate to any OpenAI-compatible video job API (media gateway, engines with /v1/videos)."
 author: anai (Charles / Pewpy)
 license: MIT
 config_schema:
@@ -9,7 +9,7 @@ config_schema:
     type: str
     default: ""
     label: "Video endpoint base URL"
-    description: "e.g. http://192.168.1.62:8080/v1 — any endpoint speaking the OpenAI video job API."
+    description: "e.g. http://gpu-box.example.com:8080/v1 — any endpoint speaking the OpenAI video job API."
   default_model:
     type: str
     default: ""

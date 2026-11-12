@@ -44,7 +44,7 @@ Each step visibly downloads the model it needs.
 |------|--------------|
 | `model_forge_status` | GPUs, VRAM, RAM, engines per compute target, pull credentials |
 | `model_forge_browse` | Models by modality with an advisory fit verdict per target, plus a live HuggingFace "fresh" section (`fresh=false` = curated only) |
-| `model_forge_target_add` | Register a compute target (LAN LXC, cloud GPU box) — asks for your approval first |
+| `model_forge_target_add` | Register a compute target (a remote host, a cloud GPU box) — asks for your approval first |
 | `model_forge_install` | Pull a model: plugin-side HF download (sha256, resume, job polling), a running Maya's HTTP pull, or the exact engine CLI command to run yourself |
 | `model_forge_activate` | Connect a running chat model as Hermes' default (plan-only; `apply=true` writes config after human approval) |
 | `model_forge_generate_media` | 3D (image→GLB), music, SFX via engine job APIs |
@@ -121,7 +121,8 @@ This repo also ships three provider packages:
   Studio profile pattern), so `hermes model` / `--provider strata` can run
   Hermes directly on those engines.
 - **`model-forge-image/`** (`kind: backend`): routes `image_generate` to ANY
-  OpenAI-compatible images API (weights broker, vLLM-Omni, SGLang Diffusion)
+  OpenAI-compatible images API (an OpenAI-compatible media gateway,
+  vLLM-Omni, SGLang Diffusion)
   — endpoint via **Settings → Plugins** or `MODEL_FORGE_IMAGE_BASE_URL`.
 - **`model-forge-video/`** (`kind: backend`): routes `video_generate` to any
   OpenAI video job API — endpoint via **Settings → Plugins** or
@@ -153,7 +154,7 @@ Honest scoping — current limits, and what does not work yet:
   no music-vs-sfx pipeline tags.
 - **World model is an empty stub.** No local open engine with a stable API
   exists yet; the slot ships so the flow works the day one lands.
-- **`model_forge_generate_media` speaks the weights-broker job API only**
+- **`model_forge_generate_media` speaks the media gateway job API only**
   (`/v1/videos/generations`, `/v1/audio/music`, `/v1/audio/sfx`). The
   ComfyUI-native job flow (`/prompt` + `/history`) is not implemented.
 - **No engine lifecycle.** Model Forge never installs or starts engines —

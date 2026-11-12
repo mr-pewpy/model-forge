@@ -1,7 +1,7 @@
 """Generic OpenAI-compatible engine detection.
 
 Any engine serving GET /v1/models — vLLM, SGLang, LiteLLM, llama-swap, a
-weights broker, Strata, Maya's OpenAI path — speaks this API. We list its
+media gateway, Strata, Maya's OpenAI path — speaks this API. We list its
 models but never claim WHICH engine it is from the response alone (they are
 indistinguishable). Engines with a distinctive fingerprint (llama-server
 /props, Ollama /api/tags, Maya /api/catalog) are detected by their own

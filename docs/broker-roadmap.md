@@ -3,7 +3,7 @@
 Where the plugin goes after the hackathon entry. v1 finds and pulls models;
 v2 owns **local model resources** for Hermes: what weights live where, what
 is loaded in VRAM right now, and what happens when a task needs a different
-model. Normie-first throughout — productivity users, not power users.
+model. Everyday-user first throughout — productivity users, not power users.
 
 ## 1. Vision
 
@@ -18,13 +18,13 @@ pillars:
 3. **Model orchestration** — workflow scopes around a task: "with chat
    model → swap to image gen → restore chat" as one gesture, not three
    manual steps.
-4. **Weights broker** — loading and unloading weights: what is resident,
+4. **Weight residency** — loading and unloading weights: what is resident,
    when it gets evicted, whose lane wakes. Not networking — the resource
    policy layer.
 5. **Pulling + storage management** — downloads (done in v1), plus knowing
    where every byte lives and deleting with user approval.
 
-**Normie-first.** The user says "make me an image"; Model Forge handles
+**Everyday-user first.** The user says "make me an image"; Model Forge handles
 residency. Verbs, not knobs — no `unload_policy=lru-600` anywhere in the UX.
 
 **Official Hermes capacity.** Where Hermes core already does the job — the
@@ -55,7 +55,7 @@ Missing (the v2 work):
 
 - **Storage management** — no tool lists what is on disk with sizes and
   last-used, and nothing deletes with approval.
-- **Weights broker** — nothing tracks residency or evicts; status only
+- **Weight residency** — nothing tracks residency or evicts; status only
   mirrors whatever an engine reports as loaded.
 - **Model orchestration** — no workflow scopes, no pre-warm, no restore.
 - **Engine install** — "Model Forge does not start engines" is the current
@@ -63,12 +63,10 @@ Missing (the v2 work):
 - **HF filename auto-resolve** — file pulls demand an exact `engine_model=`
   path inside the repo; the registry does not guess filenames.
 
-## 3. Reference implementation: the LAN weights broker
+## 3. Battle-tested serving policy
 
-The developer already runs a LAN weights broker — a 2× RTX 3090 gateway
-with a packer — and it is the proof the policy layer works. v2 is that
-broker generalized off Docker onto raw engine APIs. Its battle rules port
-directly:
+These rules are distilled from production multi-GPU model serving. They
+generalize to any machine; v2 applies them directly against raw engine APIs:
 
 - **Fit against NOMINAL booked ceilings.** Live free VRAM only **orders**
   candidates (which to load first); it never **gates** them (whether they
@@ -104,7 +102,7 @@ and the README disclosure):
   Precedent: Hermes core already ships a managed llama.cpp runtime with a
   hardware-priced catalog and downloads — the framework can own engines.
 - **Background processes are allowed but must be disclosed in README.**
-  The download job runner already is; broker-side engine processes extend
+  The download job runner already is; serving-side engine processes extend
   the disclosure.
 - **Fail cleanly unattended.** No hanging prompts. An unattended run
   degrades to a stated reason, never a stall.
@@ -112,9 +110,9 @@ and the README disclosure):
   deletes, network targets, config writes — via the `pre_tool_call`
   approve contract this plugin already uses for `model_forge_target_add`
   and `model_forge_activate apply=true`.
-- **Generalize for any machine through compute targets.** The broker books
-  against declared budgets per target (local/LAN/cloud), never host-local
-  assumptions.
+- **Generalize for any machine through compute targets.** The policy layer
+  books against declared budgets per target (local/lan/cloud), never
+  host-local assumptions.
 
 ## 5. Architecture — four components
 
@@ -162,7 +160,7 @@ denial.
 
 - **Verbs, not knobs.** "Make an image", "free up space", "use this
   model" — never eviction policies, cache modes, or VRAM math.
-- **The normie promise is orchestrated pre-warm + honest timing feedback.**
+- **The user promise is orchestrated pre-warm + honest timing feedback.**
   Never zero-latency: weights physically move into VRAM and no policy
   erases that. Never a silent stall: a user who waits 40 s behind
   `loading (~35s) → ready` trusts the product; a user who waits 40 s at a
@@ -170,7 +168,7 @@ denial.
 
 ## 7. Phased delivery
 
-### P1 — normie closure
+### P1 — user-path closure
 
 - HF filename auto-resolve via the repo file-list API: `model_forge_install`
   resolves the model file without `engine_model=` (prefer full weights;
@@ -183,7 +181,7 @@ denial.
 storage delete requires approval and fails closed on denial; an unattended
 install never hangs.
 
-### P2 — broker core
+### P2 — residency core
 
 - Residency ledger + Ollama / llama-swap / llama.cpp adapters +
   booked-ceiling fit + eviction (LRU + recency window + lane priority).
@@ -213,9 +211,9 @@ jobs); measured peaks replace published footprints in bookings.
 
 ## 8. Honest difficulty profile
 
-- **The policy layer is proven.** The LAN broker already runs these rules;
-  the main work is the port from Docker onto raw engine APIs — that port
-  *is* the project, not the policy design.
+- **The policy layer is proven.** These rules already run in a production
+  multi-GPU serving deployment; the main work is expressing them against
+  raw engine APIs — that work *is* the project, not the policy design.
 - **Per-engine lifecycle quirks demand adapter-level honesty.** Sleep/wake
   is not a given — some engine wake endpoints are unreliable upstream — so
   process restart belongs in the adapter contract from day one, not as an

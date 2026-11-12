@@ -3,7 +3,7 @@
 STATUS = {
     "name": "model_forge_status",
     "description": (
-        "Report every compute target (this machine, a LAN box, a cloud GPU) "
+        "Report every compute target (this machine, a remote host, a cloud GPU) "
         "with its GPUs, VRAM, RAM, and which local inference engines are "
         "running there (llama.cpp, Ollama, Strata, Maya, ...) and what models "
         "they have loaded. Use when the user asks what runs locally, what "
@@ -69,7 +69,7 @@ TARGET_ADD = {
     "name": "model_forge_target_add",
     "description": (
         "Register a compute target: a machine with GPUs where inference can "
-        "run — this machine, an LXC on a Proxmox node, a rented cloud GPU "
+        "run — this machine, a remote server, a rented cloud GPU "
         "box. Persists so future sessions know about it. Use when the user "
         "says their GPU lives somewhere else or wants to add a server."
     ),
@@ -78,15 +78,15 @@ TARGET_ADD = {
         "properties": {
             "id": {
                 "type": "string",
-                "description": "Short unique id, e.g. 'ai-lxc' or 'lambda-a100'.",
+                "description": "Short unique id, e.g. 'gpu-box' or 'lambda-a100'.",
             },
             "label": {
                 "type": "string",
-                "description": "Human label, e.g. 'AI LXC on Proxmox'.",
+                "description": "Human label, e.g. 'GPU workstation'.",
             },
             "base_url": {
                 "type": "string",
-                "description": "Engine root URL, e.g. http://192.168.1.62:8080",
+                "description": "Engine root URL, e.g. http://gpu-box.example.com:8080",
             },
             "kind": {
                 "type": "string",
@@ -103,7 +103,7 @@ TARGET_ADD = {
             },
             "note": {
                 "type": "string",
-                "description": "Free-form note, e.g. '2x RTX 3090'.",
+                "description": "Free-form note, e.g. 'NVIDIA A100, 80 GB'.",
             },
         },
         "required": ["id", "base_url"],
@@ -188,7 +188,7 @@ GENERATE_MEDIA = {
             "model": {
                 "type": "string",
                 "description": "Engine lane/model id, e.g. 'gen/3d' on a "
-                               "weights-broker target.",
+                               "media gateway target.",
             },
             "prompt": {
                 "type": "string",

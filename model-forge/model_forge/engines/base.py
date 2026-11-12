@@ -19,11 +19,11 @@ def root_url(base_url: str) -> str:
 def route_exists(root: str, path: str, timeout: float = 2.0) -> bool:
     """True when the server answers on path with anything but 404.
 
-    Probe chain (the weights broker 404s BOTH wrong-method GETs and
+    Probe chain (some media gateways 404 BOTH wrong-method GETs and
     empty-body POSTs on routes that exist, so status codes alone cannot be
     trusted everywhere):
     1. GET /openapi.json — authoritative route list for FastAPI apps
-       (broker, vLLM, SGLang, Maya);
+       (media gateways, vLLM, SGLang, Maya);
     2. GET the path — 405/other non-404 proves a POST-only route (plain
        FastAPI default);
     3. empty POST — 422/400/405 prove the route on servers that validate

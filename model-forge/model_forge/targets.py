@@ -1,6 +1,6 @@
 """Compute targets: WHERE inference runs.
 
-A target is a machine with GPUs — this one, an LXC on your Proxmox node, a
+A target is a machine with GPUs — this machine, a remote server, or a
 rented cloud box. Engines are probed over each target's HTTP API; only the
 local machine gets CLI/`nvidia-smi` treatment. Hardware numbers for remote
 targets are user-declared (we cannot probe a remote GPU's VRAM honestly over
@@ -24,7 +24,7 @@ _FILE = "targets.json"
 class ComputeTarget:
     id: str
     label: str
-    base_url: str               # engine root, e.g. http://192.168.1.62:8080
+    base_url: str               # engine root, e.g. http://gpu-box.example.com:8080
     kind: str = "local"         # local | lan | cloud (advisory label)
     vram_gb: float = 0.0        # declared budget for fit verdicts
     ram_gb: float = 0.0

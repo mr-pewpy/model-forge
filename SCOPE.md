@@ -50,11 +50,11 @@ don't fake the capability.
   instructions for remote; activate emits media_setup wiring commands;
   video-route probing on generic endpoints.
 - **D5 (done):** `model_forge_generate_media` (3d/music/sfx — verified live:
-  image→GLB through a broker's Hunyuan3D lane, glTF 2.0 confirmed); TTS/
+  image→GLB through a media gateway's Hunyuan3D lane, glTF 2.0 confirmed); TTS/
   voice-clone command provider script (`tts/model_forge_tts.py`); cockpit
   desktop pane (`model-forge-desktop/`) — targets with live engine probes;
   `targets_json` setting (Desktop JSON editor feeds tools + pane); route
-  probing hardened (openapi-first — the broker 404s wrong-method GETs and
+  probing hardened (openapi-first — some gateways 404 wrong-method GETs and
   empty POSTs on routes that exist).
 - **Post-D5 hardening (done):** live discovery layer (`discovery.py`) —
   curated catalog + unvetted live HuggingFace freshness in
@@ -71,13 +71,13 @@ don't fake the capability.
 
 ## Non-goals for the hackathon
 
-- Multi-host / LAN orchestration (broker territory — future plugin)
+- Multi-host orchestration (distributed serving territory — future plugin)
 - Rebuilding core's GGUF pricing/catalog (we complement it)
 - World model inference (no local open engine with a stable API yet)
 
 ## Submission checklist
 
-- [ ] Public GitHub repo (mirror from Gitea; Gitea stays the dev home)
+- [ ] Public GitHub repo (canonical public home)
 - [ ] `hermes plugins validate <path> --install-deps` green
 - [ ] README disclosure lines match reality
 - [ ] plugin-catalog entry: full 40-char SHA pin, quoted version,

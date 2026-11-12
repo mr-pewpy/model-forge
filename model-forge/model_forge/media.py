@@ -4,7 +4,7 @@ These modalities have no native Hermes tool surface (image/video/TTS do), so
 Model Forge exposes them through job-style engine APIs:
 
 - 3d:    POST {endpoint}/v1/videos/generations {"model", "image"} -> {"id"}
-         -> GET /jobs/{id} -> {status, data:[{url}]}   (weights-broker shape;
+         -> GET /jobs/{id} -> {status, data:[{url}]}   (media-gateway shape;
          ComfyUI Hunyuan3D/TRELLIS lanes behind it)
 - music: POST {endpoint}/v1/audio/music {"model", "prompt", ...} -> audio
 - sfx:   POST {endpoint}/v1/audio/speech-or-sfx-style {"model", "prompt"}
@@ -40,7 +40,7 @@ def media_plan(modality: str, base_url: str) -> dict:
                 "detail": f"{root} does not serve {route} — no {modality} "
                           "lane on this endpoint. ComfyUI-native job flow is "
                           "not implemented yet; what works today is a "
-                          "weights-broker target exposing the "
+                          "media gateway exposing the "
                           "/v1/videos/generations (3d), /v1/audio/music "
                           "(music) and /v1/audio/sfx (sfx) lanes."}
     return {

@@ -6,7 +6,7 @@ live calls only, no mockups. Screen-capture the desktop app + terminal.
 | # | Time | Shot | On screen | Narration beat |
 |---|------|------|-----------|----------------|
 | 1 | 0:00–0:08 | Title + the ask | Desktop with Model Forge cockpit pane open (targets + live engines) | "One GPU box. Every kind of model. Watch." |
-| 2 | 0:08–0:20 | Find the hardware | Agent calls `model_forge_status` → ai-lxc target, 48 GB VRAM, engines + loaded models | "Hermes finds the GPU — even when it lives in another machine." |
+| 2 | 0:08–0:20 | Find the hardware | Agent calls `model_forge_status` → remote GPU target, 48 GB VRAM, engines + loaded models | "Hermes finds the GPU — even when it lives in another machine." |
 | 3 | 0:20–0:32 | Pick + chat | `model_forge_browse` (chat rows, fit verdicts) → chat answer on the local model | "Pick a model by what fits. Chat runs on it." |
 | 4 | 0:32–0:46 | Make an image | `image_generate` → real image appears (cuts to result while it renders) | "An image? The plugin pulls the model and generates." |
 | 5 | 0:46–0:56 | Edit it | one-line edit request → edited image | "Edit it. Same stack, edit model." |
@@ -22,7 +22,7 @@ live calls only, no mockups. Screen-capture the desktop app + terminal.
 - If the i2v beat (the slowest, ~15 min real) is too slow for a cutaway,
   show the job poll + jump cut to the finished clip; say "a few minutes".
 
-## Verified timings (2026-11-06 rehearsal, 2x3090 box)
+## Verified timings (2026-11-06 rehearsal, dual-GPU box)
 - image (qwen-image-2.1): ~110 s · (moss): ~198 s
 - 3D (hunyuan3d): ~55 s submit→done
 - i2v (h3): ~15 min (jump-cut candidate)

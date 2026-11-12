@@ -32,8 +32,8 @@ from model_forge.engines.base import EngineStatus, root_url, route_exists
 # --- base helpers -----------------------------------------------------------
 
 def test_root_url_strips_v1_and_slash():
-    assert root_url("http://192.168.1.62:8080/v1") == "http://192.168.1.62:8080"
-    assert root_url("http://192.168.1.62:8080/") == "http://192.168.1.62:8080"
+    assert root_url("http://gpu-box.example.com:8080/v1") == "http://gpu-box.example.com:8080"
+    assert root_url("http://gpu-box.example.com:8080/") == "http://gpu-box.example.com:8080"
     assert root_url("") == ""
     assert root_url(None) == ""
 
@@ -341,12 +341,12 @@ def test_comfyui_detect_running(monkeypatch):
     _install_urlopen(monkeypatch, {
         "/system_stats": json.dumps({
             "system": {"comfyui-version": "0.3.0"},
-            "devices": [{"name": "RTX 3090"}, {"name": "RTX 4090"}],
+            "devices": [{"name": "NVIDIA A100"}, {"name": "RTX 4090"}],
         }).encode(),
     })
     st = comfyui.detect("http://x:1")
     assert st.available is True and "comfyui 0.3.0" in st.detail
-    assert "RTX 3090" in st.detail
+    assert "NVIDIA A100" in st.detail
 
 
 def test_comfyui_detect_dead(monkeypatch):

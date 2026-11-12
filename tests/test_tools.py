@@ -28,8 +28,8 @@ from model_forge.targets import (
     load_targets,
 )
 
-_LXC = ComputeTarget(id="ai-lxc", label="AI LXC", kind="lan",
-                     base_url="http://192.168.1.62:8080",
+_REMOTE = ComputeTarget(id="gpu-box", label="GPU Box", kind="lan",
+                     base_url="http://gpu-box.example.com:8080",
                      vram_gb=48.0, ram_gb=96.0)
 _LOCAL = ComputeTarget(id="local", label="This machine",
                        base_url="http://127.0.0.1:8080", kind="local")
@@ -70,7 +70,7 @@ def _ok_engine(monkeypatch, modalities=("chat",)):
 
     e = base.EngineStatus(id="openai-compatible", display_name="OpenAI-compat",
                           available=True,
-                          endpoint="http://192.168.1.62:8080/v1",
+                          endpoint="http://gpu-box.example.com:8080/v1",
                           modalities=modalities)
     monkeypatch.setattr(
         "model_forge.tools.detect_engines",
@@ -383,14 +383,14 @@ def test_target_add_validation_and_persist(tmp_path, monkeypatch):
     assert "error" in err
     # base_url must be http(s)
     err = json.loads(tools.model_forge_target_add(
-        {"id": "ai-lxc", "base_url": "ftp://x:1"}))
+        {"id": "gpu-box", "base_url": "ftp://x:1"}))
     assert "error" in err
     # happy path persists to the stubbed data dir
     out = json.loads(tools.model_forge_target_add(
-        {"id": "ai-lxc", "label": "AI LXC",
-         "base_url": "http://192.168.1.62:8080", "vram_gb": "48"}))
-    assert out["added"] == "ai-lxc"
-    assert any(t["id"] == "ai-lxc" for t in out["targets"])
+        {"id": "gpu-box", "label": "GPU Box",
+         "base_url": "http://gpu-box.example.com:8080", "vram_gb": "48"}))
+    assert out["added"] == "gpu-box"
+    assert any(t["id"] == "gpu-box" for t in out["targets"])
 
 
 # --- tools.py: browse -------------------------------------------------------
@@ -406,15 +406,15 @@ def test_browse_unknown_target(tmp_path, monkeypatch):
 
 def test_browse_lists_and_prices(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
 
     # point get_target at our temp store by monkeypatching the handler's view
     monkeypatch.setattr(tools, "get_target",
                         lambda tid: get_target(tid, base_dir=tmp_path))
-    out = json.loads(tools.model_forge_browse({"target": "ai-lxc",
+    out = json.loads(tools.model_forge_browse({"target": "gpu-box",
                                                "modality": "image"}))
-    assert out["target"] == "ai-lxc"
+    assert out["target"] == "gpu-box"
     # budget = declared VRAM + (RAM - 8 GB) = 48 + (96 - 8) = 136
     assert out["hardware_budget_gb"] == 136.0
     assert isinstance(out["models"], list)
@@ -426,7 +426,7 @@ def test_browse_lists_and_prices(tmp_path, monkeypatch):
 
 def test_status_lists_targets_and_engines(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
 
     monkeypatch.setattr(tools, "load_targets",
@@ -437,24 +437,24 @@ def test_status_lists_targets_and_engines(tmp_path, monkeypatch):
     assert out["pull_credentials"] == {"HF_TOKEN": False,
                                        "MODELSCOPE_API_TOKEN": False}
     by_id = {t["id"]: t for t in out["targets"]}
-    assert "local" in by_id and "ai-lxc" in by_id
-    eng = by_id["ai-lxc"]["engines"][0]
+    assert "local" in by_id and "gpu-box" in by_id
+    eng = by_id["gpu-box"]["engines"][0]
     assert eng["available"] is True and "image" in eng["modalities"]
 
 
 def test_status_remote_hw_uses_declared_budget(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
 
     monkeypatch.setattr(tools, "load_targets",
                         lambda: load_targets(base_dir=tmp_path))
     monkeypatch.setattr(tools, "detect_engines", lambda base_url="": [])
     out = json.loads(tools.model_forge_status())
-    lxc = next(t for t in out["targets"] if t["id"] == "ai-lxc")
+    remote = next(t for t in out["targets"] if t["id"] == "gpu-box")
     # remote target -> declared VRAM, not a live probe
-    assert lxc["hardware"]["total_vram_gb"] == 48.0
-    assert lxc["hardware"]["ram_gb"] == 96.0
+    assert remote["hardware"]["total_vram_gb"] == 48.0
+    assert remote["hardware"]["ram_gb"] == 96.0
 
 
 def test_status_error_path(tmp_path, monkeypatch):
@@ -508,7 +508,7 @@ def test_install_strata_runs_cli(tmp_path, monkeypatch):
 
 def test_install_maya_pull(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
 
     monkeypatch.setattr(tools, "get_target",
@@ -518,14 +518,14 @@ def test_install_maya_pull(tmp_path, monkeypatch):
                         lambda model, detach=False, base_url="":
                         {"ok": True, "job": "maya-1"})
     out = json.loads(tools.model_forge_install(
-        {"model_id": "glm-5.3-flash", "target": "ai-lxc"}))
+        {"model_id": "glm-5.3-flash", "target": "gpu-box"}))
     assert out["action"] == "maya_pull"
     assert out["pull_response"] == {"ok": True, "job": "maya-1"}
 
 
 def test_install_maya_no_response(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
 
     monkeypatch.setattr(tools, "get_target",
@@ -533,7 +533,7 @@ def test_install_maya_no_response(tmp_path, monkeypatch):
     monkeypatch.setattr(tools.maya_adapter, "pull",
                         lambda model, detach=False, base_url="": None)
     out = json.loads(tools.model_forge_install(
-        {"model_id": "glm-5.3-flash", "target": "ai-lxc"}))
+        {"model_id": "glm-5.3-flash", "target": "gpu-box"}))
     assert out["ok"] is False and "pull_response" not in out
 
 
@@ -550,14 +550,14 @@ def test_activate_unknown_model(tmp_path, monkeypatch):
 
 def test_activate_plan_only(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
 
     monkeypatch.setattr(tools, "get_target",
                         lambda tid: get_target(tid, base_dir=tmp_path))
     _ok_engine(monkeypatch, ("chat", "image"))
     out = json.loads(tools.model_forge_activate(
-        {"model_id": "glm-5.3-flash", "target": "ai-lxc"}))
+        {"model_id": "glm-5.3-flash", "target": "gpu-box"}))
     assert out["ok"] is True and out["applied"] is False
     assert "hint" in out
     # image modality present -> media setup hint for image_gen
@@ -566,7 +566,7 @@ def test_activate_plan_only(tmp_path, monkeypatch):
 
 def test_activate_apply_writes(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
 
     monkeypatch.setattr(tools, "get_target",
@@ -577,7 +577,7 @@ def test_activate_apply_writes(tmp_path, monkeypatch):
         lambda model, provider, base_url="": {"model": model})
     monkeypatch.setitem(sys.modules, "hermes_cli.model_setup", setup)
     out = json.loads(tools.model_forge_activate(
-        {"model_id": "glm-5.3-flash", "target": "ai-lxc", "apply": True}))
+        {"model_id": "glm-5.3-flash", "target": "gpu-box", "apply": True}))
     assert out["applied"] is True
     # engine_model not passed -> the plan's model is the registry entry id
     assert out["saved_model_section"] == {"model": "glm-5.3-flash"}
@@ -623,7 +623,7 @@ def test_generate_media_unknown_target(tmp_path, monkeypatch):
 
 def test_generate_media_3d_needs_args(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
 
     monkeypatch.setattr(tools, "get_target",
@@ -631,15 +631,15 @@ def test_generate_media_3d_needs_args(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "media_plan",
                         lambda modality, base_url:
                         {"ok": True, "action": "submit_job",
-                         "submit": "http://192.168.1.62:8080/jobs"})
+                         "submit": "http://gpu-box.example.com:8080/jobs"})
     out = json.loads(tools.model_forge_generate_media(
-        {"modality": "3d", "target": "ai-lxc"}))
+        {"modality": "3d", "target": "gpu-box"}))
     assert out["action"] == "needs_args"
 
 
 def test_generate_media_3d_submit(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
 
     monkeypatch.setattr(tools, "get_target",
@@ -647,10 +647,10 @@ def test_generate_media_3d_submit(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "media_plan",
                         lambda modality, base_url:
                         {"ok": True, "action": "submit_job",
-                         "submit": "http://192.168.1.62:8080/jobs"})
+                         "submit": "http://gpu-box.example.com:8080/jobs"})
     _fake_urlopen(monkeypatch, json.dumps({"id": "3djob-1"}).encode())
     out = json.loads(tools.model_forge_generate_media(
-        {"modality": "3d", "target": "ai-lxc", "model": "gen/3d",
+        {"modality": "3d", "target": "gpu-box", "model": "gen/3d",
          "image": "https://example.com/x.png"}))
     assert out["ok"] is True and out["action"] == "submitted"
     assert out["submitted"]["id"] == "3djob-1"
@@ -658,7 +658,7 @@ def test_generate_media_3d_submit(tmp_path, monkeypatch):
 
 def test_generate_media_3d_submit_failure(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
 
     monkeypatch.setattr(tools, "get_target",
@@ -666,17 +666,17 @@ def test_generate_media_3d_submit_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "media_plan",
                         lambda modality, base_url:
                         {"ok": True, "action": "submit_job",
-                         "submit": "http://192.168.1.62:8080/jobs"})
+                         "submit": "http://gpu-box.example.com:8080/jobs"})
     _fake_urlopen(monkeypatch, b"", exc=RuntimeError("conn refused"))
     out = json.loads(tools.model_forge_generate_media(
-        {"modality": "3d", "target": "ai-lxc", "model": "gen/3d",
+        {"modality": "3d", "target": "gpu-box", "model": "gen/3d",
          "image": "https://example.com/x.png"}))
     assert out["action"] == "submit_failed"
 
 
 def test_generate_media_music_needs_args(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
 
     monkeypatch.setattr(tools, "get_target",
@@ -684,15 +684,15 @@ def test_generate_media_music_needs_args(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "media_plan",
                         lambda modality, base_url:
                         {"ok": True, "action": "submit_job",
-                         "submit": "http://192.168.1.62:8080/audio"})
+                         "submit": "http://gpu-box.example.com:8080/audio"})
     out = json.loads(tools.model_forge_generate_media(
-        {"modality": "music", "target": "ai-lxc"}))
+        {"modality": "music", "target": "gpu-box"}))
     assert out["action"] == "needs_args"
 
 
 def test_generate_media_music_done(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
 
     monkeypatch.setattr(tools, "get_target",
@@ -700,10 +700,10 @@ def test_generate_media_music_done(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "media_plan",
                         lambda modality, base_url:
                         {"ok": True, "action": "submit_job",
-                         "submit": "http://192.168.1.62:8080/audio"})
+                         "submit": "http://gpu-box.example.com:8080/audio"})
     _fake_urlopen(monkeypatch, json.dumps({"url": "http://x/a.mp3"}).encode())
     out = json.loads(tools.model_forge_generate_media(
-        {"modality": "music", "target": "ai-lxc", "model": "gen/music",
+        {"modality": "music", "target": "gpu-box", "model": "gen/music",
          "prompt": "lofi"}))
     assert out["ok"] is True and out["action"] == "done"
     assert out["result"]["url"] == "http://x/a.mp3"
@@ -711,7 +711,7 @@ def test_generate_media_music_done(tmp_path, monkeypatch):
 
 def test_generate_media_route_missing(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
 
     monkeypatch.setattr(tools, "get_target",
@@ -720,7 +720,7 @@ def test_generate_media_route_missing(tmp_path, monkeypatch):
                         lambda modality, base_url:
                         {"ok": False, "action": "route_missing"})
     out = json.loads(tools.model_forge_generate_media(
-        {"modality": "3d", "target": "ai-lxc", "model": "gen/3d",
+        {"modality": "3d", "target": "gpu-box", "model": "gen/3d",
          "image": "https://example.com/x.png"}))
     assert out["action"] == "route_missing"
 
@@ -826,7 +826,7 @@ def test_as_data_url_file_scheme_validated(tmp_path, monkeypatch):
 
 def test_generate_media_invalid_image(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
 
     monkeypatch.setattr(tools, "get_target",
@@ -834,9 +834,9 @@ def test_generate_media_invalid_image(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "media_plan",
                         lambda modality, base_url:
                         {"ok": True, "action": "submit_job",
-                         "submit": "http://192.168.1.62:8080/jobs"})
+                         "submit": "http://gpu-box.example.com:8080/jobs"})
     out = json.loads(tools.model_forge_generate_media(
-        {"modality": "3d", "target": "ai-lxc", "model": "gen/3d",
+        {"modality": "3d", "target": "gpu-box", "model": "gen/3d",
          "image": "/etc/shadow"}))
     assert out["action"] == "invalid_image"
 
@@ -858,7 +858,7 @@ def test_policy_hook_activate_apply_requires_approval():
     from model_forge import tools
 
     d = tools.policy_hook("model_forge_activate",
-                          {"model_id": "m1", "target": "ai-lxc",
+                          {"model_id": "m1", "target": "gpu-box",
                            "apply": True})
     assert d["action"] == "approve"
     assert "model_id" in d["message"]

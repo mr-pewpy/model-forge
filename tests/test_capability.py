@@ -25,8 +25,8 @@ _BIG = HardwareProfile(gpus=({"name": "RTX 4090", "vram_gb": 24.0},),
                        total_vram_gb=24.0, ram_gb=64.0, platform="linux")
 _LOW_RAM = HardwareProfile(gpus=({"name": "RTX 4090", "vram_gb": 24.0},),
                            total_vram_gb=24.0, ram_gb=16.0, platform="linux")
-_LXC = ComputeTarget(id="ai-lxc", label="AI LXC", kind="lan",
-                     base_url="http://192.168.1.62:8080",
+_REMOTE = ComputeTarget(id="gpu-box", label="GPU Box", kind="lan",
+                     base_url="http://gpu-box.example.com:8080",
                      vram_gb=48.0, ram_gb=96.0)
 _LOCAL = ComputeTarget(id="local", label="This machine",
                        base_url="http://127.0.0.1:8080", kind="local")
@@ -50,7 +50,7 @@ def _stub_hermes_modules(monkeypatch, data_dir: Path):
 def _detected(monkeypatch, ids):
     """Make tools.detect_engines report exactly these available engine ids."""
     sts = [EngineStatus(id=i, display_name=i, available=True,
-                        endpoint="http://192.168.1.62:8080/v1")
+                        endpoint="http://gpu-box.example.com:8080/v1")
            for i in ids]
     monkeypatch.setattr("model_forge.tools.detect_engines",
                         lambda base_url="": sts)
@@ -141,13 +141,13 @@ def test_fit_report_ram_floor_advisory():
 
 def test_browse_rows_surface_fit_signals(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
     monkeypatch.setattr(tools, "get_target",
                         lambda tid: get_target(tid, base_dir=tmp_path))
     _detected(monkeypatch, ["comfyui"])
     out = json.loads(tools.model_forge_browse(
-        {"target": "ai-lxc", "modality": "3d", "fresh": False}))
+        {"target": "gpu-box", "modality": "3d", "fresh": False}))
     rows = {m["id"]: m for m in out["models"]}
     fit = rows["hunyuan3d-2"]["fit"]
     assert fit["engine_available"] is True and fit["engine"] == "comfyui"
@@ -155,7 +155,7 @@ def test_browse_rows_surface_fit_signals(tmp_path, monkeypatch):
     # chat rows carry the RAM floor
     _detected(monkeypatch, ["maya"])
     out = json.loads(tools.model_forge_browse(
-        {"target": "ai-lxc", "modality": "chat", "fresh": False}))
+        {"target": "gpu-box", "modality": "chat", "fresh": False}))
     flash = next(m for m in out["models"] if m["id"] == "qwen3.8-flash-next")
     assert flash["fit"]["ram_gb_min"] == 64.0
     # target has 96 GB RAM -> floor met, engine matched -> engine_managed
@@ -167,12 +167,12 @@ def test_browse_rows_surface_fit_signals(tmp_path, monkeypatch):
 def test_install_plan_auto_selects_detected_engine():
     from model_forge.tools import install_plan
     qwen = _entry("qwen-image-2.1")           # (vllm, comfyui)
-    plan = install_plan(qwen, _LXC, engine_model="model.safetensors",
+    plan = install_plan(qwen, _REMOTE, engine_model="model.safetensors",
                         available_engines=["comfyui"])
     assert plan["engine"] == "comfyui"        # NOT blind engines[0]=vllm
     assert plan["ok"] is True and plan["action"] == "run_on_target"
     # first match in entry order when several are detected
-    plan = install_plan(qwen, _LXC, engine_model="model.safetensors",
+    plan = install_plan(qwen, _REMOTE, engine_model="model.safetensors",
                         available_engines=["comfyui", "vllm"])
     assert plan["engine"] == "vllm"
 
@@ -181,12 +181,12 @@ def test_install_plan_engine_override():
     from model_forge.tools import install_plan
     qwen = _entry("qwen-image-2.1")
     # override wins over detection, with an honest note when not detected
-    plan = install_plan(qwen, _LXC, engine_model="model.safetensors",
+    plan = install_plan(qwen, _REMOTE, engine_model="model.safetensors",
                         engine="comfyui", available_engines=["vllm"])
     assert plan["engine"] == "comfyui"
     assert "not detected" in plan["engine_note"]
     # an override naming an engine the model cannot use is refused
-    plan = install_plan(qwen, _LXC, engine="maya")
+    plan = install_plan(qwen, _REMOTE, engine="maya")
     assert plan["ok"] is False and plan["action"] == "engine_mismatch"
     assert "comfyui" in plan["detail"] or "vllm" in plan["detail"]
 
@@ -194,13 +194,13 @@ def test_install_plan_engine_override():
 def test_install_plan_fallback_note_when_nothing_detected():
     from model_forge.tools import install_plan
     qwen = _entry("qwen-image-2.1")
-    plan = install_plan(qwen, _LXC, engine_model="model.safetensors",
+    plan = install_plan(qwen, _REMOTE, engine_model="model.safetensors",
                         available_engines=[])
     assert plan["engine"] == "vllm"           # engines[0] fallback
     assert "falling back" in plan["engine_note"]
     assert "vllm" in plan["engine_note"]
     # no detection performed (None) keeps the historical quiet fallback
-    plan = install_plan(qwen, _LXC, engine_model="model.safetensors")
+    plan = install_plan(qwen, _REMOTE, engine_model="model.safetensors")
     assert plan["engine"] == "vllm" and plan["engine_note"] == ""
 
 
@@ -209,7 +209,7 @@ def test_install_plan_needs_engine_model_intact():
     plan = install_plan(_entry("qwen3.8-flash-next"), _LOCAL,
                         available_engines=["strata"])
     assert plan["ok"] is False and plan["action"] == "needs_engine_model"
-    plan = install_plan(_entry("glm-5.3-flash"), _LXC, available_engines=[])
+    plan = install_plan(_entry("glm-5.3-flash"), _REMOTE, available_engines=[])
     assert plan["action"] == "maya_pull" and plan["model"] == "glm-maya-s"
     plan = install_plan(_entry("hunyuan3d-2"), _LOCAL,
                         available_engines=["comfyui"])
@@ -218,20 +218,20 @@ def test_install_plan_needs_engine_model_intact():
 
 def test_install_handler_auto_selects_detected_engine(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
     monkeypatch.setattr(tools, "get_target",
                         lambda tid: get_target(tid, base_dir=tmp_path))
     _detected(monkeypatch, ["comfyui"])
     out = json.loads(tools.model_forge_install(
-        {"model_id": "qwen-image-2.1", "target": "ai-lxc",
+        {"model_id": "qwen-image-2.1", "target": "gpu-box",
          "engine_model": "model.safetensors"}))
     assert out["ok"] is True and out["engine"] == "comfyui"
     assert out["action"] == "run_on_target"
     # explicit engine override flows through the handler too
     _detected(monkeypatch, ["vllm"])
     out = json.loads(tools.model_forge_install(
-        {"model_id": "qwen-image-2.1", "target": "ai-lxc",
+        {"model_id": "qwen-image-2.1", "target": "gpu-box",
          "engine": "comfyui", "engine_model": "model.safetensors"}))
     assert out["engine"] == "comfyui"
     assert "not detected" in out["engine_note"]
@@ -252,19 +252,19 @@ def test_phantom_python_notes_are_honest():
 
 def test_browse_engine_listing_labels_phantom(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
     monkeypatch.setattr(tools, "get_target",
                         lambda tid: get_target(tid, base_dir=tmp_path))
     _detected(monkeypatch, ["comfyui"])
     out = json.loads(tools.model_forge_browse(
-        {"target": "ai-lxc", "modality": "music", "fresh": False}))
+        {"target": "gpu-box", "modality": "music", "fresh": False}))
     row = out["models"][0]
     assert row["engines"][0].startswith("python (")
     assert PHANTOM_PHRASE in row["engines"][0]
     # hybrid entries: real engines stay plain, phantom lane is labeled
     out = json.loads(tools.model_forge_browse(
-        {"target": "ai-lxc", "modality": "3d", "fresh": False}))
+        {"target": "gpu-box", "modality": "3d", "fresh": False}))
     trellis = next(m for m in out["models"] if m["id"] == "trellis.2-4b")
     assert trellis["engines"][0] == "comfyui"
     assert PHANTOM_PHRASE in trellis["engines"][1]
@@ -286,13 +286,13 @@ def test_install_plan_phantom_python_refuses_honestly():
 
 def test_remote_hf_download_argv_is_wellformed():
     from model_forge.tools import install_plan
-    plan = install_plan(_entry("hunyuan3d-2"), _LXC,
+    plan = install_plan(_entry("hunyuan3d-2"), _REMOTE,
                         engine_model="checkpoints/x.safetensors")
     assert plan["command"] == ["hf", "download",
                                "Comfy-Org/hunyuan3D_2.0_repackaged",
                                "checkpoints/x.safetensors"]
     # no engine_model -> whole-repo pull, not a stray positional '*'
-    plan = install_plan(_entry("hunyuan3d-2"), _LXC)
+    plan = install_plan(_entry("hunyuan3d-2"), _REMOTE)
     assert plan["command"] == ["hf", "download",
                                "Comfy-Org/hunyuan3D_2.0_repackaged",
                                "--include", "*"]
@@ -304,34 +304,34 @@ def test_route_missing_says_comfyui_flow_not_implemented(monkeypatch):
     monkeypatch.setattr("model_forge.media.route_exists",
                         lambda root, path, timeout=2.0: False)
     from model_forge.media import media_plan
-    plan = media_plan("3d", "http://192.168.1.62:8080")
+    plan = media_plan("3d", "http://gpu-box.example.com:8080")
     assert plan["ok"] is False and plan["action"] == "route_missing"
     assert "ComfyUI" in plan["detail"]
     assert "not implemented" in plan["detail"]
-    assert "weights-broker" in plan["detail"]
+    assert "media gateway" in plan["detail"]
     assert "/v1/videos/generations" in plan["detail"]   # what does work
 
 
 def test_generate_media_passes_honest_route_error(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    add_target(_LXC, base_dir=tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
     from model_forge import tools
     monkeypatch.setattr(tools, "get_target",
                         lambda tid: get_target(tid, base_dir=tmp_path))
     monkeypatch.setattr("model_forge.media.route_exists",
                         lambda root, path, timeout=2.0: False)
     out = json.loads(tools.model_forge_generate_media(
-        {"modality": "3d", "target": "ai-lxc"}))
+        {"modality": "3d", "target": "gpu-box"}))
     assert out["ok"] is False and out["action"] == "route_missing"
     assert "not implemented" in out["detail"]
-    assert "weights-broker" in out["detail"]
+    assert "media gateway" in out["detail"]
 
 
 def test_hunyuan3d_note_carries_comfyui_caveat():
     note = _entry("hunyuan3d-2").note
     assert "ComfyUI" in note
     assert "not implemented" in note
-    assert "weights-broker" in note
+    assert "media gateway" in note
 
 
 # --- INSTALL schema ----------------------------------------------------------

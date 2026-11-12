@@ -14,8 +14,8 @@ config_schema:
     default: []
     label: "Compute targets"
     description: >-
-      Extra compute targets as JSON, e.g. [{"id": "ai-lxc", "label": "AI LXC",
-      "base_url": "http://192.168.1.62:8080", "kind": "lan", "vram_gb": 48,
+      Extra compute targets as JSON, e.g. [{"id": "gpu-box", "label": "GPU Box",
+      "base_url": "http://gpu-box.example.com:8080", "kind": "lan", "vram_gb": 48,
       "ram_gb": 96}]. The model_forge_target_add tool stores targets too (it
       asks for your approval first); entries here win on id conflicts.
       'local' is always present.
