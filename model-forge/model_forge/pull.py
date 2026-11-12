@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -22,6 +23,10 @@ from .credentials import auth_headers
 
 _CHUNK = 1 << 20  # 1 MiB
 _TIMEOUT_S = 30.0
+# The exact shape start_download generates (uuid4().hex[:12]). Anything else
+# is rejected before it reaches the jobs path (no traversal, no odd bytes).
+_JOB_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+_DOWNLOAD_SUBDIR = "downloads"
 
 
 def _jobs_dir() -> Path:
@@ -31,13 +36,64 @@ def _jobs_dir() -> Path:
     return d
 
 
-def download_plan(url: str, dest: str) -> dict:
-    """Validate a download request (pure)."""
+def allowed_download_roots(extra_roots=None) -> list[Path]:
+    """Where a model-requested download may land: the plugin's downloads dir
+    plus any roots the USER lists in plugin settings (`download_roots`)."""
+    from plugins.plugin_storage import plugin_data_dir
+    roots = [plugin_data_dir("model-forge") / _DOWNLOAD_SUBDIR]
+    roots += [Path(str(r)) for r in (extra_roots or []) if str(r).strip()]
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        entries = (cfg.get("plugins") or {}).get("entries") or {}
+        settings = (entries.get("model-forge") or {}).get("settings") or {}
+        roots += [Path(str(r)) for r in (settings.get("download_roots") or [])
+                  if str(r).strip()]
+    except Exception:
+        pass
+    return roots
+
+
+def _confine_dest(dest: str, allowed_roots) -> tuple[Path | None, str]:
+    """Resolve and confine a download destination. Returns (path, "") when
+    safe, (None, reason) otherwise. Refuses: non-absolute paths, symlinked
+    destination entries, and anything that resolves outside the allowed roots
+    (which also defeats symlinked-parent escapes)."""
+    p = Path(dest)
+    if not p.is_absolute():
+        return None, "dest must be an absolute file path"
+    if p.is_symlink():
+        return None, f"dest may not be a symlink: {dest}"
+    try:
+        resolved = p.resolve()
+    except OSError as exc:
+        return None, f"dest not usable: {exc}"
+    for root in allowed_roots:
+        try:
+            root_resolved = Path(root).resolve()
+        except OSError:
+            continue
+        if resolved.is_relative_to(root_resolved):
+            return resolved, ""
+    return None, ("dest must be inside the plugin downloads directory or a "
+                  "configured download root (Settings -> Plugins -> Model "
+                  "Forge -> download_roots)")
+
+
+def download_plan(url: str, dest: str, allowed_roots=None) -> dict:
+    """Validate a download request (pure). Destination confinement: a
+    model-supplied dest may only land inside the plugin downloads dir or a
+    user-configured download root (symlinks refused)."""
     if not (url.startswith("http://") or url.startswith("https://")):
         return {"ok": False, "error": "url must be http(s)"}
     if not dest or not str(dest).startswith("/"):
         return {"ok": False, "error": "dest must be an absolute file path"}
-    return {"ok": True, "action": "download", "url": url, "dest": dest}
+    if allowed_roots is None:
+        allowed_roots = allowed_download_roots()
+    confined, err = _confine_dest(str(dest), allowed_roots)
+    if confined is None:
+        return {"ok": False, "error": err}
+    return {"ok": True, "action": "download", "url": url, "dest": str(confined)}
 
 
 def _write_job(job_id: str, payload: dict) -> None:
@@ -46,6 +102,9 @@ def _write_job(job_id: str, payload: dict) -> None:
 
 
 def job_status(job_id: str) -> dict:
+    # job_id is model-supplied: gate it before it joins the jobs path.
+    if not _JOB_ID_RE.fullmatch(str(job_id or "")):
+        return {"state": "unknown", "error": f"invalid job id: {job_id!r}"}
     try:
         return json.loads(
             (_jobs_dir() / f"{job_id}.json").read_text(encoding="utf-8"))

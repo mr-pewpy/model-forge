@@ -1,5 +1,5 @@
 name: model-forge
-version: 0.2.0
+version: 0.2.1
 description: >-
   Local models for every modality. Find your GPU, pick a model — chat, vision,
   image, image edit, video, 3D, music, SFX, voice, OCR — and Model Forge finds
@@ -15,8 +15,18 @@ config_schema:
     description: >-
       Extra compute targets as JSON, e.g. [{"id": "ai-lxc", "label": "AI LXC",
       "base_url": "http://192.168.1.62:8080", "kind": "lan", "vram_gb": 48,
-      "ram_gb": 96}]. The model_forge_target_add tool stores targets too;
-      entries here win on id conflicts. 'local' is always present.
+      "ram_gb": 96}]. The model_forge_target_add tool stores targets too (it
+      asks for your approval first); entries here win on id conflicts.
+      'local' is always present.
+  download_roots:
+    type: list
+    default: []
+    label: "Extra download roots"
+    description: >-
+      Optional absolute directories where model_forge_install may place
+      downloaded files, e.g. ["/home/you/models"]. Downloads are always
+      confined to the plugin's downloads dir plus these roots; symlinks are
+      refused.
   hf_token:
     type: secret
     env: HF_TOKEN
@@ -38,3 +48,5 @@ provides_tools:
   - model_forge_install
   - model_forge_activate
   - model_forge_generate_media
+provides_hooks:
+  - pre_tool_call

@@ -19,6 +19,13 @@ from .registry import MODALITY_LABELS, ModelEntry, fit_verdict, models_for
 from .targets import ComputeTarget, add_target, get_target, load_targets
 
 _CHAT_MODALITIES = ("chat", "vision")
+_IMAGE_MIME_BY_SUFFIX = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
+_MAX_IMAGE_BYTES = 25 * 1024 * 1024
 _PROVIDER_FOR_ENGINE = {
     "strata": "strata",
     "maya": "maya",
@@ -31,6 +38,46 @@ _PROVIDER_FOR_ENGINE = {
 
 def _dump(payload: dict) -> str:
     return json.dumps(payload, indent=1)
+
+
+def policy_hook(tool_name: str, args: dict | None = None, task_id: str = "",
+                **kwargs) -> dict | None:
+    """pre_tool_call policy: routes the two policy decisions through Hermes'
+    human-approval gate.
+
+    Registering a compute target decides where engine calls and media jobs
+    (including image data) can be sent; rewriting model.default redirects all
+    future conversations. Both are the USER'S decisions — the model must not
+    make them alone. Escalating with ``action: approve`` shows the user the
+    exact URL / config change; denial, timeout, or a gate error fails closed.
+    """
+    args = args or {}
+    if tool_name == "model_forge_target_add":
+        return {
+            "action": "approve",
+            "message": (
+                "Model Forge wants to register a compute target. Engine "
+                "probes, media jobs (including image data) and downloads "
+                "may then be sent to this address:\n"
+                f"  id: {args.get('id')}\n"
+                f"  label: {args.get('label') or args.get('id')}\n"
+                f"  base_url: {args.get('base_url')}"),
+            "rule_key": "model-forge:target_add",
+        }
+    if tool_name == "model_forge_activate" and args.get("apply") is True:
+        return {
+            "action": "approve",
+            "message": (
+                "Model Forge wants to rewrite your default model config "
+                "(model.default, model.provider, base_url) so future "
+                "sessions chat through this endpoint:\n"
+                f"  model_id: {args.get('model_id')}\n"
+                f"  target: {args.get('target') or 'local'}\n"
+                f"  engine_model: {args.get('engine_model') or '(registry '
+                f'default)'}"),
+            "rule_key": "model-forge:activate",
+        }
+    return None
 
 
 def _err(exc: Exception) -> str:
@@ -373,7 +420,12 @@ def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
                 return _dump({"ok": False, "action": "needs_args",
                               "detail": "3d needs model (e.g. gen/3d) and "
                                         "image (URL or local file path)"})
-            body = {"model": model, "image": _as_data_url(image)}
+            try:
+                image_ref = _as_data_url(image)
+            except ValueError as exc:
+                return _dump({"ok": False, "action": "invalid_image",
+                              "error": str(exc)})
+            body = {"model": model, "image": image_ref}
             if args.get("prompt"):
                 body["prompt"] = str(args["prompt"])
             req = urllib.request.Request(
@@ -412,13 +464,41 @@ def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
 
 
 def _as_data_url(value: str) -> str:
-    """Local image path -> data: URL (engines on other hosts need bytes)."""
+    """Local image path -> data: URL (engines on other hosts need bytes).
+
+    Model-supplied values are confined: URLs pass through, local paths must
+    pass the Hermes read-block check and look like a real image file (suffix,
+    magic bytes, size cap). Anything else raises ValueError instead of being
+    passed through raw — a raw path could otherwise read any file the user
+    can read and upload it to the engine host.
+    """
     if value.startswith(("data:", "http://", "https://")):
         return value
+    if value.startswith("file://"):
+        value = value[len("file://"):]
+    from agent.file_safety import raise_if_read_blocked
+    raise_if_read_blocked(value)
     import base64
     from pathlib import Path
     p = Path(value)
-    if not p.exists():
-        return value
-    mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
+    if not p.is_file():
+        raise ValueError(
+            f"image must be a URL, a data: URL, or an existing local image "
+            f"file: {value!r}")
+    suffix = p.suffix.lower()
+    mime = _IMAGE_MIME_BY_SUFFIX.get(suffix)
+    if mime is None:
+        raise ValueError(
+            f"unsupported image type {suffix!r} (allowed: "
+            f"{sorted(_IMAGE_MIME_BY_SUFFIX)})")
+    size = p.stat().st_size
+    if size > _MAX_IMAGE_BYTES:
+        raise ValueError(
+            f"image too large: {size} bytes (max {_MAX_IMAGE_BYTES})")
+    head = p.open("rb").read(16)
+    if not (head.startswith(b"\x89PNG\r\n\x1a\n")
+            or head.startswith(b"\xff\xd8\xff")
+            or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")):
+        raise ValueError(
+            "image content does not match its extension (magic bytes)")
     return f"data:{mime};base64," + base64.b64encode(p.read_bytes()).decode()

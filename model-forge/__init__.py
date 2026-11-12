@@ -47,3 +47,7 @@ def register(ctx):
         schema=schemas.GENERATE_MEDIA,
         handler=tools.model_forge_generate_media,
     )
+    # Policy gate: registering a compute target and rewriting the default
+    # model config are user decisions, not model decisions — tools.policy_hook
+    # escalates both to Hermes' human-approval gate (fail closed on denial).
+    ctx.register_hook("pre_tool_call", tools.policy_hook)

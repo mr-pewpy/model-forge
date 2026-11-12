@@ -108,6 +108,11 @@ def _install_agent_fakes(monkeypatch):
     agent_pkg.video_gen_provider = vid
     agent_pkg.secret_scope = secret
 
+    # the read-block chokepoint: permissive by default, monkeypatch to raise
+    fs_mod = types.ModuleType("agent.file_safety")
+    fs_mod.raise_if_read_blocked = lambda path: None
+    agent_pkg.file_safety = fs_mod
+
     # the providers lazily `import openai` / `import httpx` inside functions —
     # provide module fakes so the import resolves (tests then monkeypatch the
     # specific attributes they exercise).
@@ -122,6 +127,7 @@ def _install_agent_fakes(monkeypatch):
     monkeypatch.setitem(sys.modules, "agent.secret_scope", secret)
     monkeypatch.setitem(sys.modules, "agent.image_gen_provider", img)
     monkeypatch.setitem(sys.modules, "agent.video_gen_provider", vid)
+    monkeypatch.setitem(sys.modules, "agent.file_safety", fs_mod)
     monkeypatch.setitem(sys.modules, "openai", openai_fake)
     monkeypatch.setitem(sys.modules, "httpx", httpx_fake)
 
@@ -233,21 +239,59 @@ def test_image_live_models_network_error(image_pkg, monkeypatch):
     assert image_pkg._live_models() == []
 
 
-def test_image_as_data_url(image_pkg, tmp_path):
+def test_image_as_data_url(image_pkg, tmp_path, monkeypatch):
     p = tmp_path / "a.png"
-    p.write_bytes(b"\x89PNG")
+    p.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
     got = image_pkg._as_data_url(str(p))
     assert got.startswith("data:image/png;base64,")
-    assert base64.b64decode(got.split(",", 1)[1]) == b"\x89PNG"
-    # passthroughs
+    assert base64.b64decode(got.split(",", 1)[1]) == p.read_bytes()
+    # passthroughs: URLs and data: ride through untouched
     assert image_pkg._as_data_url("https://x/a.png") == "https://x/a.png"
     assert image_pkg._as_data_url("data:image/png;base64,AA") \
         == "data:image/png;base64,AA"
-    assert image_pkg._as_data_url("/nope/a.png") == "/nope/a.png"
-    # jpeg mime
+    # jpeg / webp mime by real magic
     j = tmp_path / "a.jpg"
-    j.write_bytes(b"\xff\xd8")
+    j.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 8)
     assert image_pkg._as_data_url(str(j)).startswith("data:image/jpeg;base64,")
+    w = tmp_path / "a.webp"
+    w.write_bytes(b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 4)
+    assert image_pkg._as_data_url(str(w)).startswith("data:image/webp;base64,")
+
+
+def test_image_as_data_url_rejects_raw_paths(image_pkg, tmp_path, monkeypatch):
+    # the old code passed raw strings through — that let any file be named
+    with pytest.raises(ValueError):
+        image_pkg._as_data_url("/nope/a.png")
+    # blocked reads propagate (core's read-block check)
+    import agent.file_safety as fs
+
+    def blocked(path):
+        raise ValueError("read blocked: secrets area")
+    monkeypatch.setattr(fs, "raise_if_read_blocked", blocked)
+    with pytest.raises(ValueError, match="read blocked"):
+        image_pkg._as_data_url(str(tmp_path / "auth.json"))
+    # suffix and magic bytes are enforced
+    monkeypatch.setattr(fs, "raise_if_read_blocked", lambda path: None)
+    fake = tmp_path / "fake.png"
+    fake.write_bytes(b"#!/bin/sh\nrm -rf ~\n")
+    with pytest.raises(ValueError, match="magic bytes"):
+        image_pkg._as_data_url(str(fake))
+    txt = tmp_path / "a.txt"
+    txt.write_bytes(b"\x89PNG\r\n\x1a\n")
+    with pytest.raises(ValueError, match="unsupported image type"):
+        image_pkg._as_data_url(str(txt))
+
+
+def test_image_generate_invalid_image_arg(image_pkg, monkeypatch):
+    monkeypatch.setitem(sys.modules, "hermes_cli.config",
+                        types.SimpleNamespace(load_config_readonly=lambda: {
+                            "plugins": {"entries": {"model-forge-image": {
+                                "settings": {"base_url": "http://x:1/v1",
+                                             "default_model": "img-1"}}}}}))
+    out = image_pkg.ModelForgeImageGenProvider().generate(
+        "make it wink", image_url="/etc/shadow")
+    assert out["success"] is False
+    assert out["error_type"] == "invalid_argument"
 
 
 # --- image provider: class surface ------------------------------------------

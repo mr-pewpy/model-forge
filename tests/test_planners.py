@@ -74,11 +74,16 @@ def test_install_plan_file_pull():
                         engine_model="checkpoints/x.safetensors")
     assert plan["ok"] is True and plan["action"] == "run_on_target"
     # download_plan validation (pure)
+    tmp_roots = [Path(tempfile.mkdtemp())]
     ok = download_plan("https://huggingface.co/x/resolve/main/y.bin",
-                       "/tmp/y.bin")
+                       str(tmp_roots[0] / "y.bin"), allowed_roots=tmp_roots)
     assert ok["ok"] is True
     assert download_plan("ftp://x/y", "/tmp/y")["ok"] is False
     assert download_plan("https://x/y", "relative/path")["ok"] is False
+    # dest outside the allowed roots is refused (no overwrite of user files)
+    outside = download_plan("https://x/y.bin", "/tmp/y.bin",
+                            allowed_roots=tmp_roots)
+    assert outside["ok"] is False and "dest must be inside" in outside["error"]
 
 
 def test_media_plan():

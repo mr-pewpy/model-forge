@@ -28,6 +28,13 @@ from agent.secret_scope import get_secret_str
 logger = logging.getLogger(__name__)
 
 _ENV_BASE_URL = "MODEL_FORGE_IMAGE_BASE_URL"
+_IMAGE_MIME_BY_SUFFIX = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
+_MAX_IMAGE_BYTES = 25 * 1024 * 1024
 _ASPECT_TO_SIZE = {
     "1:1": "1024x1024",
     "16:9": "1024x576",
@@ -79,12 +86,39 @@ def _live_models() -> List[Dict[str, Any]]:
 
 
 def _as_data_url(value: str) -> str:
-    if value.startswith(("data:", "http://", "https://", "file://")):
+    """Local image path -> data: URL. Model-supplied values are confined:
+    URLs pass through, local paths must pass the Hermes read-block check and
+    look like a real image file (suffix, magic bytes, size cap). Anything
+    else raises ValueError instead of being passed through raw — a raw path
+    could otherwise read any file the user can read and upload it to the
+    engine host."""
+    if value.startswith(("data:", "http://", "https://")):
         return value
+    if value.startswith("file://"):
+        value = value[len("file://"):]
+    from agent.file_safety import raise_if_read_blocked
+    raise_if_read_blocked(value)
     path = Path(value)
-    if not path.exists():
-        return value
-    mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+    if not path.is_file():
+        raise ValueError(
+            f"image_url must be a URL, a data: URL, or an existing local "
+            f"image file: {value!r}")
+    suffix = path.suffix.lower()
+    mime = _IMAGE_MIME_BY_SUFFIX.get(suffix)
+    if mime is None:
+        raise ValueError(
+            f"unsupported image type {suffix!r} (allowed: "
+            f"{sorted(_IMAGE_MIME_BY_SUFFIX)})")
+    size = path.stat().st_size
+    if size > _MAX_IMAGE_BYTES:
+        raise ValueError(
+            f"image too large: {size} bytes (max {_MAX_IMAGE_BYTES})")
+    head = path.open("rb").read(16)
+    if not (head.startswith(b"\x89PNG\r\n\x1a\n")
+            or head.startswith(b"\xff\xd8\xff")
+            or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")):
+        raise ValueError(
+            "image content does not match its extension (magic bytes)")
     return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode()
 
 
@@ -199,7 +233,12 @@ class ModelForgeImageGenProvider(ImageGenProvider):
                 error_type="no_model", provider=self.name, prompt=prompt,
                 aspect_ratio=aspect)
 
-        extra = _extra_body(image_url, reference_image_urls)
+        try:
+            extra = _extra_body(image_url, reference_image_urls)
+        except ValueError as exc:
+            return error_response(
+                error=str(exc), error_type="invalid_argument",
+                provider=self.name, prompt=prompt, aspect_ratio=aspect)
         try:
             import openai
             client = openai.OpenAI(api_key="local-endpoint", base_url=base,

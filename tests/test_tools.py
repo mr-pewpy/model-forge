@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import json
 import sys
+import tempfile
 import types
 from pathlib import Path
 from unittest import mock
@@ -52,6 +53,15 @@ def _stub_hermes_modules(monkeypatch, data_dir: Path):
     cfg_mod = types.ModuleType("hermes_cli.config")
     cfg_mod.load_config_readonly = lambda: {}
     monkeypatch.setitem(sys.modules, "hermes_cli.config", cfg_mod)
+
+    # agent.file_safety is the core read-block chokepoint: default it to a
+    # no-op (nothing blocked), monkeypatch raise to simulate blocked paths.
+    agent_pkg = sys.modules.get("agent") or types.ModuleType("agent")
+    fs_mod = types.ModuleType("agent.file_safety")
+    fs_mod.raise_if_read_blocked = lambda path: None
+    agent_pkg.file_safety = fs_mod
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.file_safety", fs_mod)
 
 
 def _ok_engine(monkeypatch, modalities=("chat",)):
@@ -166,16 +176,83 @@ def test_ram_gb_degrades_to_zero(monkeypatch):
 # --- pull.py ----------------------------------------------------------------
 
 def test_download_plan_validation():
-    assert pull.download_plan("https://x/y.bin", "/abs/y.bin")["ok"] is True
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        assert pull.download_plan("https://x/y.bin", str(root / "y.bin"),
+                                  allowed_roots=[root])["ok"] is True
     assert pull.download_plan("ftp://x/y", "/abs/y.bin")["ok"] is False
     assert pull.download_plan("https://x/y.bin", "rel/y.bin")["ok"] is False
 
 
-def test_job_status_unknown(tmp_path, monkeypatch):
+def test_download_plan_confinement(tmp_path):
+    root = tmp_path / "downloads"
+    root.mkdir()
+    # inside the root: fine
+    ok = pull.download_plan("https://x/y.bin", str(root / "a" / "y.bin"),
+                            allowed_roots=[root])
+    assert ok["ok"] is True
+    # outside the root: refused (this is the arbitrary-overwrite fix)
+    out = pull.download_plan("https://x/y.bin", str(tmp_path / "victim.bin"),
+                             allowed_roots=[root])
+    assert out["ok"] is False and "dest must be inside" in out["error"]
+    # traversal after the root is resolved and refused too
+    trav = pull.download_plan("https://x/y.bin",
+                              str(root / ".." / "victim.bin"),
+                              allowed_roots=[root])
+    assert trav["ok"] is False
+
+
+def test_download_plan_refuses_symlink_dest(tmp_path):
+    root = tmp_path / "downloads"
+    root.mkdir()
+    outside = tmp_path / "victim.bin"
+    outside.write_bytes(b"precious")
+    link = root / "y.bin"
+    link.symlink_to(outside)
+    res = pull.download_plan("https://x/y.bin", str(link),
+                             allowed_roots=[root])
+    assert res["ok"] is False
+
+
+def test_download_plan_refuses_symlink_parent_escape(tmp_path):
+    root = tmp_path / "downloads"
+    root.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    link_dir = root / "sub"
+    link_dir.symlink_to(outside_dir)
+    res = pull.download_plan("https://x/y.bin", str(link_dir / "y.bin"),
+                             allowed_roots=[root])
+    assert res["ok"] is False
+
+
+def test_download_plan_user_roots(tmp_path):
+    root = tmp_path / "downloads"
+    root.mkdir()
+    models = tmp_path / "models"
+    models.mkdir()
+    # a user-configured root accepts its subtree
+    ok = pull.download_plan("https://x/y.bin", str(models / "y.bin"),
+                            allowed_roots=[root, models])
+    assert ok["ok"] is True
+
+
+def test_job_status_invalid_ids(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
-    got = pull.job_status("does-not-exist")
+    # job_id is model-supplied: only the 12-hex shape start_download makes
+    for bad in ("../../auth", "", "x" * 12, "AABBCCDD0011",
+                "aabbccdd001", "aabbccdd00112", "aabbccdd001a/../x",
+                "aabbccdd001a.json"):
+        got = pull.job_status(bad)
+        assert got["state"] == "unknown", bad
+        assert "invalid job id" in got["error"], bad
+
+
+def test_job_status_missing_valid_id(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    got = pull.job_status("aabbccdd0011")
     assert got["state"] == "unknown"
-    assert "does-not-exist" in got["error"]
+    assert "aabbccdd0011" in got["error"]
 
 
 def test_start_download_validates(tmp_path, monkeypatch):
@@ -210,8 +287,9 @@ def test_start_download_and_poll(tmp_path, monkeypatch):
     monkeypatch.setattr(
         urllib.request, "urlopen",
         lambda req, timeout=None: _Resp(b"hello"))
-    res = pull.start_download("https://huggingface.co/x/y.bin",
-                              str(tmp_path / "y.bin"))
+    # dest must sit inside the stubbed plugin downloads root
+    dest = tmp_path / "model-forge" / "downloads" / "y.bin"
+    res = pull.start_download("https://huggingface.co/x/y.bin", str(dest))
     assert res["ok"] is True and res["job_id"]
     import time
     for _ in range(100):
@@ -221,7 +299,7 @@ def test_start_download_and_poll(tmp_path, monkeypatch):
         time.sleep(0.02)
     assert st["state"] == "done"
     assert st["done_bytes"] == 5
-    assert (tmp_path / "y.bin").read_bytes() == b"hello"
+    assert dest.read_bytes() == b"hello"
 
 
 def test_run_sha256_mismatch(tmp_path, monkeypatch):
@@ -248,9 +326,9 @@ def test_run_sha256_mismatch(tmp_path, monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen",
                         lambda req, timeout=None: _Resp(b"hello"))
     dest = str(tmp_path / "m.bin")
-    pull._run("j1", "https://huggingface.co/x/y.bin", dest,
+    pull._run("aabbccdd0011", "https://huggingface.co/x/y.bin", dest,
               "0" * 64)  # wrong digest
-    st = pull.job_status("j1")
+    st = pull.job_status("aabbccdd0011")
     assert st["state"] == "error"
     assert "sha256 mismatch" in st["error"]
     assert not Path(dest).exists()
@@ -286,7 +364,7 @@ def test_run_resume_range(tmp_path, monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", _fake)
     dest = str(tmp_path / "r.bin")
     Path(dest + ".part").write_bytes(b"he")  # pre-existing partial
-    pull._run("j2", "https://huggingface.co/x/y.bin", dest, "")
+    pull._run("aabbccdd0022", "https://huggingface.co/x/y.bin", dest, "")
     assert seen["range"] == "bytes=2-"
     assert Path(dest).read_bytes() == b"hello"
 
@@ -404,10 +482,13 @@ def test_install_job_id_poll(tmp_path, monkeypatch):
     from model_forge import tools
 
     (tmp_path / "model-forge" / "jobs").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "model-forge" / "jobs" / "jx.json").write_text(
-        json.dumps({"job_id": "jx", "state": "done"}))
-    out = json.loads(tools.model_forge_install({"job_id": "jx"}))
-    assert out["job_id"] == "jx" and out["state"] == "done"
+    (tmp_path / "model-forge" / "jobs" / "aabbccdd0033.json").write_text(
+        json.dumps({"job_id": "aabbccdd0033", "state": "done"}))
+    out = json.loads(tools.model_forge_install({"job_id": "aabbccdd0033"}))
+    assert out["job_id"] == "aabbccdd0033" and out["state"] == "done"
+    # a traversal-shaped job_id is rejected before it reaches the jobs dir
+    bad = json.loads(tools.model_forge_install({"job_id": "../../auth"}))
+    assert bad["state"] == "unknown" and "invalid job id" in bad["error"]
 
 
 def test_install_strata_runs_cli(tmp_path, monkeypatch):
@@ -642,7 +723,7 @@ def test_generate_media_route_missing(tmp_path, monkeypatch):
     assert out["action"] == "route_missing"
 
 
-# --- tools.py: _as_data_url -------------------------------------------------
+# --- tools.py: _as_data_url (confined) --------------------------------------
 
 def test_as_data_url_passthrough():
     from model_forge import tools
@@ -650,24 +731,147 @@ def test_as_data_url_passthrough():
     assert tools._as_data_url("https://x/y.png") == "https://x/y.png"
     assert tools._as_data_url("data:image/png;base64,AA") \
         == "data:image/png;base64,AA"
-    assert tools._as_data_url("/does/not/exist/x.png") \
-        == "/does/not/exist/x.png"
 
 
-def test_as_data_url_local_file(tmp_path):
+def _png(tmp_path, name="x.png", data=None):
+    p = tmp_path / name
+    p.write_bytes(data if data is not None
+                  else b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+    return p
+
+
+def test_as_data_url_local_file(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
     from model_forge import tools
 
-    p = tmp_path / "x.png"
-    p.write_bytes(b"\x89PNG\r\n")
+    p = _png(tmp_path)
     got = tools._as_data_url(str(p))
     assert got.startswith("data:image/png;base64,")
-    assert base64.b64decode(got.split(",", 1)[1]) == b"\x89PNG\r\n"
+    assert base64.b64decode(got.split(",", 1)[1]) == p.read_bytes()
 
 
-def test_as_data_url_jpeg_mime(tmp_path):
+def test_as_data_url_jpeg_and_webp(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
     from model_forge import tools
 
-    p = tmp_path / "x.jpg"
-    p.write_bytes(b"\xff\xd8")
-    got = tools._as_data_url(str(p))
-    assert got.startswith("data:image/jpeg;base64,")
+    j = tmp_path / "x.jpg"
+    j.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 8)
+    assert tools._as_data_url(str(j)).startswith("data:image/jpeg;base64,")
+    w = tmp_path / "x.webp"
+    w.write_bytes(b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 4)
+    assert tools._as_data_url(str(w)).startswith("data:image/webp;base64,")
+
+
+def test_as_data_url_missing_path_errors(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    # the old code passed raw strings through — that let any file be named
+    with pytest.raises(ValueError):
+        tools._as_data_url("/does/not/exist/x.png")
+
+
+def test_as_data_url_blocked_path_errors(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    import agent.file_safety as fs
+
+    def blocked(path):
+        raise ValueError("read blocked: secrets area")
+    monkeypatch.setattr(fs, "raise_if_read_blocked", blocked)
+    from model_forge import tools
+
+    with pytest.raises(ValueError, match="read blocked"):
+        tools._as_data_url(str(tmp_path / "auth.json"))
+
+
+def test_as_data_url_suffix_and_magic_enforced(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    # wrong suffix
+    bad_suffix = tmp_path / "x.txt"
+    bad_suffix.write_bytes(b"\x89PNG\r\n\x1a\n")
+    with pytest.raises(ValueError, match="unsupported image type"):
+        tools._as_data_url(str(bad_suffix))
+    # right suffix, wrong content (magic bytes)
+    fake = _png(tmp_path, "fake.png", data=b"#!/bin/sh\nrm -rf ~\n")
+    with pytest.raises(ValueError, match="magic bytes"):
+        tools._as_data_url(str(fake))
+
+
+def test_as_data_url_size_cap(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    big = _png(tmp_path, "big.png",
+               data=b"\x89PNG\r\n\x1a\n" + b"\x00" * 1024)
+    monkeypatch.setattr(tools, "_MAX_IMAGE_BYTES", 512)
+    with pytest.raises(ValueError, match="too large"):
+        tools._as_data_url(str(big))
+
+
+def test_as_data_url_file_scheme_validated(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    p = _png(tmp_path)
+    got = tools._as_data_url("file://" + str(p))
+    assert got.startswith("data:image/png;base64,")
+    # file:// does not smuggle past validation
+    with pytest.raises(ValueError):
+        tools._as_data_url("file:///does/not/exist/x.png")
+
+
+def test_generate_media_invalid_image(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_LXC, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit_job",
+                         "submit": "http://192.168.1.62:8080/jobs"})
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "ai-lxc", "model": "gen/3d",
+         "image": "/etc/shadow"}))
+    assert out["action"] == "invalid_image"
+
+
+# --- tools.py: policy_hook (approval gate) ----------------------------------
+
+def test_policy_hook_target_add_requires_approval():
+    from model_forge import tools
+
+    d = tools.policy_hook("model_forge_target_add",
+                          {"id": "evil", "label": "evil",
+                           "base_url": "https://evil.example:8080"})
+    assert d["action"] == "approve"
+    assert "https://evil.example:8080" in d["message"]
+    assert d["rule_key"] == "model-forge:target_add"
+
+
+def test_policy_hook_activate_apply_requires_approval():
+    from model_forge import tools
+
+    d = tools.policy_hook("model_forge_activate",
+                          {"model_id": "m1", "target": "ai-lxc",
+                           "apply": True})
+    assert d["action"] == "approve"
+    assert "model_id" in d["message"]
+    assert d["rule_key"] == "model-forge:activate"
+
+
+def test_policy_hook_plan_only_passes():
+    from model_forge import tools
+
+    # plan-only activate and every other call need no approval
+    assert tools.policy_hook("model_forge_activate",
+                             {"model_id": "m1"}) is None
+    assert tools.policy_hook("model_forge_activate",
+                             {"model_id": "m1", "apply": False}) is None
+    assert tools.policy_hook("model_forge_status", {}) is None
+    assert tools.policy_hook("model_forge_browse", {}) is None
+    assert tools.policy_hook("terminal", {"command": "ls"}) is None
+    assert tools.policy_hook("model_forge_install", {"model_id": "m"}) is None
