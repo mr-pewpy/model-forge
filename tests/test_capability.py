@@ -197,7 +197,9 @@ def test_install_plan_fallback_note_when_nothing_detected():
     plan = install_plan(qwen, _REMOTE, engine_model="model.safetensors",
                         available_engines=[])
     assert plan["engine"] == "vllm"           # engines[0] fallback
-    assert "falling back" in plan["engine_note"]
+    assert "no matching engine detected on this target" in plan["engine_note"]
+    assert "install one or register a target that runs it" \
+        in plan["engine_note"]
     assert "vllm" in plan["engine_note"]
     # no detection performed (None) keeps the historical quiet fallback
     plan = install_plan(qwen, _REMOTE, engine_model="model.safetensors")
@@ -342,3 +344,215 @@ def test_install_schema_has_optional_engine_arg():
     assert props["engine"]["type"] == "string"
     assert props["engine_model"]["type"] == "string"   # override still there
     assert schemas.INSTALL["parameters"].get("required", []) == []
+
+
+# --- engine_note honesty per case -------------------------------------------
+
+def test_engine_note_phantom_fallback_matches_payload():
+    from model_forge.tools import install_plan
+    # fallback lands on a phantom engine: the note must not tell the caller
+    # to install and serve it here — the payload says the opposite
+    plan = install_plan(_entry("musicgen-small"), _LOCAL, available_engines=[])
+    assert plan["engine"] == "python"
+    assert PHANTOM_PHRASE in plan["engine_note"]
+    assert "install and serve it first" not in plan["engine_note"]
+    assert plan["action"] == "custom_env_unmanaged"
+    assert PHANTOM_PHRASE in plan["detail"]     # note and payload agree
+    # the same holds for an explicit phantom override
+    plan = install_plan(_entry("musicgen-small"), _LOCAL, engine="python",
+                        available_engines=[])
+    assert PHANTOM_PHRASE in plan["engine_note"]
+    assert "install and serve it first" not in plan["engine_note"]
+
+
+def test_engine_note_real_engine_fallback_is_actionable():
+    from model_forge.tools import install_plan
+    plan = install_plan(_entry("glm-5.3-flash"), _REMOTE, available_engines=[])
+    assert plan["engine"] == "maya"
+    assert "no matching engine detected on this target" in plan["engine_note"]
+    assert "install one or register a target that runs it" \
+        in plan["engine_note"]
+
+
+# --- HF repo file auto-resolve ----------------------------------------------
+
+_GB = 1024 ** 3
+
+
+def _fake_hf(siblings=None, exc=None, payload=None):
+    """resolve_repo_weights fetch fake; records call URLs."""
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        if exc is not None:
+            raise exc
+        if payload is not None:
+            return payload
+        return {"id": "org/repo", "siblings": siblings or []}
+
+    fetch.calls = calls
+    return fetch
+
+
+def test_repo_weights_picks_largest_primary():
+    from model_forge.tools import resolve_repo_weights
+    fetch = _fake_hf([
+        {"rfilename": "README.md", "size": 1000},
+        {"rfilename": "config.json", "size": 300},
+        {"rfilename": "model.bin", "size": 1 * _GB},
+        {"rfilename": "model.safetensors", "size": 5 * _GB},
+    ])
+    plan = resolve_repo_weights("org/repo", fetch=fetch)
+    assert plan["ok"] is True and plan["action"] == "resolved"
+    assert plan["file"] == "model.safetensors"
+    assert plan["size_bytes"] == 5 * _GB
+    # model-info API with the blobs=true query parameter
+    assert fetch.calls == [
+        "https://huggingface.co/api/models/org/repo?blobs=true"]
+
+
+def test_repo_weights_skips_component_files():
+    from model_forge.tools import resolve_repo_weights
+    # the component file is the largest file — it is still not the pick
+    fetch = _fake_hf([
+        {"rfilename": "text_encoders/clip.safetensors", "size": 6 * _GB},
+        {"rfilename": "tokenizer/model.vocab", "size": 500_000},
+        {"rfilename": "model.safetensors", "size": 2 * _GB},
+    ])
+    plan = resolve_repo_weights("org/repo", fetch=fetch)
+    assert plan["ok"] is True
+    assert plan["file"] == "model.safetensors"
+    # smaller non-component weight wins over larger component weight
+    fetch = _fake_hf([
+        {"rfilename": "vae/diffusion_pytorch_model.safetensors",
+         "size": 4 * _GB},
+        {"rfilename": "unet/weights.safetensors", "size": 3 * _GB},
+    ])
+    plan = resolve_repo_weights("org/repo", fetch=fetch)
+    assert plan["file"] == "unet/weights.safetensors"
+
+
+def test_repo_weights_multi_component_pipeline():
+    from model_forge.tools import resolve_repo_weights
+    fetch = _fake_hf([
+        {"rfilename": "model_index.json", "size": 400},
+        {"rfilename": "unet/diffusion_pytorch_model.safetensors",
+         "size": 5 * _GB},
+    ])
+    plan = resolve_repo_weights("org/repo", fetch=fetch)
+    assert plan["ok"] is False and plan["action"] == "multi_file"
+    assert "model_index.json" in plan["files"]
+    assert "one file cannot satisfy" in plan["detail"]
+
+
+def test_repo_weights_multi_component_dirs():
+    from model_forge.tools import resolve_repo_weights
+    fetch = _fake_hf([
+        {"rfilename": "diffusion_models/dit.safetensors", "size": 5 * _GB},
+        {"rfilename": "text_encoders/clip.safetensors", "size": 6 * _GB},
+        {"rfilename": "vae/vae.safetensors", "size": 300 * 1024 ** 2},
+    ])
+    plan = resolve_repo_weights("org/repo", fetch=fetch)
+    assert plan["ok"] is False and plan["action"] == "multi_file"
+    assert "text_encoders/clip.safetensors" in plan["files"]
+    assert "vae/vae.safetensors" in plan["files"]
+
+
+def test_repo_weights_shards_are_multi_file():
+    from model_forge.tools import resolve_repo_weights
+    fetch = _fake_hf([
+        {"rfilename": "model-00001-of-00002.safetensors", "size": 5 * _GB},
+        {"rfilename": "model-00002-of-00002.safetensors", "size": 3 * _GB},
+    ])
+    plan = resolve_repo_weights("org/repo", fetch=fetch)
+    assert plan["ok"] is False and plan["action"] == "multi_file"
+    assert sorted(plan["files"]) == ["model-00001-of-00002.safetensors",
+                                    "model-00002-of-00002.safetensors"]
+
+
+def test_repo_weights_failsoft_when_api_unreachable():
+    from model_forge.tools import resolve_repo_weights
+    plan = resolve_repo_weights("org/repo",
+                                fetch=_fake_hf(exc=OSError("no route")))
+    assert plan["ok"] is False and plan["action"] == "needs_engine_model"
+    assert "diffusion_models/your-weights.safetensors" in plan["detail"]
+    assert "omit engine_model" in plan["detail"]
+    assert "model.safetensors" not in plan["detail"]   # old example is gone
+    # an unusable payload fails soft the same way
+    plan = resolve_repo_weights("org/repo",
+                                fetch=_fake_hf(payload={"not": "a repo"}))
+    assert plan["ok"] is False and plan["action"] == "needs_engine_model"
+    assert "omit engine_model" in plan["detail"]
+
+
+def test_install_handler_auto_resolves_repo_file(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_LOCAL, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _detected(monkeypatch, ["comfyui"])
+    monkeypatch.setattr(
+        tools, "_fetch_hf_json",
+        _fake_hf([
+            {"rfilename": "text_encoders/clip.safetensors", "size": 6 * _GB},
+            {"rfilename": "checkpoints/hunyuan3d-dit-v2_fp16.safetensors",
+             "size": 2 * _GB},
+        ]))
+    started = {}
+
+    def fake_start(url, dest, sha256=""):
+        started.update(url=url, dest=dest)
+        return {"ok": True, "job_id": "aabbccdd0011",
+                "poll": "model_forge_install with job_id=aabbccdd0011"}
+
+    monkeypatch.setattr("model_forge.pull.start_download", fake_start)
+    out = json.loads(tools.model_forge_install(
+        {"model_id": "hunyuan3d-2", "target": "local"}))
+    assert out["ok"] is True and out["action"] == "hf_download"
+    assert out["resolved_file"] \
+        == "checkpoints/hunyuan3d-dit-v2_fp16.safetensors"
+    assert out["url"].endswith(
+        "/checkpoints/hunyuan3d-dit-v2_fp16.safetensors")
+    assert "auto-resolved" in out["engine_model_source"]
+    assert started["url"] == out["url"]
+
+
+def test_install_handler_failsoft_needs_engine_model(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_LOCAL, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _detected(monkeypatch, ["comfyui"])
+    monkeypatch.setattr(
+        tools, "_fetch_hf_json",
+        _fake_hf(exc=OSError("name resolution failed")))
+    out = json.loads(tools.model_forge_install(
+        {"model_id": "hunyuan3d-2", "target": "local"}))
+    assert out["ok"] is False and out["action"] == "needs_engine_model"
+    assert "diffusion_models/your-weights.safetensors" in out["detail"]
+    assert "omit engine_model" in out["detail"]
+
+
+def test_install_handler_multi_file_lists_components(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_LOCAL, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _detected(monkeypatch, ["comfyui"])
+    monkeypatch.setattr(
+        tools, "_fetch_hf_json",
+        _fake_hf([
+            {"rfilename": "model_index.json", "size": 400},
+            {"rfilename": "diffusion_models/dit.safetensors", "size": 5 * _GB},
+        ]))
+    out = json.loads(tools.model_forge_install(
+        {"model_id": "hunyuan3d-2", "target": "local"}))
+    assert out["ok"] is False and out["action"] == "multi_file"
+    assert "model_index.json" in out["files"]

@@ -2,7 +2,9 @@
 
 llama-server fingerprints via /props (build_info + model fields); Ollama
 answers /api/tags instead. Port list mirrors what core probes by default
-(:8080) plus the common alternates — plain HTTP, no auth assumed.
+(:8080) plus the common alternates — and Ollama's stock default port
+(11434), which must be scanned or a plain Ollama install is invisible —
+plain HTTP, no auth assumed.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ import urllib.request
 
 from .base import EngineStatus, root_url
 
-PROBE_PORTS = (8080, 8081, 8000, 8001)
+PROBE_PORTS = (8080, 8081, 8000, 8001, 11434)
 _TIMEOUT_S = 2.0
 
 
@@ -72,7 +74,8 @@ def detect(base_url: str = "") -> EngineStatus:
         id="llamacpp",
         display_name="llama.cpp (llama-server)",
         available=False,
-        detail="no llama-server on ports 8080/8081/8000/8001 "
-               "(the managed runtime starts with Hermes when enabled)",
+        detail="no llama-server or Ollama on ports "
+               + "/".join(str(p) for p in PROBE_PORTS)
+               + " (the managed runtime starts with Hermes when enabled)",
         modalities=("chat", "vision"),
     )

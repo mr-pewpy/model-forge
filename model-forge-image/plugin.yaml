@@ -1,15 +1,19 @@
 name: model-forge-image
 kind: backend
-version: 0.1.0
+version: 1.0.0
+requires_hermes: ">=0.23.0"
 description: "Model Forge local image generation backend — routes image_generate to any OpenAI-compatible images API (media gateway, vLLM-Omni, SGLang Diffusion)."
 author: anai (Charles / Pewpy)
 license: MIT
+python_dependencies:
+  - "openai>=1,<3"
+  - "httpx>=0.27,<1"
 config_schema:
   base_url:
     type: str
     default: ""
     label: "Images endpoint base URL"
-    description: "e.g. http://gpu-box.example.com:8080/v1 — any OpenAI-compatible images API."
+    description: "Base URL of any OpenAI-compatible images API, e.g. http://<host>:<port>/v1."
   default_model:
     type: str
     default: ""

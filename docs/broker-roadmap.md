@@ -60,8 +60,11 @@ Missing (the v2 work):
 - **Model orchestration** — no workflow scopes, no pre-warm, no restore.
 - **Engine install** — "Model Forge does not start engines" is the current
   honest rule; all engine adapters are detect-only.
-- **HF filename auto-resolve** — file pulls demand an exact `engine_model=`
-  path inside the repo; the registry does not guess filenames.
+- **HF filename auto-resolve** — file pulls resolve repo filenames
+  automatically where possible; fall back to an exact `engine_model=` path
+  inside the repo when resolution cannot determine the file. Smarter
+  resolution (prefer full weights, quant variants only on request) continues
+  as v2 work.
 
 ## 3. Battle-tested serving policy
 

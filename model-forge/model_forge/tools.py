@@ -7,21 +7,47 @@ logic is unit-tested without touching the network or the Hermes config.
 from __future__ import annotations
 
 import json
+import re
+import time
+import urllib.request
+import uuid
 
 from .credentials import status as credentials_status
 from .engines import detect_engines
 from .engines import maya as maya_adapter
 from .engines import strata as strata_adapter
-from .engines.base import root_url
+from .engines.base import route_exists, root_url
 from .hardware import probe_hardware
 from .media import media_plan
 from .registry import (
-    MODALITY_LABELS, PHANTOM_ENGINE_NOTE, PHANTOM_ENGINES, ModelEntry,
-    fit_report, fit_verdict, models_for,
+    MODALITIES, MODALITY_LABELS, PHANTOM_ENGINE_NOTE, PHANTOM_ENGINES,
+    ModelEntry, fit_report, fit_verdict, models_for,
 )
 from .targets import ComputeTarget, add_target, get_target, load_targets
 
 _CHAT_MODALITIES = ("chat", "vision")
+# model_forge_generate_media joins a model-supplied job id into a /jobs/ URL
+# path on the compute target: only these characters, this length, may pass.
+_JOB_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+# Engines that install by pulling a file out of a source repo on this machine.
+_FILE_PULL_ENGINES = ("comfyui", "vllm", "sglang")
+# What to tell the caller to pass to engine_model when a repo file must be
+# named by hand.
+_FILE_PULL_HINT = (
+    "a file path inside the repo, e.g. "
+    "diffusion_models/your-weights.safetensors; omit engine_model and "
+    "Model Forge resolves it from the repo")
+# Registry ids that are catalog bookkeeping, not servable model ids.
+_CATALOG_MARKER_IDS = frozenset({"core-gguf-catalog"})
+_WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".ckpt", ".pt", ".bin")
+_WEIGHT_SUFFIX_RANK = {s: i for i, s in enumerate(_WEIGHT_SUFFIXES)}
+# Paths that hold auxiliary components, never the primary weights file.
+_COMPONENT_DIR_NAMES = ("vae", "clip")
+_COMPONENT_NAME_FRAGMENTS = ("tokenizer", "processor", "config",
+                             "model_index.json")
+_SHARD_RE = re.compile(r"-\d{5}-of-\d{5}\.\w+$")
+# Files at or above this size count as "large" for multi-component detection.
+_LARGE_FILE_BYTES = 100 * 1024 * 1024
 _IMAGE_MIME_BY_SUFFIX = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -109,12 +135,20 @@ def _select_engine(entry: ModelEntry, requested: str,
     """(engine, honest note) for an install plan.
 
     An explicit override wins; otherwise the first of entry.engines detected
-    on the target; otherwise entry.engines[0] with a fallback note when
-    detection ran and found nothing. Phantom engines are never auto-selected.
+    on the target; otherwise entry.engines[0] as the planned fallback when
+    detection ran and found nothing. The auto-match never selects a phantom
+    engine (the plugin cannot run one), but the fallback can land on a
+    phantom when entry.engines[0] is one — the returned note and the install
+    payload then say plainly that the plugin cannot install or serve it,
+    instead of telling the caller to install and serve it here.
     """
     requested = (requested or "").strip()
     detected = available_engines is not None
     if requested:
+        if requested in PHANTOM_ENGINES:
+            return requested, (f"'{requested}' needs a "
+                               f"{PHANTOM_ENGINE_NOTE} — Model Forge cannot "
+                               "install or serve it")
         if detected and requested not in available_engines:
             return requested, (f"caller-specified engine '{requested}' was "
                                "not detected on this target — install and "
@@ -125,12 +159,20 @@ def _select_engine(entry: ModelEntry, requested: str,
                 and e in available_engines:
             return e, ""
     if entry.engines:
+        fallback = entry.engines[0]
         if detected:
-            return entry.engines[0], (
-                f"none of {list(entry.engines)} was detected on this target; "
-                f"falling back to '{entry.engines[0]}' — install and serve it "
-                "first")
-        return entry.engines[0], ""
+            if fallback in PHANTOM_ENGINES:
+                return fallback, (
+                    f"'{fallback}' needs a {PHANTOM_ENGINE_NOTE} — Model "
+                    "Forge cannot install or serve it; none of "
+                    f"{list(entry.engines)} was detected on this target. Run "
+                    "the weights in that environment yourself, or register a "
+                    "target that runs a supported engine")
+            return fallback, (
+                "no matching engine detected on this target — install one or "
+                "register a target that runs it (planning for the listed "
+                f"engine '{fallback}')")
+        return fallback, ""
     return "", ""
 
 
@@ -198,9 +240,8 @@ def install_plan(entry: ModelEntry, target: ComputeTarget,
         if target.kind == "local" and entry.source:
             if not engine_model:
                 return _plan(ok=False, action="needs_engine_model",
-                             detail="pass engine_model=<file path inside the "
-                                    "source repo> (e.g. model.safetensors), "
-                                    "and optionally dest=<absolute path>")
+                             detail="pass engine_model=" + _FILE_PULL_HINT +
+                                    "; optionally pass dest=<absolute path>")
             fname = engine_model.rstrip("/").rsplit("/", 1)[-1]
             return _plan(ok=True, action="hf_download",
                          url=f"https://huggingface.co/{entry.source}"
@@ -228,6 +269,19 @@ def install_plan(entry: ModelEntry, target: ComputeTarget,
 def activation_plan(entry: ModelEntry, target: ComputeTarget,
                     available_engines: list[str], engine_model: str = "") -> dict:
     """What model_forge_activate would do — no side effects (unit-tested)."""
+    if entry.id in _CATALOG_MARKER_IDS:
+        return {"ok": False, "action": "placeholder_not_activatable",
+                "detail": f"'{entry.id}' is a catalog marker for Hermes' "
+                          "built-in Local Models catalog, not a model id a "
+                          "running engine serves — it cannot be written to "
+                          "model.default. Activate a concrete served model "
+                          "instead (GGUF chat models are managed in the "
+                          "built-in Local Models pane)"}
+    if entry.status == "stub":
+        return {"ok": False, "action": "placeholder_not_activatable",
+                "detail": f"'{entry.id}' is a placeholder entry — no engine "
+                          "serves this modality yet, so it cannot become the "
+                          "default model. Activate a concrete served model"}
     if entry.modality not in _CHAT_MODALITIES:
         return {"ok": False, "action": "not_a_chat_model",
                 "detail": f"{entry.modality} models activate through their "
@@ -298,13 +352,17 @@ def model_forge_browse(args: dict | None = None, **kwargs) -> str:
     """Models for a modality, priced against a compute target (advisory)."""
     args = args or {}
     try:
+        modality = args.get("modality") or None
+        if modality is not None and modality not in MODALITIES:
+            return _dump({"error": f"unknown modality: {modality!r}; valid "
+                                   f"modalities: {list(MODALITIES)}"})
         target = get_target(args.get("target"))
         if target is None:
             return _dump({"error": f"unknown target: {args.get('target')}"})
         hw = _hw_for_target(target)
         base = "" if target.kind == "local" else target.base_url
         available = [e.id for e in detect_engines(base) if e.available]
-        entries = models_for(modality=args.get("modality") or None,
+        entries = models_for(modality=modality,
                              engine=args.get("engine") or None)
         out = {
             "target": target.id,
@@ -338,11 +396,21 @@ def model_forge_browse(args: dict | None = None, **kwargs) -> str:
         return _err(exc)
 
 
+def _fresh_disabled(value) -> bool:
+    """True for an explicit opt-out of the live layer: false, 'false', '0'
+    or 'no' (any case, whitespace tolerated). A bare string must not silently
+    re-enable the network call."""
+    if value is False:
+        return True
+    return isinstance(value, str) \
+        and value.strip().lower() in ("false", "0", "no")
+
+
 def _fresh_section(args: dict, entries: list[ModelEntry]) -> dict:
     """Live HuggingFace freshness block for browse: newest-first rows with
     dates, honest 'fresh/unvetted' labeling, fail-soft to an unavailable
     marker. Pass fresh=false for curated-only output (no network call)."""
-    if args.get("fresh") is False:
+    if _fresh_disabled(args.get("fresh")):
         return {
             "live_discovery": "disabled",
             "fresh": [],
@@ -410,19 +478,42 @@ def model_forge_install(args: dict | None = None, **kwargs) -> str:
         from . import pull
         if args.get("job_id"):
             return _dump(pull.job_status(str(args["job_id"])))
-        entry = next((m for m in models_for()
-                      if m.id == args.get("model_id")), None)
+        model_id = str(args.get("model_id") or "").strip()
+        if not model_id:
+            return _dump({"error": "model_id required (or job_id to poll a "
+                                   "download)"})
+        entry = next((m for m in models_for() if m.id == model_id), None)
         if entry is None:
-            return _dump({"error": f"unknown model_id: {args.get('model_id')}"})
+            return _dump({"error": f"unknown model_id: {model_id}"})
         target = get_target(args.get("target"))
         if target is None:
             return _dump({"error": f"unknown target: {args.get('target')}"})
         base = "" if target.kind == "local" else target.base_url
         available = [e.id for e in detect_engines(base) if e.available]
-        plan = install_plan(entry, target,
-                            engine_model=str(args.get("engine_model", "")),
-                            engine=str(args.get("engine", "")),
-                            available_engines=available)
+        engine_model = str(args.get("engine_model") or "")
+        engine_arg = str(args.get("engine", ""))
+        plan = install_plan(entry, target, engine_model=engine_model,
+                            engine=engine_arg, available_engines=available)
+        if (plan.get("action") == "needs_engine_model"
+                and not engine_model.strip()
+                and target.kind == "local"
+                and entry.source
+                and plan.get("engine") in _FILE_PULL_ENGINES):
+            # No file named: resolve the primary weights file from the repo's
+            # file list instead of making the caller guess a path.
+            resolved = resolve_repo_weights(entry.source)
+            if resolved.get("ok"):
+                plan = install_plan(entry, target,
+                                    engine_model=resolved["file"],
+                                    engine=engine_arg,
+                                    available_engines=available)
+                plan["resolved_file"] = resolved["file"]
+                plan["engine_model_source"] = (
+                    f"auto-resolved from the {entry.source} file list on "
+                    "Hugging Face")
+            else:
+                plan.update({k: v for k, v in resolved.items()
+                             if k not in ("engine", "engine_note")})
         if plan.get("action") == "maya_pull":
             result = maya_adapter.pull(plan["model"], detach=True,
                                        base_url=target.base_url)
@@ -455,10 +546,12 @@ def model_forge_activate(args: dict | None = None, **kwargs) -> str:
     (takes effect next session; revert with `hermes model`)."""
     args = args or {}
     try:
-        entry = next((m for m in models_for()
-                      if m.id == args.get("model_id")), None)
+        model_id = str(args.get("model_id") or "").strip()
+        if not model_id:
+            return _dump({"error": "model_id required"})
+        entry = next((m for m in models_for() if m.id == model_id), None)
         if entry is None:
-            return _dump({"error": f"unknown model_id: {args.get('model_id')}"})
+            return _dump({"error": f"unknown model_id: {model_id}"})
         target = get_target(args.get("target"))
         if target is None:
             return _dump({"error": f"unknown target: {args.get('target')}"})
@@ -469,46 +562,67 @@ def model_forge_activate(args: dict | None = None, **kwargs) -> str:
                                engine_model=str(args.get("engine_model", "")))
         if plan.get("ok"):
             mods = {m for e in statuses if e.available for m in e.modalities}
-            base_v1 = root_url(target.base_url) + "/v1"
+            root = root_url(target.base_url)
+            base_v1 = root + "/v1"
             media = {}
-            if "image" in mods:
-                media["image_gen"] = (
-                    "hermes config set plugins.entries.model-forge-image"
+            withheld = []
+            for modality, key, route, plugin in (
+                    ("image", "image_gen", "/v1/images/generations",
+                     "model-forge-image"),
+                    ("video", "video_gen", "/v1/videos/generations",
+                     "model-forge-video")):
+                if modality not in mods:
+                    continue
+                if not route_exists(root, route):
+                    # An engine can list a modality it does not actually
+                    # serve on an OpenAI-compatible route (ComfyUI lists
+                    # image/video/3d but serves none of these endpoints),
+                    # so the setup hint is emitted only after the route
+                    # answers a probe.
+                    withheld.append(f"{key} -> {root}{route}")
+                    continue
+                media[key] = (
+                    f"hermes config set plugins.entries.{plugin}"
                     f".settings.base_url {base_v1} && hermes config set "
-                    "image_gen.provider model-forge")
-            if "video" in mods:
-                media["video_gen"] = (
-                    "hermes config set plugins.entries.model-forge-video"
-                    f".settings.base_url {base_v1} && hermes config set "
-                    "video_gen.provider model-forge")
+                    f"{key}.provider model-forge")
             if media:
                 plan["media_setup"] = media
-        if plan.get("ok") and args.get("apply") is True:
-            try:
-                from hermes_cli.model_setup import persist_model_selection
-                saved = persist_model_selection(
-                    plan["model"], plan["provider"],
-                    base_url=plan["base_url"])
-                plan["applied"] = True
-                plan["saved_model_section"] = saved
-            except Exception as exc:
+            if withheld:
+                plan["media_setup_note"] = (
+                    "an engine on this target lists these modalities but the "
+                    "endpoint did not answer the matching route, so the "
+                    "setup hint is withheld (run it manually only if your "
+                    "endpoint serves that route): " + "; ".join(withheld))
+        if plan.get("ok"):
+            if args.get("apply") is True:
+                try:
+                    from hermes_cli.model_setup import persist_model_selection
+                    saved = persist_model_selection(
+                        plan["model"], plan["provider"],
+                        base_url=plan["base_url"])
+                    plan["applied"] = True
+                    plan["saved_model_section"] = saved
+                except Exception as exc:
+                    plan["applied"] = False
+                    plan["error"] = f"{type(exc).__name__}: {exc}"
+            else:
                 plan["applied"] = False
-                plan["error"] = f"{type(exc).__name__}: {exc}"
+                plan["hint"] = "re-run with apply=true to write the config"
         else:
             plan["applied"] = False
-            plan["hint"] = "re-run with apply=true to write the config"
         return _dump(plan)
     except Exception as exc:
         return _err(exc)
 
 
 def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
-    """Generate 3D models / music / SFX through a compute target's engine
-    API. 3d submits a job (poll with job_id); music/sfx return audio."""
+    """Generate 3D models / music / SFX through a compute target's
+    media-gateway endpoint. 3d submits a job (poll with job_id); music/sfx
+    run synchronously and return audio (JSON result bodies are passed
+    through)."""
     args = args or {}
     try:
         import json as _json
-        import urllib.request
         modality = str(args.get("modality", ""))
         target = get_target(args.get("target"))
         if target is None:
@@ -519,8 +633,14 @@ def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
         root = root_url(target.base_url)
         if modality == "3d":
             if args.get("job_id"):
+                job_id = str(args["job_id"])
+                if not _JOB_TOKEN_RE.fullmatch(job_id):
+                    return _dump({"ok": False, "action": "invalid_job_id",
+                                  "error": "job_id must be 1-128 ASCII "
+                                           "letters, digits, '_' or '-' "
+                                           f"(got {job_id!r})"})
                 req = urllib.request.Request(
-                    f"{root}/jobs/{args['job_id']}")
+                    f"{root}/jobs/{job_id}")
                 with urllib.request.urlopen(req, timeout=30.0) as resp:
                     return _dump({"job": _json.loads(
                         resp.read().decode("utf-8", "replace"))})
@@ -552,7 +672,8 @@ def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
                           "poll": f"model_forge_generate_media with "
                                   f"modality=3d, target={target.id}, "
                                   f"job_id={out.get('id', '')}"})
-        # music / sfx: sync POST returning audio
+        # music / sfx: synchronous POST. The caller waits while the engine
+        # renders; gateways return audio bytes, some return a JSON body.
         model = str(args.get("model", "")).strip()
         prompt = str(args.get("prompt", "")).strip()
         if not model or not prompt:
@@ -562,15 +683,191 @@ def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
         req = urllib.request.Request(
             plan["submit"], data=_json.dumps(body).encode(),
             headers={"Content-Type": "application/json"}, method="POST")
+        started = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=600.0) as resp:
-                out = _json.loads(resp.read().decode("utf-8", "replace"))
+                raw = resp.read()
+                try:
+                    content_type = resp.headers.get("Content-Type") or ""
+                except Exception:  # noqa: BLE001 — headers are best-effort
+                    content_type = ""
         except Exception as exc:  # noqa: BLE001
             return _dump({"ok": False, "action": "submit_failed",
                           "error": f"{type(exc).__name__}: {exc}"})
-        return _dump({"ok": True, "action": "done", "result": out})
+        waited = time.monotonic() - started
+        wait_note = (f"this call blocked {waited:.1f} s until the engine "
+                     "finished rendering")
+        try:
+            out = _json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            out = None
+        if out is not None:
+            return _dump({"ok": True, "action": "done", "result": out,
+                          "waited_seconds": round(waited, 3),
+                          "note": wait_note})
+        path = _save_generated_audio(modality, raw, content_type)
+        return _dump({"ok": True, "action": "done", "audio": str(path),
+                      "bytes": len(raw), "content_type": content_type,
+                      "waited_seconds": round(waited, 3),
+                      "note": wait_note + f"; audio saved to {path}"})
     except Exception as exc:
         return _err(exc)
+
+
+def _audio_suffix(raw: bytes, content_type: str) -> str:
+    """File suffix for a generated audio payload: Content-Type first, then
+    container sniffing, then an honest .bin."""
+    mime = (content_type or "").split(";", 1)[0].strip().lower()
+    by_mime = {
+        "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/wav": ".wav",
+        "audio/x-wav": ".wav", "audio/wave": ".wav", "audio/ogg": ".ogg",
+        "audio/flac": ".flac", "audio/mp4": ".m4a", "audio/aac": ".aac",
+        "audio/webm": ".weba",
+    }
+    if mime in by_mime:
+        return by_mime[mime]
+    if raw.startswith(b"ID3") or (len(raw) > 2 and raw[0] == 0xFF
+                                  and raw[1] & 0xE0 == 0xE0):
+        return ".mp3"
+    if raw.startswith(b"RIFF") and raw[8:12] == b"WAVE":
+        return ".wav"
+    if raw.startswith(b"OggS"):
+        return ".ogg"
+    if raw.startswith(b"fLaC"):
+        return ".flac"
+    return ".bin"
+
+
+def _save_generated_audio(modality: str, raw: bytes,
+                          content_type: str):
+    """Persist a non-JSON generation response under the plugin data dir
+    (model-forge/media/) and return the path."""
+    from pathlib import Path
+    from plugins.plugin_storage import plugin_data_dir
+    media_dir = plugin_data_dir("model-forge") / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    name = f"{modality}-{uuid.uuid4().hex[:12]}" \
+           f"{_audio_suffix(raw, content_type)}"
+    path = Path(media_dir) / name
+    path.write_bytes(raw)
+    return path
+
+
+# --- Hugging Face repo file auto-resolve ------------------------------------
+
+def _fetch_hf_json(url: str) -> dict:
+    """GET a JSON document from Hugging Face (stdlib urllib)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "model-forge"})
+    with urllib.request.urlopen(req, timeout=15.0) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _is_weights_file(path: str) -> bool:
+    return path.lower().endswith(_WEIGHT_SUFFIXES)
+
+
+def _suffix_rank(path: str) -> int:
+    """Preference rank for a weights file's suffix (lower = preferred)."""
+    low = path.lower()
+    for suffix, rank in _WEIGHT_SUFFIX_RANK.items():
+        if low.endswith(suffix):
+            return rank
+    return 99
+
+
+def _is_component_path(path: str) -> bool:
+    """True for paths that hold auxiliary components (text encoders, VAEs,
+    CLIP, tokenizer/processor/config files) — never the primary weights."""
+    for part in path.lower().split("/"):
+        if part in _COMPONENT_DIR_NAMES or part.startswith("text_encoder"):
+            return True
+        for fragment in _COMPONENT_NAME_FRAGMENTS:
+            if fragment in part:
+                return True
+    return False
+
+
+def _weights_plan(files: list[tuple[str, int]]) -> dict:
+    """Pick the primary weights file from a repo file list (pure).
+
+    files: (path, size_bytes) rows. Picks the largest weights-suffix file
+    that is not an auxiliary component. If one file cannot honestly satisfy
+    an install — a diffusers-style multi-component pipeline
+    (model_index.json), large component weights in several directories, or
+    sharded weights — returns a multi_file plan listing what was found
+    instead of pretending one file suffices.
+    """
+    names = [p for p, _ in files]
+    if any(p.lower().rsplit("/", 1)[-1] == "model_index.json" for p in names):
+        return {"ok": False, "action": "multi_file",
+                "detail": "model_index.json marks a multi-component model "
+                          "pipeline — one file cannot satisfy an install; "
+                          "pass engine_model (and dest) once per component",
+                "files": sorted(names)}
+    weights = [(p, s) for p, s in files if _is_weights_file(p)]
+    large = [(p, s) for p, s in weights if s >= _LARGE_FILE_BYTES]
+    comp_dirs = {p.rsplit("/", 1)[0].lower() for p, _ in large
+                 if _is_component_path(p)}
+    if len(comp_dirs) >= 2:
+        return {"ok": False, "action": "multi_file",
+                "detail": "large component weights in several directories ("
+                          + ", ".join(sorted(comp_dirs))
+                          + ") — one file cannot satisfy an install; pass "
+                          "engine_model (and dest) once per component",
+                "files": sorted(p for p, _ in large)}
+    candidates = [(p, s) for p, s in weights if not _is_component_path(p)]
+    shards = [(p, s) for p, s in candidates if _SHARD_RE.search(p)]
+    if len(shards) >= 2:
+        return {"ok": False, "action": "multi_file",
+                "detail": "weights are split into "
+                          f"{len(shards)} shard files — every shard is "
+                          "required; pass engine_model once per shard",
+                "files": sorted(p for p, _ in shards)}
+    if not candidates:
+        return {"ok": False, "action": "no_weights_found",
+                "detail": "no primary weights file found in this repo; "
+                          "weight files present: "
+                          + (", ".join(sorted(p for p, _ in weights))
+                             or "none"),
+                "files": sorted(names)}
+    pick = min(candidates,
+               key=lambda row: (-row[1], _suffix_rank(row[0]), row[0]))
+    return {"ok": True, "action": "resolved", "file": pick[0],
+            "size_bytes": pick[1],
+            "detail": "primary weights file picked from the repo file list"}
+
+
+def resolve_repo_weights(repo_id: str, fetch=None) -> dict:
+    """Resolve the primary weights file of a Hugging Face repo from its file
+    list (model-info API, blobs=true). stdlib urllib; pass fetch= to inject
+    a fake in tests. API unreachable or unusable fails soft: the caller gets
+    the corrected needs_engine_model message instead of a crash."""
+    fetch = fetch or _fetch_hf_json
+    url = f"https://huggingface.co/api/models/{repo_id}?blobs=true"
+    try:
+        data = fetch(url)
+    except Exception:  # noqa: BLE001 — fail soft to a manual path request
+        return {"ok": False, "action": "needs_engine_model",
+                "detail": "pass engine_model=" + _FILE_PULL_HINT}
+    rows = data.get("siblings") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return {"ok": False, "action": "needs_engine_model",
+                "detail": "pass engine_model=" + _FILE_PULL_HINT}
+    files = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("rfilename")
+        if not isinstance(name, str) or not name:
+            continue
+        size = row.get("size")
+        if not isinstance(size, int):
+            lfs = row.get("lfs")
+            size = lfs.get("size") if isinstance(lfs, dict) else None
+        files.append((name, size if isinstance(size, int) else 0))
+    plan = _weights_plan(files)
+    plan["repo"] = repo_id
+    return plan
 
 
 def _as_data_url(value: str) -> str:

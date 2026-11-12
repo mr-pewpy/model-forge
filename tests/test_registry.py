@@ -76,3 +76,54 @@ def test_engine_status_defaults():
 
     e = EngineStatus(id="x", display_name="X", available=False)
     assert e.models_loaded == () and e.modalities == ()
+
+
+# --- registry truth: sources, gated repos, honest notes ----------------------
+
+def test_model_entry_shape_backward_compatible():
+    m = MODELS[0]
+    for attr in ("id", "name", "modality", "engines", "source", "size_gb",
+                 "vram_gb_min", "ram_gb_min", "engine_managed_fit", "status",
+                 "note", "engine_models", "released"):
+        assert hasattr(m, attr), attr
+
+
+def test_sources_point_at_public_repos():
+    # corrected against the HuggingFace model-info API (each verified live):
+    # the old sources were private/placeholder namespaces that fail with 401
+    expected = {
+        "trellis.2-4b": "microsoft/TRELLIS.2-4B",
+        "ace-step": "ACE-Step/acestep-v15-xl-turbo",
+        "chatterbox-t3-turbo": "ResembleAI/chatterbox-turbo",
+    }
+    for mid, src in expected.items():
+        m = next(x for x in MODELS if x.id == mid)
+        assert m.source == src, mid
+    for m in MODELS:
+        assert not m.source.startswith("tetherto/"), m.id
+
+
+def test_gated_repos_are_noted():
+    for mid in ("ltx-2.5", "stable-audio-open"):
+        m = next(x for x in MODELS if x.id == mid)
+        assert "gated repo: HF account + license acceptance required" in m.note, mid
+
+
+def test_comfyui_notes_do_not_overclaim():
+    for m in MODELS:
+        if "comfyui" in m.engines:
+            assert "download works" in m.note, m.id
+            assert "generation is not plugin-driven yet" in m.note, m.id
+            assert "workflow lane also works" not in m.note, m.id
+
+
+def test_python_notes_state_unmanaged_env():
+    for m in MODELS:
+        if "python" in m.engines:
+            assert "custom Python environment the plugin does not manage" in m.note, m.id
+            assert "Model Forge cannot run it" in m.note, m.id
+
+
+def test_status_values_are_known():
+    for m in MODELS:
+        assert m.status in ("validated", "known", "stub"), (m.id, m.status)

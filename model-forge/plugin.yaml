@@ -1,5 +1,6 @@
 name: model-forge
-version: 0.2.1
+version: 1.0.0
+requires_hermes: ">=0.23.0"
 description: >-
   Local models for every modality. Find your GPU, pick a model — chat, vision,
   image, image edit, video, 3D, music, SFX, voice, OCR — and Model Forge finds
@@ -14,9 +15,9 @@ config_schema:
     default: []
     label: "Compute targets"
     description: >-
-      Extra compute targets as JSON, e.g. [{"id": "gpu-box", "label": "GPU Box",
-      "base_url": "http://gpu-box.example.com:8080", "kind": "lan", "vram_gb": 48,
-      "ram_gb": 96}]. The model_forge_target_add tool stores targets too (it
+      Extra compute targets as JSON, e.g. [{"id": "remote-1", "label": "Remote
+      target", "base_url": "http://<host>:<port>", "kind": "lan", "vram_gb":
+      <VRAM>, "ram_gb": <RAM>}]. The model_forge_target_add tool stores targets too (it
       asks for your approval first); entries here win on id conflicts.
       'local' is always present.
   download_roots:

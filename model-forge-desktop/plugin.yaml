@@ -1,6 +1,7 @@
 name: model-forge-desktop
 kind: desktop
-version: 0.1.0
+version: 1.0.0
+requires_hermes: ">=0.23.0"
 description: "Model Forge cockpit pane — compute targets, live engines, models, and hardware at a glance."
 author: anai (Charles / Pewpy)
 license: MIT

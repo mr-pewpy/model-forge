@@ -556,11 +556,14 @@ def test_activate_plan_only(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "get_target",
                         lambda tid: get_target(tid, base_dir=tmp_path))
     _ok_engine(monkeypatch, ("chat", "image"))
+    # the media hint is emitted only when the endpoint serves the route
+    monkeypatch.setattr(tools, "route_exists",
+                        lambda root, path, timeout=2.0: True)
     out = json.loads(tools.model_forge_activate(
         {"model_id": "glm-5.3-flash", "target": "gpu-box"}))
     assert out["ok"] is True and out["applied"] is False
     assert "hint" in out
-    # image modality present -> media setup hint for image_gen
+    # image modality present AND the route served -> media setup hint
     assert "media_setup" in out and "image_gen" in out["media_setup"]
 
 
@@ -707,6 +710,8 @@ def test_generate_media_music_done(tmp_path, monkeypatch):
          "prompt": "lofi"}))
     assert out["ok"] is True and out["action"] == "done"
     assert out["result"]["url"] == "http://x/a.mp3"
+    # the synchronous wait is stated in the output
+    assert "blocked" in out["note"]
 
 
 def test_generate_media_route_missing(tmp_path, monkeypatch):
@@ -877,3 +882,202 @@ def test_policy_hook_plan_only_passes():
     assert tools.policy_hook("model_forge_browse", {}) is None
     assert tools.policy_hook("terminal", {"command": "ls"}) is None
     assert tools.policy_hook("model_forge_install", {"model_id": "m"}) is None
+
+
+# --- honesty fixes: required args, job_id shape, fresh strings, modality ----
+
+def test_install_and_activate_require_model_id(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    # empty args must say what is required — never leak a literal 'None'
+    out = json.loads(tools.model_forge_install({}))
+    assert out["error"] == "model_id required (or job_id to poll a download)"
+    assert "None" not in json.dumps(out)
+    out = json.loads(tools.model_forge_install({"model_id": ""}))
+    assert "model_id required" in out["error"]
+    assert "None" not in json.dumps(out)
+    out = json.loads(tools.model_forge_activate({}))
+    assert "model_id required" in out["error"]
+    assert "None" not in json.dumps(out)
+
+
+def test_generate_media_3d_job_id_is_shape_validated(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit_job",
+                         "submit": "http://gpu-box.example.com:8080/jobs"})
+
+    def _no_call(req, timeout=None):
+        raise AssertionError("an invalid job_id must never reach the target")
+
+    monkeypatch.setattr("urllib.request.urlopen", _no_call)
+    for bad in ("../secret", "..", "a/b", "x" * 129, "id 1", "ünicode",
+                "job;rm", "a%2e%2e", "-bad\u2013dash"):
+        out = json.loads(tools.model_forge_generate_media(
+            {"modality": "3d", "target": "gpu-box", "job_id": bad}))
+        assert out["ok"] is False and out["action"] == "invalid_job_id", bad
+        assert "job_id" in out["error"]
+    # a well-formed id (letters, digits, _ and -) is forwarded and polled
+    _fake_urlopen(monkeypatch, json.dumps({"status": "done"}).encode())
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box", "job_id": "job-1_A"}))
+    assert out["job"] == {"status": "done"}
+
+
+def test_generate_media_music_audio_bytes_saved(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit",
+                         "submit": "http://gpu-box.example.com:8080"
+                                   "/v1/audio/music"})
+    wav = b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 8
+    _fake_urlopen(monkeypatch, wav)
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "music", "target": "gpu-box", "model": "gen/music",
+         "prompt": "lofi"}))
+    # audio bytes are saved under the plugin media dir, not JSON-decoded
+    assert out["ok"] is True and out["action"] == "done"
+    saved = Path(out["audio"])
+    assert saved.is_file() and saved.read_bytes() == wav
+    assert str(tmp_path / "model-forge" / "media") in out["audio"]
+    assert saved.suffix == ".wav"
+    assert out["bytes"] == len(wav)
+    assert "blocked" in out["note"] and str(saved) in out["note"]
+    # other non-JSON bodies are saved too (honest .bin, no JSONDecodeError)
+    _fake_urlopen(monkeypatch, b"<html>gateway error page</html>")
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "sfx", "target": "gpu-box", "model": "gen/sfx",
+         "prompt": "boom"}))
+    assert out["ok"] is True and out["action"] == "done"
+    saved = Path(out["audio"])
+    assert saved.suffix == ".bin"
+    assert saved.read_bytes() == b"<html>gateway error page</html>"
+
+
+def test_browse_fresh_falsey_strings_skip_network(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="": [])
+
+    def no_network(*a, **k):
+        raise AssertionError("the live layer must not run for a falsey arg")
+
+    monkeypatch.setattr("model_forge.discovery.fresh_models", no_network)
+    for falsey in (False, "false", "FALSE", "0", "no", " No "):
+        out = json.loads(tools.model_forge_browse(
+            {"target": "gpu-box", "modality": "3d", "fresh": falsey}))
+        assert out["live_discovery"] == "disabled", falsey
+        assert out["fresh"] == []
+    # a truthy string still enables the live layer
+    monkeypatch.setattr(
+        "model_forge.discovery.fresh_models",
+        lambda modality=None: {"live_discovery": "ok", "models": []})
+    out = json.loads(tools.model_forge_browse(
+        {"target": "gpu-box", "modality": "3d", "fresh": "true"}))
+    assert out["live_discovery"] == "ok"
+
+
+def test_browse_invalid_modality_names_valid_ones(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    out = json.loads(tools.model_forge_browse({"modality": "banana"}))
+    assert "error" in out and "models" not in out
+    assert "banana" in out["error"]
+    assert "chat" in out["error"] and "music" in out["error"]
+
+
+def test_activate_apply_refuses_placeholder_ids(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _ok_engine(monkeypatch, ("chat",))
+
+    def _forbidden(*a, **k):
+        raise AssertionError("a placeholder id must never be persisted")
+
+    setup = types.ModuleType("hermes_cli.model_setup")
+    setup.persist_model_selection = _forbidden
+    monkeypatch.setitem(sys.modules, "hermes_cli.model_setup", setup)
+    # catalog marker: refuse apply with an honest message
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "core-gguf-catalog", "target": "gpu-box", "apply": True}))
+    assert out["ok"] is False
+    assert out["action"] == "placeholder_not_activatable"
+    assert "catalog marker" in out["detail"]
+    assert out["applied"] is False
+    # stub entries are refused the same way
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "world-model-slot", "target": "gpu-box", "apply": True}))
+    assert out["ok"] is False and out["action"] == "placeholder_not_activatable"
+    assert "placeholder" in out["detail"]
+    assert out["applied"] is False
+    assert "hint" not in out   # no 'apply=true' nudge on a refusal
+
+
+def test_activate_media_setup_gated_on_route_probe(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    # engine advertises image/video but the endpoint serves neither route
+    # (ComfyUI-style modality listing)
+    _ok_engine(monkeypatch, ("chat", "image", "video"))
+    monkeypatch.setattr(tools, "route_exists",
+                        lambda root, path, timeout=2.0: False)
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box"}))
+    assert out["ok"] is True
+    assert "media_setup" not in out
+    assert "/v1/images/generations" in out["media_setup_note"]
+    assert "/v1/videos/generations" in out["media_setup_note"]
+    # partial serving: only the image route answers the probe
+    monkeypatch.setattr(
+        tools, "route_exists",
+        lambda root, path, timeout=2.0: path == "/v1/images/generations")
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box"}))
+    assert "image_gen" in out["media_setup"]
+    assert "video_gen" not in out.get("media_setup", {})
+    assert "/v1/videos/generations" in out["media_setup_note"]
+
+
+# --- schema honesty ---------------------------------------------------------
+
+def test_generate_media_schema_honest_about_gateway():
+    desc = schemas.GENERATE_MEDIA["description"]
+    assert "media gateway" in desc
+    assert "/v1/videos/generations" in desc
+    assert "/v1/audio/music" in desc and "/v1/audio/sfx" in desc
+    # the ComfyUI-native flow is stated as a known limit, not implied support
+    assert "ComfyUI" in desc and "not implemented" in desc
+
+
+def test_install_schema_example_is_a_real_repo_path():
+    desc = schemas.INSTALL["parameters"]["properties"]["engine_model"][
+        "description"]
+    assert "model.safetensors" not in desc    # the 404-prone example is gone
+    assert "diffusion_models/your-weights.safetensors" in desc
+    assert "omit engine_model" in desc

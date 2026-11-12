@@ -1,7 +1,7 @@
 # Model Forge
 
-**Local models for every modality — find your GPU, pick a model, and Hermes
-runs it. No account, no API key, nothing leaves your machine.**
+**Local models for every modality — find your hardware, pick a model, and
+Hermes runs it. No account, no API key — models run on hardware you control.**
 
 Model Forge is a Hermes Agent plugin that makes local AI a first-class
 experience across every modality: chat, vision, OCR, image generation, image
@@ -36,7 +36,8 @@ prints the exact command for you to run. Engines stay yours to launch.
 5. **Video** — generate a promo video from the 3D render (i2v)
 6. **Voice** — give it a voice (TTS / voice clone) and a soundtrack (music, SFX)
 
-Each step visibly downloads the model it needs.
+Each step visibly downloads the model it needs. Media jobs (3D, music, SFX)
+run through a user-configured OpenAI-compatible media gateway.
 
 ## Tools
 
@@ -44,10 +45,10 @@ Each step visibly downloads the model it needs.
 |------|--------------|
 | `model_forge_status` | GPUs, VRAM, RAM, engines per compute target, pull credentials |
 | `model_forge_browse` | Models by modality with an advisory fit verdict per target, plus a live HuggingFace "fresh" section (`fresh=false` = curated only) |
-| `model_forge_target_add` | Register a compute target (a remote host, a cloud GPU box) — asks for your approval first |
+| `model_forge_target_add` | Register a compute target (a remote host, a cloud instance) — asks for your approval first |
 | `model_forge_install` | Pull a model: plugin-side HF download (sha256, resume, job polling), a running Maya's HTTP pull, or the exact engine CLI command to run yourself |
 | `model_forge_activate` | Connect a running chat model as Hermes' default (plan-only; `apply=true` writes config after human approval) |
-| `model_forge_generate_media` | 3D (image→GLB), music, SFX via engine job APIs |
+| `model_forge_generate_media` | 3D (image→GLB), music, SFX — jobs through a user-configured OpenAI-compatible media gateway |
 
 Plus `tts/model_forge_tts.py` — a config-driven TTS/voice-clone command
 provider for any OpenAI-style `/v1/audio/speech` endpoint (see `tts/`), and
@@ -60,9 +61,11 @@ target with live engine probes and model counts.
 
 - **Curated catalog** (`model_forge/registry.py`) — hand-maintained entries
   with approximate size, minimum VRAM, and an advisory **fit verdict** per
-  target: `fits_gpu`, `fits_memory`, `needs_gpu`, `too_big`, `engine_managed`
-  (Strata/Maya size themselves at launch), `unknown`, or `unavailable`
-  (stub). Verdicts are estimates from published footprints — the serving
+  target, first matching rule wins: `unavailable` (stub), `engine_unavailable`
+  (no engine on the target can serve it), `needs_ram`, `engine_managed`
+  (Strata/Maya size themselves at launch), `unknown`, `fits_gpu`, `needs_gpu`,
+  `fits_memory`, or `too_big`. Verdicts are estimates from published
+  footprints — the serving
   engine does the authoritative memory sizing.
 - **Fresh (live HuggingFace)** — newest public models per modality lane,
   sorted by last-modified date. Every row carries its date, download count,
@@ -110,7 +113,7 @@ register them.
 | Python engines (ACE-Step, Chatterbox, AudioGen, MusicGen) | music, sfx, voice_clone | adapter next |
 
 GGUF chat models are served by Hermes' core Local Models catalog — Model Forge
-never duplicates that pricing; it complements it.
+never duplicates that catalog; it complements it.
 
 ## Bundled provider plugins
 
@@ -147,9 +150,10 @@ Honest scoping — current limits, and what does not work yet:
 
 - **Install is registry-only.** Fresh (live) rows are discovery, not install
   targets; `model_forge_install` resolves curated `model_id`s only.
-- **File pulls need the exact repo file path.** Pass `engine_model=` with
-  the file inside the source repo (e.g. `model.safetensors`); the registry
-  does not guess filenames.
+- **File pulls resolve repo filenames automatically where possible.** When
+  a filename cannot be resolved, pass `engine_model=` with the exact file
+  inside the source repo (e.g. `diffusion_models/your-weights.safetensors`;
+  omit it and Model Forge resolves the file from the repo).
 - **music and sfx share one HuggingFace lane** (`text-to-audio`) — HF has
   no music-vs-sfx pipeline tags.
 - **World model is an empty stub.** No local open engine with a stable API
@@ -169,18 +173,28 @@ Honest scoping — current limits, and what does not work yet:
   (`huggingface.co/api/models`, newest-first per modality; disabled with
   `fresh=false`) and caches answers for one hour. Model downloads stream
   from the URL the engine or registry names (HuggingFace / ModelScope
-  resolve links). If pull credentials are configured, they are sent only to
-  `huggingface.co` / `modelscope.cn` hosts.
+  resolve links). Media jobs (`model_forge_generate_media`) POST prompts and
+  image bytes to user-configured compute targets, and Maya pulls POST to the
+  target's `/api/pull`. The TTS helper (`tts/model_forge_tts.py`) POSTs the
+  text to speak plus base64-encoded voice-clone reference audio to a
+  user-configured `/v1/audio/speech` endpoint. If pull credentials are
+  configured, they are sent only to `huggingface.co` / `modelscope.cn` hosts.
 - **Shell:** runs `nvidia-smi` and `rocm-smi` (read-only GPU queries) and
-  checks `PATH` for the `strata` CLI. No engine installer or launcher is
-  run by the plugin.
+  checks `PATH` for the `strata` CLI. Hardware probes also read system state
+  directly: amdgpu sysfs on Linux and the Windows memory API
+  (`GlobalMemoryStatusEx`). No engine installer or launcher is run by the
+  plugin.
+- **Background:** long model downloads run on a daemon background thread
+  (job records are pollable); it is the plugin's only background process.
 - **Files:** writes downloaded model files (with `.part` resume files),
   download job records, and discovery caches under its own plugin data dir;
   `download_roots` (**Settings → Plugins**) can widen where downloads land
   (symlinks refused). Reads: your Hermes config, read-only, for
-  `download_roots`; and a local image file only when you pass one to
-  `model_forge_generate_media` — behind the Hermes read-block check, image
-  magic bytes, and a 25 MB cap.
+  `targets_json`, `download_roots`, and the plugin's settings; a local image
+  file only when you pass one to `model_forge_generate_media` — behind the
+  Hermes read-block check, image magic bytes, and a 25 MB cap; and the TTS
+  helper reads the `--in` text file and `--reference` audio file from
+  whatever command-line paths you name.
 - **Approvals:** two actions escalate to Hermes' human-approval gate and
   fail closed on denial — registering a compute target, and writing the
   default model config (`model_forge_activate` with `apply=true`).
@@ -191,24 +205,32 @@ Honest scoping — current limits, and what does not work yet:
 
 ## Requirements
 
-- Hermes Agent (see `requires_hermes` in `plugin.yaml`)
+- Hermes Agent 0.23.0 or newer (see `requires_hermes` in `plugin.yaml`)
 - Any supported engine for the modality you want; Model Forge tells you what
   your hardware supports before you download anything.
 
 ## Install
 
+Primary route — install from the plugin catalog:
+
 ```bash
-hermes plugins install <this repo>
-# or copy the folder into ~/.hermes/plugins/model-forge
+hermes plugins install model-forge
 ```
+
+Manual route — copy the package folder you want (e.g. `model-forge/`) into
+`~/.hermes/plugins/`. The repo root has no manifest, so per-package folder
+copies are the working manual path.
 
 ## Development
 
-The repo holds two installable packages: `model-forge/` (general plugin,
-tools) and `model-forge-providers/` (`kind: model-provider`).
+The repo holds five installable packages: `model-forge/` (tools + hooks),
+`model-forge-image/` and `model-forge-video/` (media backends),
+`model-forge-desktop/` (desktop pane), and `model-forge-providers/`
+(`kind: model-provider`).
 
 ```bash
-python3 tests/run.py                # stdlib runner, no deps
+python3 tests/run.py                # stdlib runner, no deps; without pytest it
+                                    # skips fixture-based tests
 cd /path/to/model-forge             # repo root
 pytest -q                           # same suite under pytest (root config: pytest.ini)
 cd model-forge          # the tools plugin

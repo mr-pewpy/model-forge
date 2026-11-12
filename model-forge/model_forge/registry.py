@@ -48,6 +48,16 @@ MODALITY_LABELS: dict[str, str] = {
 PHANTOM_ENGINES: frozenset[str] = frozenset({"python"})
 PHANTOM_ENGINE_NOTE = "custom Python environment the plugin does not manage"
 
+# Every entry listing the "comfyui" engine carries this honest caveat: the
+# plugin downloads ComfyUI model files but does not drive ComfyUI-native
+# generation (see README known limits).
+COMFYUI_LIMIT_NOTE = ("ComfyUI download works; generation is not plugin-driven "
+                     "yet (see README known limits)")
+
+# Gated HuggingFace repos need license acceptance before any download.
+GATED_REPO_NOTE = ("This is a gated repo: HF account + license acceptance "
+                   "required.")
+
 
 @dataclass(frozen=True)
 class ModelEntry:
@@ -176,7 +186,8 @@ MODELS: tuple[ModelEntry, ...] = (
         size_gb=19.0,
         vram_gb_min=16.0,
         status="validated",
-        note="Aesthetic/style-first default; 8-step turbo, cfg 1.0.",
+        note="Aesthetic/style-first default; 8-step turbo, cfg 1.0. "
+             + COMFYUI_LIMIT_NOTE + ".",
     ),
     ModelEntry(
         id="qwen-image-2.1",
@@ -188,7 +199,7 @@ MODELS: tuple[ModelEntry, ...] = (
         vram_gb_min=20.0,
         status="validated",
         note="Native 2K, typography, RGBA transparency. vLLM form = vLLM-Omni "
-             "(vllm serve <model> --omni); ComfyUI workflow lane also works.",
+             "(vllm serve <model> --omni). " + COMFYUI_LIMIT_NOTE + ".",
     ),
     ModelEntry(
         id="qwen-image-2.1-edit",
@@ -199,7 +210,8 @@ MODELS: tuple[ModelEntry, ...] = (
         size_gb=25.0,
         vram_gb_min=20.0,
         status="validated",
-        note="Up to 4 reference images; ordinal <image1>.. phrase binding.",
+        note="Up to 4 reference images; ordinal <image1>.. phrase binding. "
+             + COMFYUI_LIMIT_NOTE + ".",
     ),
     ModelEntry(
         id="flux-2-klein-4b",
@@ -212,7 +224,8 @@ MODELS: tuple[ModelEntry, ...] = (
         status="validated",
         note="Apache-2.0, edit-native (image+mask inpainting/outpainting). "
              "SGLang Diffusion: sglang serve --tp-size N --num-gpus N; "
-             "vLLM-Omni has a native FLUX.2-klein inpaint test.",
+             "vLLM-Omni has a native FLUX.2-klein inpaint test. "
+             + COMFYUI_LIMIT_NOTE + ".",
     ),
     # --- video ---
     ModelEntry(
@@ -224,7 +237,8 @@ MODELS: tuple[ModelEntry, ...] = (
         size_gb=20.0,
         vram_gb_min=16.0,
         status="validated",
-        note="i2v keeps subject identity; ComfyUI lane, torch >= 2.7.",
+        note="i2v keeps subject identity; torch >= 2.7. "
+             + COMFYUI_LIMIT_NOTE + ". " + GATED_REPO_NOTE,
     ),
     ModelEntry(
         id="minimax-h3",
@@ -235,7 +249,8 @@ MODELS: tuple[ModelEntry, ...] = (
         size_gb=25.0,
         vram_gb_min=20.0,
         status="known",
-        note="i2v/t2v; 1024x576 @ 24fps fits 24 GB with --novram.",
+        note="i2v/t2v; 1024x576 @ 24fps fits 24 GB with --novram. "
+             + COMFYUI_LIMIT_NOTE + ".",
     ),
     # --- 3d ---
     ModelEntry(
@@ -248,21 +263,23 @@ MODELS: tuple[ModelEntry, ...] = (
         vram_gb_min=10.0,
         status="validated",
         note="Single-view image to textured mesh; printable after repair. "
-             "ComfyUI-native 3D job flow is not implemented in Model Forge "
-             "yet — model_forge_generate_media needs a media gateway lane "
-             "(/v1/videos/generations).",
+             + COMFYUI_LIMIT_NOTE
+             + ": the ComfyUI-native job flow is not implemented in Model "
+             "Forge, and model_forge_generate_media needs a media gateway "
+             "lane (/v1/videos/generations).",
     ),
     ModelEntry(
         id="trellis.2-4b",
         name="TRELLIS.2-4B",
         modality="3d",
         engines=("comfyui", "python"),
-        source="microsoft/TRELLIS.2",
+        source="microsoft/TRELLIS.2-4B",
         size_gb=8.0,
         vram_gb_min=12.0,
         status="known",
-        note="Image to 3D, GLB/PLY output. The 'python' lane needs a "
-             + PHANTOM_ENGINE_NOTE + ".",
+        note="Image to 3D, GLB/PLY output. " + COMFYUI_LIMIT_NOTE
+             + ". The 'python' lane needs a " + PHANTOM_ENGINE_NOTE
+             + " — Model Forge cannot run it.",
     ),
     # --- audio family ---
     ModelEntry(
@@ -270,12 +287,12 @@ MODELS: tuple[ModelEntry, ...] = (
         name="ACE-Step 1.5 turbo",
         modality="music",
         engines=("python",),
-        source="tetherto/ACE-Step",
+        source="ACE-Step/acestep-v15-xl-turbo",
         size_gb=8.0,
         vram_gb_min=8.0,
         status="validated",
         note="Text-to-music; also serves on CPU via an OpenAI-style audio API. "
-             "Needs a " + PHANTOM_ENGINE_NOTE + ".",
+             "Needs a " + PHANTOM_ENGINE_NOTE + " — Model Forge cannot run it.",
     ),
     ModelEntry(
         id="musicgen-small",
@@ -287,7 +304,7 @@ MODELS: tuple[ModelEntry, ...] = (
         vram_gb_min=4.0,
         status="known",
         note="Lightweight text-to-music baseline. Needs a "
-             + PHANTOM_ENGINE_NOTE + ".",
+             + PHANTOM_ENGINE_NOTE + " — Model Forge cannot run it.",
     ),
     ModelEntry(
         id="audiogen",
@@ -298,7 +315,8 @@ MODELS: tuple[ModelEntry, ...] = (
         size_gb=4.0,
         vram_gb_min=6.0,
         status="known",
-        note="Text-to-sound-effects. Needs a " + PHANTOM_ENGINE_NOTE + ".",
+        note="Text-to-sound-effects. Needs a " + PHANTOM_ENGINE_NOTE
+             + " — Model Forge cannot run it.",
     ),
     ModelEntry(
         id="stable-audio-open",
@@ -310,19 +328,20 @@ MODELS: tuple[ModelEntry, ...] = (
         vram_gb_min=10.0,
         status="known",
         note="Open SFX and short music generation. Needs a "
-             + PHANTOM_ENGINE_NOTE + ".",
+             + PHANTOM_ENGINE_NOTE + " — Model Forge cannot run it. "
+             + GATED_REPO_NOTE,
     ),
     ModelEntry(
         id="chatterbox-t3-turbo",
         name="Chatterbox t3-turbo",
         modality="voice_clone",
         engines=("python",),
-        source="tetherto/chatterbox",
+        source="ResembleAI/chatterbox-turbo",
         size_gb=3.0,
         vram_gb_min=6.0,
         status="validated",
         note="TTS with voice clone via reference audio. Needs a "
-             + PHANTOM_ENGINE_NOTE + ".",
+             + PHANTOM_ENGINE_NOTE + " — Model Forge cannot run it.",
     ),
     # --- world model: honest empty slot ---
     ModelEntry(

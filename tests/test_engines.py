@@ -113,20 +113,39 @@ def test_route_exists_dead(monkeypatch):
 # --- detect_engines aggregator ----------------------------------------------
 
 def test_detect_engines_drops_generic_when_named_present(monkeypatch):
-    # local probe: strata (named) and openai-compatible both find /v1/models
-    # at the default root -> the generic row for that endpoint is suppressed
+    # a llama-server on the default port answers both /props (its distinctive
+    # fingerprint) and /v1/models (generic): the named row wins and the
+    # generic row for that endpoint is suppressed
     _install_urlopen(monkeypatch, {
+        "/props": json.dumps(
+            {"build_info": "x", "model_path": "m.gguf"}).encode(),
         "/v1/models": json.dumps(
             {"data": [{"id": "m1"}]}).encode(),
     })
-    monkeypatch.setattr(strata.shutil, "which", lambda _: "/usr/bin/strata")
     out = detect_engines("")
-    # strata reports available with the default root as its endpoint
-    assert any(e.id == "strata" and e.available for e in out)
+    assert any(e.id == "llamacpp" and e.available for e in out)
     # no generic openai-compatible row claims the SAME (default) endpoint
     for e in out:
         if e.id == "openai-compatible" and e.available:
             assert e.endpoint != strata.DEFAULT_ROOT
+    # and the llama-server is never double-labeled as Strata
+    assert not any(e.id == "strata" and e.available for e in out)
+
+
+def test_detect_engines_generic_models_not_mislabeled(monkeypatch):
+    # generic /v1/models on the default port with NO engine fingerprint:
+    # one honest "identity unknown" row, and never a selectable Strata row
+    _install_urlopen(monkeypatch, {
+        "/v1/models": json.dumps({"data": [{"id": "m1"}]}).encode(),
+    })
+    monkeypatch.setattr(strata.shutil, "which", lambda _: None)
+    out = detect_engines("")
+    assert not any(e.id == "strata" and e.available for e in out)
+    generic = [e for e in out
+               if e.id == "openai-compatible" and e.available
+               and e.endpoint == strata.DEFAULT_ROOT]
+    assert len(generic) == 1
+    assert "identity unknown" in generic[0].detail
 
 
 def test_detect_engines_catches_probe_errors(monkeypatch):
@@ -167,13 +186,65 @@ def test_strata_detect_remote_is_neutral(monkeypatch):
     assert st.available is False and st.id == "strata"
 
 
-def test_strata_detect_local_serving(monkeypatch):
+def test_strata_detect_generic_models_not_mislabeled(monkeypatch):
+    # generic /v1/models must NEVER yield a selectable 'Strata available' row
+    _install_urlopen(monkeypatch, {
+        "/v1/models": json.dumps({"data": [{"id": "glm"}]}).encode()})
+    monkeypatch.setattr(strata.shutil, "which", lambda _: None)
+    st = strata.detect()
+    assert not (st.id == "strata" and st.available)
+    assert st.id == "openai-compatible" and st.available is True
+    assert "generic OpenAI-compatible endpoint on port 8080" in st.detail
+    assert "identity unknown" in st.detail
+
+
+def test_strata_detect_generic_models_with_cli_still_not_mislabeled(monkeypatch):
+    # even with the strata CLI on PATH, a generic /v1/models answer is not
+    # proof of a Strata server: still no selectable 'Strata available' row
     _install_urlopen(monkeypatch, {
         "/v1/models": json.dumps({"data": [{"id": "glm"}]}).encode()})
     monkeypatch.setattr(strata.shutil, "which", lambda _: "/usr/bin/strata")
     st = strata.detect()
-    assert st.available is True
+    assert not (st.id == "strata" and st.available)
+    assert st.id == "openai-compatible"
+    assert "identity unknown" in st.detail
+    assert "strata status" in st.detail   # how to confirm, if it is Strata
+
+
+def test_strata_fingerprint_never_from_models(monkeypatch):
+    _install_urlopen(monkeypatch, {
+        "/v1/models": json.dumps({"data": [{"id": "glm"}]}).encode()})
+    assert strata.strata_fingerprint("") is False
+
+
+def test_strata_detect_serving_confirmed_by_telemetry(monkeypatch):
+    # only a Strata-specific surface (the telemetry snapshot behind
+    # `strata status`) lets detect claim 'Strata serving <models>'
+    _install_urlopen(monkeypatch, {
+        "/v1/models": json.dumps({"data": [{"id": "glm"}]}).encode(),
+        "/v1/telemetry": json.dumps({
+            "sampled_at": 1, "model": {"id": "glm", "loaded": True},
+            "instance": {"id": "i1", "state": "ready"},
+            "work": {}, "quality": {}}).encode(),
+    })
+    monkeypatch.setattr(strata.shutil, "which", lambda _: "/usr/bin/strata")
+    st = strata.detect()
+    assert st.available is True and st.id == "strata"
     assert st.models_loaded == ("glm",)
+    assert "serving glm" in st.detail
+
+
+def test_strata_detect_serving_confirmed_by_status_fallback(monkeypatch):
+    # older servers: /v1/status exposes `loaded` and `auto_load`
+    _install_urlopen(monkeypatch, {
+        "/v1/models": json.dumps({"data": [{"id": "glm"}]}).encode(),
+        "/v1/telemetry": 404,
+        "/v1/status": json.dumps({"loaded": True, "auto_load": True,
+                                  "model": "glm"}).encode(),
+    })
+    monkeypatch.setattr(strata.shutil, "which", lambda _: None)
+    st = strata.detect()
+    assert st.available is True and st.id == "strata"
     assert "serving glm" in st.detail
 
 
@@ -213,6 +284,20 @@ def test_llamacpp_detect_ollama(monkeypatch):
     assert st.models_loaded == ("llama3", "mistral")
 
 
+def test_llamacpp_detect_ollama_default_port(monkeypatch):
+    # stock Ollama listens on 11434 — the local scan must cover it
+    assert 11434 in llamacpp.PROBE_PORTS
+    routes = {
+        "11434/props": 404,
+        "11434/api/tags": json.dumps({"models": [{"name": "llama3"}]}).encode(),
+    }
+    _install_urlopen(monkeypatch, routes)
+    st = llamacpp.detect()
+    assert st.id == "ollama" and st.available is True
+    assert st.endpoint == "http://127.0.0.1:11434"
+    assert st.models_loaded == ("llama3",)
+
+
 def test_llamacpp_detect_dead(monkeypatch):
     _install_urlopen(monkeypatch, {})
     st = llamacpp.detect("http://x:1")
@@ -236,7 +321,7 @@ def test_llamacpp_detect_local_port_scan(monkeypatch):
 def test_llamacpp_detect_local_all_dead(monkeypatch):
     _install_urlopen(monkeypatch, {})
     st = llamacpp.detect()
-    assert st.available is False and "8080/8081/8000/8001" in st.detail
+    assert st.available is False and "8080/8081/8000/8001/11434" in st.detail
 
 
 # --- openai_compat ----------------------------------------------------------

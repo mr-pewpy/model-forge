@@ -62,17 +62,20 @@ install, and activate pick it up automatically. Fields:
 | `engine_models` | Map of engine id → engine-native model id (e.g. Maya setup ids, Strata `family:pack`) |
 | `note` | Free-form honesty note shown in browse |
 
-For file-pull installs (ComfyUI/vLLM/SGLang/Python engines) the user must
-still pass `engine_model=` with the exact file path inside the source repo —
-the registry does not store or guess filenames.
+For file-pull installs (ComfyUI/vLLM/SGLang/Python engines) Model Forge
+resolves the repo filename automatically where possible; pass `engine_model=`
+with the exact file path inside the source repo when it cannot.
 
 ## How the fit verdict works
 
-`fit_verdict(entry, hardware)` in `registry.py` returns, in rule order:
+`fit_verdict(entry, hardware, available_engines)` in `registry.py` returns
+the first matching rule:
 
 | Verdict | Rule |
 |---------|------|
 | `unavailable` | entry `status` is `stub` |
+| `engine_unavailable` | engine ids for the target are known and none of the entry's engines can run there |
+| `needs_ram` | the entry's declared `ram_gb_min` exceeds the target's detected RAM (RAM 0 = unknown, never triggers) |
 | `engine_managed` | `engine_managed_fit` is set (Strata/Maya size at launch) |
 | `unknown` | `size_gb` is 0 |
 | `fits_gpu` | `vram_gb_min` set and detected VRAM ≥ `vram_gb_min` |

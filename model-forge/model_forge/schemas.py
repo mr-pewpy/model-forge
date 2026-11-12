@@ -57,8 +57,9 @@ BROWSE = {
                 "description": (
                     "Include the live HuggingFace freshness section (newest "
                     "models per modality, sorted by last-modified date). "
-                    "Default true; false = curated catalog only, no "
-                    "HuggingFace call (target engine detection still runs)."
+                    "Default true; false — or the strings 'false', '0', "
+                    "'no' — means curated catalog only, no HuggingFace "
+                    "call (target engine detection still runs)."
                 ),
             },
         },
@@ -146,8 +147,11 @@ INSTALL = {
                     "Engine-native model id when the registry has none: a "
                     "Maya setup id (e.g. glm-maya-s), for Strata "
                     "<family>:<pack> (e.g. deepseek41:ist-das-2.00bpw), or "
-                    "for engine file pulls the file path inside the source "
-                    "repo (e.g. model.safetensors)."
+                    "for engine file pulls a file path inside the source "
+                    "repo (e.g. diffusion_models/your-weights.safetensors). "
+                    "For file pulls, omit engine_model and Model Forge "
+                    "resolves the primary weights file from the repo's "
+                    "file list."
                 ),
             },
             "dest": {
@@ -172,10 +176,16 @@ INSTALL = {
 GENERATE_MEDIA = {
     "name": "model_forge_generate_media",
     "description": (
-        "Generate 3D models, music, or sound effects through a compute "
-        "target's engine API. 3d: image to GLB (submit job, then poll with "
-        "job_id). music/sfx: prompt to audio. Use when the user wants a 3D "
-        "model, soundtrack, or sound effect generated locally."
+        "Generate 3D models, music, or sound effects through a "
+        "user-configured OpenAI-compatible media gateway endpoint on a "
+        "compute target (lanes: /v1/videos/generations for 3d jobs, "
+        "/v1/audio/music, /v1/audio/sfx). 3d: image to GLB (submit job, "
+        "then poll with job_id). music/sfx: prompt to audio; the call "
+        "blocks while the audio renders and the result is saved to the "
+        "plugin media directory. Known limit: the ComfyUI-native job flow "
+        "is not implemented — a plain ComfyUI endpoint does not serve "
+        "these lanes. Use when the user wants a 3D model, soundtrack, or "
+        "sound effect generated through a media gateway."
     ),
     "parameters": {
         "type": "object",
