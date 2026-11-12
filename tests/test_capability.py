@@ -245,7 +245,7 @@ def test_phantom_python_notes_are_honest():
     phantom_ids = {m.id for m in MODELS if "python" in m.engines}
     assert phantom_ids == {"trellis.2-4b", "ace-step", "musicgen-small",
                            "audiogen", "stable-audio-open",
-                           "chatterbox-t3-turbo"}
+                           "chatterbox-turbo"}
     for m in MODELS:
         if "python" in m.engines:
             assert PHANTOM_PHRASE in m.note, m.id
@@ -291,12 +291,12 @@ def test_remote_hf_download_argv_is_wellformed():
     plan = install_plan(_entry("hunyuan3d-2"), _REMOTE,
                         engine_model="checkpoints/x.safetensors")
     assert plan["command"] == ["hf", "download",
-                               "Comfy-Org/hunyuan3D_2.0_repackaged",
+                               "Comfy-Org/Hunyuan-3D-2.0",
                                "checkpoints/x.safetensors"]
     # no engine_model -> whole-repo pull, not a stray positional '*'
     plan = install_plan(_entry("hunyuan3d-2"), _REMOTE)
     assert plan["command"] == ["hf", "download",
-                               "Comfy-Org/hunyuan3D_2.0_repackaged",
+                               "Comfy-Org/Hunyuan-3D-2.0",
                                "--include", "*"]
 
 

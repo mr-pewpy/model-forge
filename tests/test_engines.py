@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import io
 import json
+import threading
+import time
 import urllib.error
 
 import pytest
@@ -162,6 +164,50 @@ def test_detect_engines_catches_probe_errors(monkeypatch):
         eng._DETECTORS = orig
     assert any(e.id == "unknown" and "adapter blew up" in e.detail
                for e in out)
+
+
+# --- detect_engines parallelism: dead targets must not stall ------------------
+def test_detect_engines_probes_detectors_in_parallel(monkeypatch):
+    # every call burns a stand-in for a dead-connection timeout; seven
+    # sequential detectors would sum to >= 2.1 s here, while the concurrent
+    # aggregator must finish near the slowest single detector chain (~0.6 s)
+    delay = 0.3
+    lock = threading.Lock()
+    calls = []
+
+    def _fake(req, timeout=None):
+        with lock:
+            calls.append(1)
+        time.sleep(delay)
+        raise urllib.error.URLError("no route in test")
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake)
+    start = time.monotonic()
+    out = detect_engines("http://x:1")
+    elapsed = time.monotonic() - start
+    assert len(calls) == 7          # every adapter probed exactly once-chain
+    assert len(out) == 7            # and every detector still yields a row
+    assert elapsed < 1.5            # sequential would be >= 2.1 s
+
+
+def test_detect_engines_order_stable_when_probes_finish_out_of_order(monkeypatch):
+    # the first detector is the slowest one; if results were collected in
+    # completion order the fast SGLang row would jump ahead of it
+    def _fake(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if url.endswith("/props"):
+            time.sleep(0.4)
+            raise urllib.error.HTTPError(url, 404, "e", {}, None)
+        if url.endswith("/get_model_info"):
+            return _Resp(json.dumps({"model_path": "flux"}).encode())
+        raise urllib.error.URLError("no route in test")
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake)
+    out = detect_engines("http://x:1")
+    ids = [e.id for e in out]
+    assert ids == ["llamacpp", "strata", "maya", "comfyui", "vllm", "sglang",
+                   "openai-compatible"]
+    assert ids.index("llamacpp") < ids.index("sglang")
 
 
 # --- strata -----------------------------------------------------------------

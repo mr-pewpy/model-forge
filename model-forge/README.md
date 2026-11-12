@@ -49,6 +49,7 @@ run through a user-configured OpenAI-compatible media gateway.
 | `model_forge_install` | Pull a model: plugin-side HF download (sha256, resume, job polling), a running Maya's HTTP pull, or the exact engine CLI command to run yourself |
 | `model_forge_activate` | Connect a running chat model as Hermes' default (plan-only; `apply=true` writes config after human approval) |
 | `model_forge_generate_media` | 3D (image→GLB), music, SFX — jobs through a user-configured OpenAI-compatible media gateway |
+| `model_forge_storage` | Model weights on disk (downloads dir, Ollama models dir, HuggingFace hub cache): list names, sizes and modification times; delete a listed entry after your approval |
 
 Plus `tts/model_forge_tts.py` — a config-driven TTS/voice-clone command
 provider for any OpenAI-style `/v1/audio/speech` endpoint (see `tts/`), and
@@ -194,10 +195,17 @@ Honest scoping — current limits, and what does not work yet:
   file only when you pass one to `model_forge_generate_media` — behind the
   Hermes read-block check, image magic bytes, and a 25 MB cap; and the TTS
   helper reads the `--in` text file and `--reference` audio file from
-  whatever command-line paths you name.
-- **Approvals:** two actions escalate to Hermes' human-approval gate and
-  fail closed on denial — registering a compute target, and writing the
-  default model config (`model_forge_activate` with `apply=true`).
+  whatever command-line paths you name. `model_forge_storage` reads file
+  names, sizes and modification times — read-only — in the plugin downloads
+  directory and in your engine-managed model directories (the Ollama models
+  dir and the HuggingFace hub cache under your home directory);
+  `model_forge_storage` with `action=delete` removes the user-approved files
+  and folders from those roots.
+- **Approvals:** three actions escalate to Hermes' human-approval gate and
+  fail closed on denial — registering a compute target, writing the
+  default model config (`model_forge_activate` with `apply=true`), and
+  deleting a model-storage entry (`model_forge_storage` with `action=delete`;
+  the prompt names the exact path and size).
 - **Credentials:** none required. HF/ModelScope tokens are optional, stored
   through Hermes' credential route (`Settings → Plugins`), read only via the
   secret scope.

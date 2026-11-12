@@ -258,7 +258,10 @@ MODELS: tuple[ModelEntry, ...] = (
         name="Hunyuan3D-2 (image to GLB)",
         modality="3d",
         engines=("comfyui",),
-        source="Comfy-Org/hunyuan3D_2.0_repackaged",
+        # canonical HF id (verified via the model-info API: the old
+        # "Comfy-Org/hunyuan3D_2.0_repackaged" id now redirects here and the
+        # repo serves the dit-v2 weights under split_files/)
+        source="Comfy-Org/Hunyuan-3D-2.0",
         size_gb=5.0,
         vram_gb_min=10.0,
         status="validated",
@@ -288,8 +291,11 @@ MODELS: tuple[ModelEntry, ...] = (
         modality="music",
         engines=("python",),
         source="ACE-Step/acestep-v15-xl-turbo",
-        size_gb=8.0,
-        vram_gb_min=8.0,
+        # sizes verified against the HF model-info API (blobs): the four
+        # safetensors shards alone total 19,953,378,268 bytes (~20 GB), so the
+        # old 8 GB download/VRAM figures were far too small
+        size_gb=20.0,
+        vram_gb_min=20.0,
         status="validated",
         note="Text-to-music; also serves on CPU via an OpenAI-style audio API. "
              "Needs a " + PHANTOM_ENGINE_NOTE + " — Model Forge cannot run it.",
@@ -332,8 +338,8 @@ MODELS: tuple[ModelEntry, ...] = (
              + GATED_REPO_NOTE,
     ),
     ModelEntry(
-        id="chatterbox-t3-turbo",
-        name="Chatterbox t3-turbo",
+        id="chatterbox-turbo",
+        name="Chatterbox Turbo",
         modality="voice_clone",
         engines=("python",),
         source="ResembleAI/chatterbox-turbo",

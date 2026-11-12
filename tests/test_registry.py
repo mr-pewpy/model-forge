@@ -94,13 +94,42 @@ def test_sources_point_at_public_repos():
     expected = {
         "trellis.2-4b": "microsoft/TRELLIS.2-4B",
         "ace-step": "ACE-Step/acestep-v15-xl-turbo",
-        "chatterbox-t3-turbo": "ResembleAI/chatterbox-turbo",
+        "chatterbox-turbo": "ResembleAI/chatterbox-turbo",
+        "hunyuan3d-2": "Comfy-Org/Hunyuan-3D-2.0",
     }
     for mid, src in expected.items():
         m = next(x for x in MODELS if x.id == mid)
         assert m.source == src, mid
     for m in MODELS:
         assert not m.source.startswith("tetherto/"), m.id
+        # the old non-canonical hunyuan id redirects to the canonical repo;
+        # nothing may keep referencing it
+        assert m.source != "Comfy-Org/hunyuan3D_2.0_repackaged", m.id
+
+
+def test_ace_step_sizes_match_verified_repo_footprint():
+    # HF model-info API (blobs=true) 2026-09: the four model shards total
+    # 19,953,378,268 bytes (~20 GB); the old 8 GB size fields were stale
+    m = next(x for x in MODELS if x.id == "ace-step")
+    assert m.size_gb == 20.0
+    # VRAM floor can never honestly sit below the weights footprint
+    assert m.vram_gb_min == 20.0
+
+
+def test_chatterbox_name_and_id_match_public_repo():
+    # the verified public repo is ResembleAI/chatterbox-turbo; no official
+    # "t3" repo exists, so neither the id nor the name may claim one
+    m = next(x for x in MODELS if x.id == "chatterbox-turbo")
+    assert m.name == "Chatterbox Turbo"
+    assert m.source == "ResembleAI/chatterbox-turbo"
+    assert all("t3-turbo" not in x.id for x in MODELS)
+
+
+def test_hunyuan3d_source_is_canonical_hf_id():
+    # Comfy-Org/hunyuan3D_2.0_repackaged resolves (307) to the canonical
+    # Comfy-Org/Hunyuan-3D-2.0, which serves the dit-v2 weights (split_files/)
+    m = next(x for x in MODELS if x.id == "hunyuan3d-2")
+    assert m.source == "Comfy-Org/Hunyuan-3D-2.0"
 
 
 def test_gated_repos_are_noted():

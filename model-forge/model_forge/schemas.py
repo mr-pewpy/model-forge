@@ -259,3 +259,42 @@ ACTIVATE = {
         "required": ["model_id"],
     },
 }
+
+STORAGE = {
+    "name": "model_forge_storage",
+    "description": (
+        "List and delete model weights on this machine: the Model Forge "
+        "downloads directory plus the engine-managed model directories "
+        "(the Ollama models dir, the Hugging Face hub cache). 'list' "
+        "(default) reports each entry's name, absolute path, size in "
+        "bytes, and filesystem modification time. 'delete' removes one "
+        "listed entry — the user approves the exact path and size first, "
+        "and only an entry id or exact path from a previous list is "
+        "accepted (arbitrary paths are refused). Use when the user asks "
+        "what model files are on disk, how much space they take, or wants "
+        "unwanted weights deleted."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "delete"],
+                "description": (
+                    "'list' (default) inventories model storage; 'delete' "
+                    "removes one listed entry (asks for the user's approval "
+                    "first)."
+                ),
+            },
+            "entry": {
+                "type": "string",
+                "description": (
+                    "For action=delete: the entry id returned by "
+                    "action=list, or that entry's exact absolute path. "
+                    "Anything else is refused."
+                ),
+            },
+        },
+        "required": [],
+    },
+}

@@ -287,7 +287,7 @@ def test_browse_fresh_false_skips_network(tmp_path, monkeypatch):
 
 def test_browse_fresh_dedupes_against_curated_sources(tmp_path, monkeypatch):
     fetch = _fake_fetch(default=[
-        _item("Comfy-Org/hunyuan3D_2.0_repackaged", "2026-03-01"),
+        _item("Comfy-Org/Hunyuan-3D-2.0", "2026-03-01"),
         _item("org/novel", "2026-02-01"),
     ])
     tools = _browse_env(tmp_path, monkeypatch, fetch)

@@ -87,7 +87,8 @@ def test_schema_shapes():
                        ("model_forge_target_add", schemas.TARGET_ADD),
                        ("model_forge_install", schemas.INSTALL),
                        ("model_forge_generate_media", schemas.GENERATE_MEDIA),
-                       ("model_forge_activate", schemas.ACTIVATE)]:
+                       ("model_forge_activate", schemas.ACTIVATE),
+                       ("model_forge_storage", schemas.STORAGE)]:
         assert spec["name"] == name
         assert spec["description"].strip()
         assert spec["parameters"]["type"] == "object"
@@ -105,6 +106,14 @@ def test_activate_requires_model_id():
     assert schemas.ACTIVATE["parameters"]["required"] == ["model_id"]
     assert schemas.GENERATE_MEDIA["parameters"]["required"] == ["modality"]
     assert schemas.TARGET_ADD["parameters"]["required"] == ["id", "base_url"]
+
+
+def test_storage_schema_shape():
+    spec = schemas.STORAGE
+    props = spec["parameters"]["properties"]
+    assert props["action"]["enum"] == ["list", "delete"]
+    assert "entry" in props  # entry identifier or exact path for delete
+    assert spec["parameters"].get("required", []) == []  # list is the default
 
 
 # --- hardware.py ------------------------------------------------------------
@@ -677,6 +686,65 @@ def test_generate_media_3d_submit_failure(tmp_path, monkeypatch):
     assert out["action"] == "submit_failed"
 
 
+def test_generate_media_3d_http_error_surfaces_status_and_body(tmp_path,
+                                                               monkeypatch):
+    import io
+    import urllib.error
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit_job",
+                         "submit": "http://gpu-box.example.com:8080/jobs"})
+    exc = urllib.error.HTTPError(
+        "http://gpu-box.example.com:8080/jobs", 502, "Bad Gateway",
+        hdrs=None, fp=io.BytesIO(b'{"detail":"engine exploded"}'))
+    _fake_urlopen(monkeypatch, b"", exc=exc)
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box", "model": "gen/3d",
+         "image": "https://example.com/x.png"}))
+    # fail closed, but the detail names the HTTP status and a response
+    # snippet instead of a generic submit_failed
+    assert out["ok"] is False and out["action"] == "submit_failed"
+    assert out["http_status"] == 502
+    assert "502" in out["error"]
+    assert "engine exploded" in out["error"]
+    assert out["response_snippet"] == '{"detail":"engine exploded"}'
+
+
+def test_generate_media_music_http_error_surfaces_status_and_body(tmp_path,
+                                                                  monkeypatch):
+    import io
+    import urllib.error
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit",
+                         "submit": "http://gpu-box.example.com:8080"
+                                   "/v1/audio/music"})
+    exc = urllib.error.HTTPError(
+        "http://gpu-box.example.com:8080/v1/audio/music", 500,
+        "Internal Server Error", hdrs=None,
+        fp=io.BytesIO(b"<html>gateway refused the prompt</html>"))
+    _fake_urlopen(monkeypatch, b"", exc=exc)
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "music", "target": "gpu-box", "model": "gen/music",
+         "prompt": "lofi"}))
+    assert out["ok"] is False and out["action"] == "submit_failed"
+    assert out["http_status"] == 500
+    assert "500" in out["error"]
+    assert "gateway refused the prompt" in out["error"]
+
+
 def test_generate_media_music_needs_args(tmp_path, monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
     add_target(_REMOTE, base_dir=tmp_path)
@@ -882,6 +950,39 @@ def test_policy_hook_plan_only_passes():
     assert tools.policy_hook("model_forge_browse", {}) is None
     assert tools.policy_hook("terminal", {"command": "ls"}) is None
     assert tools.policy_hook("model_forge_install", {"model_id": "m"}) is None
+
+
+def test_policy_hook_storage_delete_requires_approval(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    downloads = tmp_path / "model-forge" / "downloads"
+    downloads.mkdir(parents=True)
+    f = downloads / "weights.bin"
+    f.write_bytes(b"12345")
+    from model_forge import tools
+
+    # delete escalates with the exact path and size being deleted
+    for ref in (str(f), "plugin-downloads:weights.bin"):
+        d = tools.policy_hook("model_forge_storage",
+                              {"action": "delete", "entry": ref})
+        assert d["action"] == "approve", ref
+        assert str(f) in d["message"], ref
+        assert "5 bytes" in d["message"], ref
+        assert d["rule_key"] == "model-forge:storage_delete"
+    # an unlisted ref still escalates (fail closed); the handler refuses it
+    d = tools.policy_hook("model_forge_storage",
+                          {"action": "delete", "entry": "nope"})
+    assert d["action"] == "approve"
+    assert "nope" in d["message"]
+
+
+def test_policy_hook_storage_list_passes():
+    from model_forge import tools
+
+    # listing is read-only: no approval, and no storage walk either
+    assert tools.policy_hook("model_forge_storage", {}) is None
+    assert tools.policy_hook("model_forge_storage",
+                             {"action": "list"}) is None
 
 
 # --- honesty fixes: required args, job_id shape, fresh strings, modality ----

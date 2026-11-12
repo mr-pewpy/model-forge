@@ -71,16 +71,36 @@ def _dump(payload: dict) -> str:
 
 def policy_hook(tool_name: str, args: dict | None = None, task_id: str = "",
                 **kwargs) -> dict | None:
-    """pre_tool_call policy: routes the two policy decisions through Hermes'
-    human-approval gate.
+    """pre_tool_call policy: routes the three policy decisions through
+    Hermes' human-approval gate.
 
     Registering a compute target decides where engine calls and media jobs
     (including image data) can be sent; rewriting model.default redirects all
-    future conversations. Both are the USER'S decisions — the model must not
-    make them alone. Escalating with ``action: approve`` shows the user the
-    exact URL / config change; denial, timeout, or a gate error fails closed.
+    future conversations; deleting a model-storage entry destroys model
+    weights on this machine. All three are the USER'S decisions — the model
+    must not make them alone. Escalating with ``action: approve`` shows the
+    user the exact URL / config change / path and size; denial, timeout, or
+    a gate error fails closed (the call is blocked before the handler runs).
     """
     args = args or {}
+    if tool_name == "model_forge_storage" and args.get("action") == "delete":
+        from . import storage
+        ref = str(args.get("entry") or "")
+        entry = storage.describe_entry(ref)
+        if entry is not None:
+            target = (f"  path: {entry['path']}\n"
+                      f"  size: {entry['size_bytes']} bytes")
+        else:
+            target = (f"  path: {ref or '(no entry given)'}\n"
+                      f"  size: unknown (not an entry from the storage "
+                      f"list; the delete will be refused)")
+        return {
+            "action": "approve",
+            "message": (
+                "Model Forge wants to permanently delete a model-storage "
+                "entry from this machine:\n" + target),
+            "rule_key": "model-forge:storage_delete",
+        }
     if tool_name == "model_forge_target_add":
         return {
             "action": "approve",
@@ -615,6 +635,29 @@ def model_forge_activate(args: dict | None = None, **kwargs) -> str:
         return _err(exc)
 
 
+def model_forge_storage(args: dict | None = None, **kwargs) -> str:
+    """List model-storage entries (downloads dir + engine-managed model
+    dirs), or delete one listed entry (routed through the human-approval
+    gate; see policy_hook)."""
+    args = args or {}
+    try:
+        from . import storage
+        action = str(args.get("action") or "list").strip() or "list"
+        if action not in ("list", "delete"):
+            return _dump({"error": f"unknown action: {action!r}; valid "
+                                   f"actions: ['list', 'delete']"})
+        if action == "list":
+            return _dump(storage.list_storage())
+        ref = str(args.get("entry") or "").strip()
+        if not ref:
+            return _dump({"error": "entry required for action=delete: pass "
+                                   "an entry id from action=list or that "
+                                   "entry's exact path"})
+        return _dump(storage.delete_entry(ref))
+    except Exception as exc:
+        return _err(exc)
+
+
 def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
     """Generate 3D models / music / SFX through a compute target's
     media-gateway endpoint. 3d submits a job (poll with job_id); music/sfx
@@ -665,8 +708,7 @@ def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
                 with urllib.request.urlopen(req, timeout=60.0) as resp:
                     out = _json.loads(resp.read().decode("utf-8", "replace"))
             except Exception as exc:  # noqa: BLE001
-                return _dump({"ok": False, "action": "submit_failed",
-                              "error": f"{type(exc).__name__}: {exc}"})
+                return _dump(_submit_failure(exc))
             return _dump({"ok": True, "action": "submitted",
                           "submitted": out,
                           "poll": f"model_forge_generate_media with "
@@ -692,8 +734,7 @@ def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
                 except Exception:  # noqa: BLE001 — headers are best-effort
                     content_type = ""
         except Exception as exc:  # noqa: BLE001
-            return _dump({"ok": False, "action": "submit_failed",
-                          "error": f"{type(exc).__name__}: {exc}"})
+            return _dump(_submit_failure(exc))
         waited = time.monotonic() - started
         wait_note = (f"this call blocked {waited:.1f} s until the engine "
                      "finished rendering")
@@ -712,6 +753,38 @@ def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
                       "note": wait_note + f"; audio saved to {path}"})
     except Exception as exc:
         return _err(exc)
+
+
+def _submit_failure(exc: Exception) -> dict:
+    """Error payload for a failed media-endpoint call (fail closed). An HTTP
+    failure names its status and a short response snippet in the detail so
+    the caller can act on it instead of a generic submit_failed."""
+    out = {"ok": False, "action": "submit_failed"}
+    status = getattr(exc, "code", None)
+    if isinstance(status, int):
+        out["http_status"] = status
+    snippet = ""
+    read = getattr(exc, "read", None)
+    if callable(read):
+        try:
+            raw = read()
+        except Exception:  # noqa: BLE001 — snippet is best-effort
+            raw = b""
+        if isinstance(raw, (bytes, bytearray)):
+            snippet = bytes(raw).decode("utf-8", "replace").strip()[:200]
+    if snippet:
+        out["response_snippet"] = snippet
+    if "http_status" in out:
+        detail = f"media endpoint request failed: HTTP {out['http_status']}"
+        reason = getattr(exc, "reason", None)
+        if reason:
+            detail += f" {reason}"
+        if snippet:
+            detail += f"; response: {snippet}"
+    else:
+        detail = f"{type(exc).__name__}: {exc}"
+    out["error"] = detail
+    return out
 
 
 def _audio_suffix(raw: bytes, content_type: str) -> str:

@@ -63,7 +63,7 @@ def test_install_plan_file_pull():
                         engine_model="checkpoints/hunyuan3d-dit-v2_fp16.safetensors")
     assert plan["ok"] is True and plan["action"] == "hf_download"
     assert plan["url"] == ("https://huggingface.co/"
-                           "Comfy-Org/hunyuan3D_2.0_repackaged/resolve/main/"
+                           "Comfy-Org/Hunyuan-3D-2.0/resolve/main/"
                            "checkpoints/hunyuan3d-dit-v2_fp16.safetensors")
     assert plan["dest_default"].endswith("hunyuan3d-dit-v2_fp16.safetensors")
     # without a file path it asks instead of guessing
