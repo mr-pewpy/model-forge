@@ -117,16 +117,33 @@ INSTALL = {
         "Pull/download a model on a compute target. Maya targets download "
         "over HTTP with progress; Strata targets get the exact `strata "
         "launch` command to run there; GGUF chat models defer to Hermes' "
-        "built-in Local Models. Use when the user wants a model from "
-        "model_forge_browse downloaded."
+        "built-in Local Models. Or provision an inference engine with "
+        "action='engine_install': the plan shows the vendor's exact "
+        "official install command (Ollama, Strata, Project Maya) and it "
+        "runs as a background job only after the human-approval gate "
+        "approves it; llama.cpp is never installed — it defers to Hermes "
+        "core's managed runtime. Use when the user wants a model from "
+        "model_forge_browse downloaded, or an engine installed."
     ),
     "parameters": {
         "type": "object",
         "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["model_install", "engine_install"],
+                "description": (
+                    "'model_install' (default) pulls a model. "
+                    "'engine_install' provisions an inference engine: plan "
+                    "first (the vendor's exact install command), then "
+                    "execute=true runs it after the human-approval gate "
+                    "approves — denial or timeout runs nothing."
+                ),
+            },
             "model_id": {
                 "type": "string",
                 "description": "Registry model id from model_forge_browse "
-                               "(required unless polling with job_id).",
+                               "(required for model_install unless polling "
+                               "with job_id).",
             },
             "target": {
                 "type": "string",
@@ -135,10 +152,25 @@ INSTALL = {
             "engine": {
                 "type": "string",
                 "description": (
-                    "Which engine to install for when the model supports "
-                    "several (e.g. 'vllm' or 'comfyui' for qwen-image-2.1). "
-                    "Default: auto-select from the engines detected on the "
-                    "target; must be one of the model's engines."
+                    "For model_install: which engine to install for when the "
+                    "model supports several (e.g. 'vllm' or 'comfyui' for "
+                    "qwen-image-2.1); default auto-selects from the engines "
+                    "detected on the target and must be one of the model's "
+                    "engines. For action=engine_install: the engine id to "
+                    "provision ('ollama', 'strata' or 'maya' — their "
+                    "vendors' official installers; 'llamacpp' returns "
+                    "guidance to Hermes core's managed runtime)."
+                ),
+            },
+            "execute": {
+                "type": "boolean",
+                "description": (
+                    "For action=engine_install: true runs the planned "
+                    "vendor-official install command as a background job "
+                    "(progress via job_id, hard timeout) — the "
+                    "human-approval gate shows the exact command first and "
+                    "denial or timeout runs nothing. false/omitted = plan "
+                    "only."
                 ),
             },
             "engine_model": {
@@ -165,8 +197,8 @@ INSTALL = {
             },
             "job_id": {
                 "type": "string",
-                "description": "Poll a running download job instead of "
-                               "starting an install.",
+                "description": "Poll a running download or engine-install "
+                               "job instead of starting an install.",
             },
         },
         "required": [],

@@ -556,3 +556,89 @@ def test_install_handler_multi_file_lists_components(tmp_path, monkeypatch):
         {"model_id": "hunyuan3d-2", "target": "local"}))
     assert out["ok"] is False and out["action"] == "multi_file"
     assert "model_index.json" in out["files"]
+
+
+# --- engine provisioning: engine_install plans + discovery integration ------
+
+def test_engine_install_plan_vendor_commands():
+    from model_forge.tools import engine_install_plan
+    plan = engine_install_plan("ollama")
+    assert plan["ok"] is True and plan["action"] == "vendor_installer"
+    assert plan["vendor"] == "Ollama" and plan["executes"] is True
+    assert plan["command"] == "curl -fsSL https://ollama.com/install.sh | sh"
+    maya = engine_install_plan("maya")
+    assert maya["command"] == ("git clone https://github.com/mw00/project-maya "
+                               "&& cd project-maya && ./setup.sh")
+    assert any("git clone https://github.com/mw00/project-maya" in s
+               for s in maya["steps"])
+    # engine ids are normalized; empty and unknown ids are refused honestly
+    assert engine_install_plan(" Strata ")["engine"] == "strata"
+    bad = engine_install_plan("banana")
+    assert bad["ok"] is False and bad["action"] == "unknown_engine"
+    missing = engine_install_plan("")
+    assert missing["ok"] is False and missing["action"] == "needs_engine"
+
+
+def test_engine_install_commands_match_adapter_documented_installs(monkeypatch):
+    # the planner's commands are exactly the installs the adapters document
+    monkeypatch.setattr("model_forge.engines.strata.shutil.which",
+                        lambda _: None)
+    monkeypatch.setattr("model_forge.engines.strata.served_models",
+                        lambda base_url="": [])
+    monkeypatch.setattr("model_forge.engines.maya.catalog",
+                        lambda base_url="": None)
+    from model_forge.engines import maya, strata
+    from model_forge.tools import engine_install_plan
+    assert engine_install_plan("strata")["command"] in strata.detect("").detail
+    detail = maya.detect("").detail
+    assert "git clone https://github.com/mw00/project-maya" in detail
+    assert "setup.sh" in detail
+    assert engine_install_plan("maya")["command"].startswith(
+        "git clone https://github.com/mw00/project-maya")
+
+
+def test_engine_install_llamacpp_guides_to_core_runtime():
+    from model_forge.tools import engine_install_plan
+    present = engine_install_plan(
+        "llamacpp",
+        core_probe=lambda: {"present": True,
+                            "signals": ["the hermes CLI is on PATH (Hermes "
+                                        "core is installed)"]})
+    assert present["ok"] is True
+    assert present["action"] == "use_core_local_models"
+    assert present["executes"] is False and "command" not in present
+    assert "never installs llama.cpp binaries" in present["detail"]
+    assert "Local Models" in present["detail"]
+    assert "hermes model" in present["detail"]
+    assert present["core_runtime"]["present"] is True
+    absent = engine_install_plan("llamacpp",
+                                 core_probe=lambda: {"present": False,
+                                                     "signals": []})
+    assert absent["action"] == "use_core_local_models"
+    assert "No managed llama.cpp runtime was detected" in absent["detail"]
+    assert "Local Models" in absent["detail"] and "downloads" in absent["detail"]
+
+
+def test_install_plan_fallback_names_engine_install_for_provisionable_engines():
+    from model_forge.tools import install_plan
+    # maya fallback: the note names the engine_install action
+    plan = install_plan(_entry("glm-5.3-flash"), _REMOTE, available_engines=[])
+    note = plan["engine_note"]
+    assert "no matching engine detected on this target" in note
+    assert "install one or register a target that runs it" in note
+    assert "action='engine_install', engine='maya'" in note
+    # strata fallback likewise
+    plan = install_plan(_entry("qwen3.8-flash-next"), _REMOTE,
+                        available_engines=[])
+    assert "action='engine_install', engine='strata'" in plan["engine_note"]
+    # engines with no approved installer path keep the plain actionable note
+    plan = install_plan(_entry("qwen-image-2.1"), _REMOTE, available_engines=[])
+    assert "engine_install" not in plan["engine_note"]
+    assert "install one or register a target that runs it" \
+        in plan["engine_note"]
+    # llama.cpp fallback names engine_install as honest core guidance
+    plan = install_plan(_entry("core-gguf-catalog"), _REMOTE,
+                        available_engines=[])
+    assert "engine_install" in plan["engine_note"]
+    assert "never installs llama.cpp binaries" in plan["engine_note"]
+    assert "Local Models" in plan["engine_note"]

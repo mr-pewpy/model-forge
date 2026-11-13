@@ -7,13 +7,19 @@ logic is unit-tested without touching the network or the Hermes config.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import signal
+import subprocess
+import threading
 import time
 import urllib.request
 import uuid
 
 from .credentials import status as credentials_status
 from .engines import detect_engines
+from .engines import llamacpp as llamacpp_adapter
 from .engines import maya as maya_adapter
 from .engines import strata as strata_adapter
 from .engines.base import route_exists, root_url
@@ -63,24 +69,73 @@ _PROVIDER_FOR_ENGINE = {
     "vllm": "custom",
     "openai-compatible": "custom",
 }
+# Engine provisioning: the vendor-official install commands Model Forge's
+# engine_install action may plan and run. The command is never model-supplied
+# — only these fixed strings can execute, and only after the human-approval
+# gate approves the exact command (rule_key model-forge:engine_install).
+# llama.cpp is deliberately absent: Hermes core manages a llama.cpp runtime
+# (hardware-priced Local Models catalog and downloads), so engine_install
+# returns guidance to it instead of installing binaries.
+_ENGINE_INSTALLERS = {
+    "ollama": {
+        "vendor": "Ollama",
+        "command": "curl -fsSL https://ollama.com/install.sh | sh",
+        "steps": ["run the Ollama official install script "
+                  "(curl -fsSL https://ollama.com/install.sh | sh)"],
+    },
+    "strata": {
+        "vendor": "Strata",
+        "command": ("curl -fsSL https://github.com/Niko1221/Strata/releases/"
+                    "latest/download/install.sh | sh"),
+        "steps": ["run the Strata official install script "
+                  "(curl -fsSL https://github.com/Niko1221/Strata/releases/"
+                  "latest/download/install.sh | sh)"],
+    },
+    "maya": {
+        "vendor": "Project Maya",
+        "command": ("git clone https://github.com/mw00/project-maya "
+                    "&& cd project-maya && ./setup.sh"),
+        "steps": ["git clone https://github.com/mw00/project-maya",
+                  "./setup.sh (run from inside the cloned repository)"],
+    },
+}
+# Hard timeout for an approved installer job: the process group is killed at
+# the limit so nothing can hang unattended.
+_ENGINE_INSTALL_TIMEOUT_S = 900.0
 
 
 def _dump(payload: dict) -> str:
     return json.dumps(payload, indent=1)
 
 
+def _installer_key(engine_id: str) -> str:
+    """Normalized engine id for the approved-installer catalog."""
+    return (engine_id or "").strip().lower()
+
+
+def _installer_for(engine_id: str) -> dict | None:
+    """Approved vendor installer spec for an engine id, or None. The catalog
+    is the ONLY source of executable commands — model-supplied strings never
+    reach a shell."""
+    return _ENGINE_INSTALLERS.get(_installer_key(engine_id))
+
+
 def policy_hook(tool_name: str, args: dict | None = None, task_id: str = "",
                 **kwargs) -> dict | None:
-    """pre_tool_call policy: routes the three policy decisions through
+    """pre_tool_call policy: routes the policy decisions through
     Hermes' human-approval gate.
 
     Registering a compute target decides where engine calls and media jobs
     (including image data) can be sent; rewriting model.default redirects all
     future conversations; deleting a model-storage entry destroys model
-    weights on this machine. All three are the USER'S decisions — the model
-    must not make them alone. Escalating with ``action: approve`` shows the
-    user the exact URL / config change / path and size; denial, timeout, or
-    a gate error fails closed (the call is blocked before the handler runs).
+    weights on this machine; running a vendor engine installer (engine_install
+    with execute=true) puts vendor software on this machine. All four are the
+    USER'S decisions — the model must not make them alone. Escalating with
+    ``action: approve`` shows the user the exact URL / config change / path
+    and size / install command; denial, timeout, or a gate error fails closed
+    (the call is blocked before the handler runs). Guidance-only engine
+    plans (llama.cpp -> Hermes core's managed runtime) carry no command and
+    execute nothing, so they do not escalate.
     """
     args = args or {}
     if tool_name == "model_forge_storage" and args.get("action") == "delete":
@@ -126,6 +181,27 @@ def policy_hook(tool_name: str, args: dict | None = None, task_id: str = "",
                 f'default)'}"),
             "rule_key": "model-forge:activate",
         }
+    if tool_name == "model_forge_install" \
+            and args.get("action") == "engine_install" \
+            and args.get("execute") is True:
+        spec = _installer_for(str(args.get("engine") or ""))
+        if spec is not None:
+            return {
+                "action": "approve",
+                "message": (
+                    "Model Forge wants to install the "
+                    f"{spec['vendor']} inference engine on this machine by "
+                    "running the vendor's official install command in a "
+                    "background job:\n"
+                    f"  command: {spec['command']}\n"
+                    f"  engine: {_installer_key(str(args.get('engine') or ''))}\n"
+                    "Progress is pollable with model_forge_install job_id, "
+                    "and a hard timeout stops the installer if it runs too "
+                    "long. Approve to run it — denying or letting this "
+                    "prompt time out runs nothing."),
+                "rule_key": "model-forge:engine_install",
+            }
+        return None   # no approved installer -> nothing can execute
     return None
 
 
@@ -188,10 +264,12 @@ def _select_engine(entry: ModelEntry, requested: str,
                     f"{list(entry.engines)} was detected on this target. Run "
                     "the weights in that environment yourself, or register a "
                     "target that runs a supported engine")
-            return fallback, (
+            note = (
                 "no matching engine detected on this target — install one or "
                 "register a target that runs it (planning for the listed "
                 f"engine '{fallback}')")
+            hint = _engine_install_hint(fallback)
+            return fallback, note + (" " + hint if hint else "")
         return fallback, ""
     return "", ""
 
@@ -328,6 +406,206 @@ def activation_plan(entry: ModelEntry, target: ComputeTarget,
                   "the documented hermes_cli.model_setup helper; takes "
                   "effect on your next session",
     }
+
+
+# --- engine provisioning (approved vendor installers) -----------------------
+
+def _core_llamacpp_status() -> dict:
+    """Detect Hermes core's managed llama.cpp runtime — read-only signals
+    only: a `hermes` CLI on PATH (core is installed and owns the runtime,
+    its hardware-priced Local Models catalog and downloads) and/or a
+    llama-server already answering locally. Reports exactly what was found,
+    never more."""
+    signals = []
+    if shutil.which("hermes"):
+        signals.append("the hermes CLI is on PATH (Hermes core is installed)")
+    try:
+        status = llamacpp_adapter.detect("")
+    except Exception:  # noqa: BLE001 — detection is advisory, fail soft
+        status = None
+    if status is not None and status.available:
+        signals.append(f"a llama.cpp server is answering at {status.endpoint}")
+    return {"present": bool(signals), "signals": signals}
+
+
+def engine_install_plan(engine_id: str, core_probe=None) -> dict:
+    """What engine_install would do for an engine id — no side effects
+    beyond read-only detection (unit-tested).
+
+    Engines with an approved vendor installer return the exact command the
+    installer would run; it executes only with execute=true after the
+    human-approval gate approves that command. llama.cpp has no installer:
+    the plan DETECTS whether Hermes core's managed llama.cpp runtime is
+    present and returns honest guidance to core's Local Models catalog and
+    downloads instead — Model Forge never installs llama.cpp binaries."""
+    key = _installer_key(engine_id)
+    if not key:
+        return {"ok": False, "action": "needs_engine",
+                "error": "engine required: pass engine=<engine id> "
+                         f"(approved installers: {sorted(_ENGINE_INSTALLERS)}; "
+                         "'llamacpp' returns guidance to Hermes core's "
+                         "managed runtime)"}
+    if key == "llamacpp":
+        probe = core_probe or _core_llamacpp_status
+        runtime = probe()
+        if runtime.get("present"):
+            found = "; ".join(runtime.get("signals") or ()) or "present"
+            detail = ("llamacpp has no vendor installer — Model Forge never "
+                      "installs llama.cpp binaries. Hermes core's managed "
+                      f"llama.cpp runtime is present on this machine ({found}). "
+                      "Use it: GGUF models are priced and installed through "
+                      "the built-in Local Models catalog (Settings -> "
+                      "Providers -> Local Models, or `hermes model`)")
+        else:
+            detail = ("llamacpp has no vendor installer — Model Forge never "
+                      "installs llama.cpp binaries. No managed llama.cpp "
+                      "runtime was detected on this machine. Use Hermes "
+                      "core's Local Models (Settings -> Providers -> Local "
+                      "Models, or `hermes model`): it manages the llama.cpp "
+                      "runtime, its hardware-priced catalog and its "
+                      "downloads; Model Forge detects the server "
+                      "automatically once it starts")
+        return {"ok": True, "action": "use_core_local_models", "engine": "llamacpp",
+                "executes": False, "core_runtime": runtime, "detail": detail}
+    spec = _installer_for(key)
+    if spec is None:
+        return {"ok": False, "action": "unknown_engine", "engine": key,
+                "error": f"no approved engine installer for '{key}'; Model "
+                         f"Forge can provision {sorted(_ENGINE_INSTALLERS)} "
+                         "from their vendors' official installers and guides "
+                         "'llamacpp' to Hermes core's managed runtime"}
+    return {"ok": True, "action": "vendor_installer", "engine": key,
+            "vendor": spec["vendor"], "command": spec["command"],
+            "steps": list(spec["steps"]), "executes": True,
+            "detail": f"the {spec['vendor']} vendor-official install "
+                      "command; it runs only with execute=true after the "
+                      "human-approval gate approves this exact command "
+                      "(rule_key model-forge:engine_install)"}
+
+
+def _engine_install_hint(engine_id: str) -> str:
+    """Discovery integration: the 'no matching engine detected' fallback
+    names the engine_install action for engines with an approved installer
+    path — and for llama.cpp, the honest core-runtime pointer instead."""
+    key = _installer_key(engine_id)
+    if key in _ENGINE_INSTALLERS:
+        return (f"Model Forge can provision '{key}' from its vendor's "
+                "official installer: model_forge_install with "
+                f"action='engine_install', engine='{key}' — plan first, "
+                "then the human-approval gate shows the exact command "
+                "before anything runs")
+    if key == "llamacpp":
+        return ("Model Forge never installs llama.cpp binaries — use Hermes "
+                "core's managed llama.cpp runtime (the built-in Local Models "
+                "catalog); model_forge_install with action='engine_install', "
+                "engine='llamacpp' explains")
+    return ""
+
+
+def _confirm_engine(engine_id: str) -> dict:
+    """Re-run engine detection after an installer exits — the install is
+    confirmed by detection, never assumed from the installer's exit code."""
+    try:
+        statuses = detect_engines("")
+    except Exception as exc:  # noqa: BLE001 — honest, not fatal
+        return {"detected": False,
+                "detail": f"engine detection failed after the install: "
+                          f"{type(exc).__name__}: {exc}"}
+    for e in statuses:
+        if e.id == _installer_key(engine_id) and e.available:
+            return {"detected": True, "endpoint": e.endpoint,
+                    "detail": e.detail or "the engine answers detection"}
+    return {"detected": False,
+            "detail": "the engine did not answer detection after the "
+                      "installer finished; engines are started by you — run "
+                      "it and Model Forge will detect it"}
+
+
+def _run_installer(command: str, timeout_s: float) -> dict:
+    """Run the approved vendor install command in its own session. The hard
+    timeout kills the whole process group so nothing can hang unattended;
+    on timeout this raises subprocess.TimeoutExpired (the job record says
+    'timeout', never a false 'done')."""
+    proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        out, _ = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        try:
+            proc.wait(timeout=10.0)
+        except Exception:  # noqa: BLE001 — already killed; nothing to do
+            pass
+        raise
+    return {"returncode": proc.returncode,
+            "output_tail": (out or b"").decode("utf-8", "replace")[-2000:]}
+
+
+def _engine_install_job(job_id: str, plan: dict, runner=None) -> None:
+    """Background installer job (daemon thread, the pull.py pattern): writes
+    progress records to the shared jobs store (polled with
+    model_forge_install job_id), enforces the hard timeout, and confirms the
+    install by re-running engine detection."""
+    from . import pull
+    state = {"job_id": job_id, "kind": "engine_install",
+             "engine": plan["engine"], "vendor": plan["vendor"],
+             "command": plan["command"], "state": "running",
+             "hard_timeout_s": _ENGINE_INSTALL_TIMEOUT_S}
+    pull._write_job(job_id, state)
+    try:
+        runner = runner or _run_installer
+        result = runner(plan["command"], _ENGINE_INSTALL_TIMEOUT_S)
+        state["returncode"] = result.get("returncode")
+        state["output_tail"] = result.get("output_tail", "")
+        if result.get("returncode") == 0:
+            state["detection"] = _confirm_engine(plan["engine"])
+            state["state"] = "done"
+            state["detail"] = (
+                "the vendor installer exited successfully"
+                + (" and the engine now answers detection"
+                   if state["detection"].get("detected")
+                   else "; see detection for the honest post-install state"))
+        else:
+            state["state"] = "error"
+            state["error"] = (
+                f"the vendor installer exited with code "
+                f"{result.get('returncode')} — nothing is assumed installed")
+    except subprocess.TimeoutExpired:
+        state["state"] = "timeout"
+        state["error"] = (
+            f"the vendor installer exceeded the "
+            f"{_ENGINE_INSTALL_TIMEOUT_S:.0f} s hard timeout and was "
+            "stopped (process group killed) — nothing is assumed installed")
+    except Exception as exc:  # noqa: BLE001 — the job record the failure
+        state["state"] = "error"
+        state["error"] = f"{type(exc).__name__}: {exc}"
+    pull._write_job(job_id, state)
+
+
+def start_engine_install(engine_id: str, runner=None) -> dict:
+    """Start the approved vendor installer as a background job (daemon
+    thread + jobs-store records). Call only after the human-approval gate
+    approved the exact command — the plan (engine_install_plan) comes first."""
+    from . import pull
+    plan = engine_install_plan(engine_id)
+    if not plan.get("command"):
+        return {"ok": False, "action": plan.get("action", "unknown_engine"),
+                "engine": plan.get("engine", _installer_key(engine_id)),
+                "error": plan.get("error")
+                         or f"engine '{engine_id}' has no vendor install "
+                           "command — nothing was run"}
+    job_id = uuid.uuid4().hex[:12]
+    pull._write_job(job_id, {"job_id": job_id, "kind": "engine_install",
+                             "engine": plan["engine"], "vendor": plan["vendor"],
+                             "command": plan["command"], "state": "starting",
+                             "hard_timeout_s": _ENGINE_INSTALL_TIMEOUT_S})
+    threading.Thread(target=_engine_install_job, args=(job_id, plan, runner),
+                     daemon=True).start()
+    return {"ok": True, "job_id": job_id,
+            "poll": f"model_forge_install with job_id={job_id}"}
 
 
 # --- tools -------------------------------------------------------------------
@@ -490,14 +768,62 @@ def model_forge_target_add(args: dict | None = None, **kwargs) -> str:
         return _err(exc)
 
 
+def _engine_install_action(args: dict) -> dict:
+    """engine_install action: plan first (the exact vendor command), execute
+    only with execute=true — and that call is escalated to the human-approval
+    gate by policy_hook (rule_key model-forge:engine_install) BEFORE this
+    handler runs; denial, timeout or a gate error blocks the call entirely,
+    so nothing runs without explicit approval. The command is never
+    model-supplied: it comes only from the approved-installer catalog."""
+    engine_id = str(args.get("engine") or "").strip()
+    plan = engine_install_plan(engine_id)
+    if args.get("execute") is not True:
+        plan["executed"] = False
+        if plan.get("command"):
+            plan["hint"] = ("plan only — re-run with action='engine_install', "
+                            f"engine='{plan['engine']}', execute=true to run "
+                            "the command above; the human-approval gate "
+                            "shows the exact command first, and denial or "
+                            "timeout runs nothing")
+        return plan
+    # execute=true. For a command-bearing plan, policy_hook has already
+    # escalated this exact call to the human-approval gate — reaching this
+    # point means the user approved the exact command shown there.
+    plan["executed"] = False
+    if not plan.get("command"):
+        return plan   # guidance-only (llama.cpp) or invalid: nothing to run
+    started = start_engine_install(plan["engine"])
+    if not started.get("ok"):
+        plan.update({k: v for k, v in started.items() if k != "ok"})
+        return plan
+    plan.update(started)
+    plan["executed"] = True
+    plan["action"] = "engine_install_started"
+    plan["detail"] = (
+        "the approved vendor installer runs as a background job (hard "
+        f"timeout {int(_ENGINE_INSTALL_TIMEOUT_S)} s); poll with "
+        f"model_forge_install job_id={started['job_id']} — completion "
+        "re-runs engine detection and reports it honestly")
+    return plan
+
+
 def model_forge_install(args: dict | None = None, **kwargs) -> str:
     """Pull a model on a compute target (Maya: HTTP pull; HF download: job;
-    Strata: CLI). Pass job_id to poll a download."""
+    Strata: CLI), or provision an engine (action='engine_install': plan the
+    vendor's official install command first; execute=true runs it behind the
+    human-approval gate). Pass job_id to poll a download or engine install."""
     args = args or {}
     try:
         from . import pull
         if args.get("job_id"):
             return _dump(pull.job_status(str(args["job_id"])))
+        action = str(args.get("action") or "model_install").strip()
+        if action == "engine_install":
+            return _dump(_engine_install_action(args))
+        if action != "model_install":
+            return _dump({"error": f"unknown action: {action!r}; valid "
+                                   f"actions: ['model_install', "
+                                   f"'engine_install']"})
         model_id = str(args.get("model_id") or "").strip()
         if not model_id:
             return _dump({"error": "model_id required (or job_id to poll a "
@@ -684,9 +1010,16 @@ def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
                                            f"(got {job_id!r})"})
                 req = urllib.request.Request(
                     f"{root}/jobs/{job_id}")
-                with urllib.request.urlopen(req, timeout=30.0) as resp:
-                    return _dump({"job": _json.loads(
-                        resp.read().decode("utf-8", "replace"))})
+                try:
+                    with urllib.request.urlopen(req, timeout=30.0) as resp:
+                        return _dump({"job": _json.loads(
+                            resp.read().decode("utf-8", "replace"))})
+                except Exception as exc:  # noqa: BLE001
+                    # Same honesty as the submit paths: name the HTTP status
+                    # and a response snippet instead of a generic error.
+                    out = _submit_failure(exc)
+                    out["action"] = "poll_failed"
+                    return _dump(out)
             model = str(args.get("model", "")).strip()
             image = str(args.get("image", "")).strip()
             if not model or not image:

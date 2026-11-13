@@ -1182,3 +1182,256 @@ def test_install_schema_example_is_a_real_repo_path():
     assert "model.safetensors" not in desc    # the 404-prone example is gone
     assert "diffusion_models/your-weights.safetensors" in desc
     assert "omit engine_model" in desc
+
+
+# --- tools.py: engine_install (approved vendor installers) ------------------
+
+_OLLAMA_CMD = "curl -fsSL https://ollama.com/install.sh | sh"
+_STRATA_CMD = ("curl -fsSL https://github.com/Niko1221/Strata/releases/"
+               "latest/download/install.sh | sh")
+
+
+def _installer_spy(monkeypatch, result=None, raise_exc=None):
+    """Fake installer runner: records the exact commands it is asked to run.
+    Tests never run a real installer."""
+    calls = []
+
+    def runner(command, timeout_s):
+        calls.append(command)
+        if raise_exc is not None:
+            raise raise_exc
+        return result or {"returncode": 0, "output_tail": "install ok"}
+
+    monkeypatch.setattr("model_forge.tools._run_installer", runner)
+    return calls
+
+
+def _simulate_approval_gate(tool_name, args, decision, dispatch):
+    """Emulate the Hermes human-approval gate contract for a pre_tool_call
+    approve directive: only an explicit user approval lets the call reach
+    the handler; denial, timeout or a gate error blocks the call BEFORE the
+    handler runs (fail closed) — nothing executes."""
+    from model_forge import tools
+    directive = tools.policy_hook(tool_name, args)
+    if directive is not None and directive.get("action") == "approve" \
+            and decision != "approve":
+        return {"blocked": True, "directive": directive}
+    return {"blocked": False, "result": dispatch(args)}
+
+
+def _poll_until_done(job_id, rounds=100):
+    import time
+    from model_forge import tools
+    st = {}
+    for _ in range(rounds):
+        st = json.loads(tools.model_forge_install({"job_id": job_id}))
+        if st.get("state") in ("done", "error", "timeout"):
+            return st
+        time.sleep(0.02)
+    return st
+
+
+def test_engine_install_plan_shows_exact_command_before_execute(tmp_path,
+                                                                monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    calls = _installer_spy(monkeypatch)
+    out = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "ollama"}))
+    # plan first: the exact vendor command, and nothing ran
+    assert out["ok"] is True and out["action"] == "vendor_installer"
+    assert out["command"] == _OLLAMA_CMD
+    assert out["executed"] is False and "job_id" not in out
+    assert "execute=true" in out["hint"] and "denial" in out["hint"]
+    assert calls == []
+    # planning is read-only: no approval gate for it
+    assert tools.policy_hook("model_forge_install",
+                             {"action": "engine_install",
+                              "engine": "ollama"}) is None
+    assert tools.policy_hook("model_forge_install",
+                             {"action": "engine_install", "engine": "ollama",
+                              "execute": False}) is None
+
+
+def test_policy_hook_engine_install_approve_directive():
+    from model_forge import tools
+    d = tools.policy_hook("model_forge_install",
+                          {"action": "engine_install", "engine": "ollama",
+                           "execute": True})
+    assert d["action"] == "approve"
+    assert d["rule_key"] == "model-forge:engine_install"
+    assert _OLLAMA_CMD in d["message"]        # the exact command shown
+    assert "ollama" in d["message"]
+    # the Strata documented install command appears verbatim as well
+    d = tools.policy_hook("model_forge_install",
+                          {"action": "engine_install", "engine": "strata",
+                           "execute": True})
+    assert d["rule_key"] == "model-forge:engine_install"
+    assert _STRATA_CMD in d["message"]
+    # a model-install call still needs no approval (historical contract)
+    assert tools.policy_hook("model_forge_install",
+                             {"model_id": "m"}) is None
+
+
+def test_engine_install_gate_denial_fails_closed(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    calls = _installer_spy(monkeypatch)
+    out = _simulate_approval_gate(
+        "model_forge_install",
+        {"action": "engine_install", "engine": "ollama", "execute": True},
+        "deny", tools.model_forge_install)
+    assert out["blocked"] is True
+    assert out["directive"]["rule_key"] == "model-forge:engine_install"
+    assert calls == []                        # denial runs nothing
+    jobs_dir = tmp_path / "model-forge" / "jobs"
+    assert not jobs_dir.exists() or list(jobs_dir.glob("*.json")) == []
+
+
+def test_engine_install_gate_timeout_fails_closed(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    calls = _installer_spy(monkeypatch)
+    for decision in ("timeout", "gate_error"):
+        out = _simulate_approval_gate(
+            "model_forge_install",
+            {"action": "engine_install", "engine": "strata", "execute": True},
+            decision, tools.model_forge_install)
+        assert out["blocked"] is True, decision
+    assert calls == []                        # a timed-out gate runs nothing
+
+
+def test_engine_install_approved_flow_runs_and_polls(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    from model_forge.engines.base import EngineStatus
+    calls = _installer_spy(monkeypatch)
+    monkeypatch.setattr(
+        tools, "detect_engines",
+        lambda base_url="": [EngineStatus(
+            id="ollama", display_name="Ollama", available=True,
+            endpoint="http://127.0.0.1:11434", detail="running")])
+    out = _simulate_approval_gate(
+        "model_forge_install",
+        {"action": "engine_install", "engine": "ollama", "execute": True},
+        "approve", tools.model_forge_install)
+    assert out["blocked"] is False
+    res = json.loads(out["result"])
+    assert res["ok"] is True and res["action"] == "engine_install_started"
+    assert res["executed"] is True and res["job_id"]
+    assert res["command"] == _OLLAMA_CMD
+    # poll through the shared jobs store (model_forge_install job_id)
+    st = _poll_until_done(res["job_id"])
+    assert st["state"] == "done"
+    assert st["kind"] == "engine_install" and st["engine"] == "ollama"
+    assert st["command"] == _OLLAMA_CMD and st["returncode"] == 0
+    # completion re-runs engine detection and reports it honestly
+    assert st["detection"]["detected"] is True
+    assert calls == [_OLLAMA_CMD]             # the approved command only
+
+
+def test_engine_install_failure_and_timeout_reported_honestly(tmp_path,
+                                                              monkeypatch):
+    import subprocess
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    # a non-zero installer exit is an error, never a false 'done'
+    _installer_spy(monkeypatch, result={"returncode": 2,
+                                       "output_tail": "permission denied"})
+    res = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "ollama", "execute": True}))
+    st = _poll_until_done(res["job_id"])
+    assert st["state"] == "error" and "2" in st["error"]
+    assert st["output_tail"] == "permission denied"
+    assert "detection" not in st              # nothing is assumed installed
+    # the hard timeout kills the job record as 'timeout', not 'done'
+    _installer_spy(monkeypatch,
+                   raise_exc=subprocess.TimeoutExpired(cmd="installer",
+                                                       timeout=1.0))
+    res = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "strata", "execute": True}))
+    st = _poll_until_done(res["job_id"])
+    assert st["state"] == "timeout"
+    assert "hard timeout" in st["error"] and "nothing is assumed installed" \
+        in st["error"]
+
+
+def test_engine_install_llamacpp_guides_to_core_runtime(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    calls = _installer_spy(monkeypatch)
+    monkeypatch.setattr(
+        tools, "_core_llamacpp_status",
+        lambda: {"present": True,
+                 "signals": ["the hermes CLI is on PATH (Hermes core is "
+                             "installed)"]})
+    out = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "llamacpp"}))
+    assert out["ok"] is True and out["action"] == "use_core_local_models"
+    assert out["executed"] is False and "command" not in out
+    assert "never installs llama.cpp binaries" in out["detail"]
+    assert "Local Models" in out["detail"] and "hermes model" in out["detail"]
+    assert out["core_runtime"]["present"] is True
+    # even with execute=true: no command exists, nothing executes, and the
+    # gate is not asked to approve an installer run
+    assert tools.policy_hook("model_forge_install",
+                             {"action": "engine_install", "engine": "llamacpp",
+                              "execute": True}) is None
+    out = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "llamacpp", "execute": True}))
+    assert out["executed"] is False and calls == []
+    # no managed runtime detected: honest absence, still core guidance
+    monkeypatch.setattr(tools, "_core_llamacpp_status",
+                        lambda: {"present": False, "signals": []})
+    out = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "llamacpp"}))
+    assert "No managed llama.cpp runtime was detected" in out["detail"]
+    assert "Local Models" in out["detail"]
+    assert calls == []
+
+
+def test_engine_install_unknown_engine_never_runs(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    calls = _installer_spy(monkeypatch)
+    for engine in ("banana", "ollama; rm -rf /", ""):
+        out = json.loads(tools.model_forge_install(
+            {"action": "engine_install", "engine": engine, "execute": True}))
+        assert out["ok"] is False, engine
+        assert out["action"] in ("unknown_engine", "needs_engine"), engine
+        # an unknown or malformed engine id escalates nothing and runs nothing
+        assert tools.policy_hook("model_forge_install",
+                                 {"action": "engine_install", "engine": engine,
+                                  "execute": True}) is None
+    assert calls == []
+    # unknown actions name the valid ones instead of falling through
+    out = json.loads(tools.model_forge_install({"action": "banana"}))
+    assert "error" in out and "engine_install" in out["error"]
+
+
+def test_generate_media_3d_job_poll_http_error_surfaces_status_and_body(
+        tmp_path, monkeypatch):
+    import io
+    import urllib.error
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit_job",
+                         "submit": "http://gpu-box.example.com:8080/jobs"})
+    exc = urllib.error.HTTPError(
+        "http://gpu-box.example.com:8080/jobs/3djob-1", 503,
+        "Service Unavailable", hdrs=None,
+        fp=io.BytesIO(b'{"detail":"queue is full"}'))
+    _fake_urlopen(monkeypatch, b"", exc=exc)
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box", "job_id": "3djob-1"}))
+    # the poll path surfaces the HTTP status and a response snippet, the
+    # same honesty as the submit paths (not a generic error payload)
+    assert out["ok"] is False and out["action"] == "poll_failed"
+    assert out["http_status"] == 503
+    assert out["response_snippet"] == '{"detail":"queue is full"}'
+    assert "503" in out["error"] and "queue is full" in out["error"]

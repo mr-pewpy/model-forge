@@ -24,8 +24,10 @@ VRAM numbers. Model Forge closes that gap: one registry of
 > Hermes → you use it.
 
 One honest caveat up front: **Model Forge does not start engines.** Install
-either downloads model files, drives a running engine's own pull API, or
-prints the exact command for you to run. Engines stay yours to launch.
+either downloads model files, drives a running engine's own pull API, prints
+the exact command for you to run, or — behind the human-approval gate — runs
+an engine vendor's official installer (`action=engine_install`). Engines
+stay yours to launch.
 
 ## The demo (90 seconds, one gaming PC, zero cloud)
 
@@ -46,7 +48,7 @@ run through a user-configured OpenAI-compatible media gateway.
 | `model_forge_status` | GPUs, VRAM, RAM, engines per compute target, pull credentials |
 | `model_forge_browse` | Models by modality with an advisory fit verdict per target, plus a live HuggingFace "fresh" section (`fresh=false` = curated only) |
 | `model_forge_target_add` | Register a compute target (a remote host, a cloud instance) — asks for your approval first |
-| `model_forge_install` | Pull a model: plugin-side HF download (sha256, resume, job polling), a running Maya's HTTP pull, or the exact engine CLI command to run yourself |
+| `model_forge_install` | Pull a model: plugin-side HF download (sha256, resume, job polling), a running Maya's HTTP pull, or the exact engine CLI command to run yourself; provision an engine (`action=engine_install`) from its vendor's official installer after your approval |
 | `model_forge_activate` | Connect a running chat model as Hermes' default (plan-only; `apply=true` writes config after human approval) |
 | `model_forge_generate_media` | 3D (image→GLB), music, SFX — jobs through a user-configured OpenAI-compatible media gateway |
 | `model_forge_storage` | Model weights on disk (downloads dir, Ollama models dir, HuggingFace hub cache): list names, sizes and modification times; delete a listed entry after your approval |
@@ -162,8 +164,13 @@ Honest scoping — current limits, and what does not work yet:
 - **`model_forge_generate_media` speaks the media gateway job API only**
   (`/v1/videos/generations`, `/v1/audio/music`, `/v1/audio/sfx`). The
   ComfyUI-native job flow (`/prompt` + `/history`) is not implemented.
-- **No engine lifecycle.** Model Forge never installs or starts engines —
-  it detects them, pulls model files, and emits run commands.
+- **No engine lifecycle management.** Model Forge never starts engines —
+  it detects them, pulls model files, and emits run commands. Installing
+  engine *software* is available for Ollama, Strata and Project Maya via
+  `model_forge_install` with `action=engine_install`: the plan shows the
+  vendor's exact official install command, and it runs as a background job
+  only after you approve it at the human-approval gate. llama.cpp is never
+  installed — Hermes core's managed runtime covers it.
 
 ## Disclosure (what this plugin does on your machine)
 
@@ -183,10 +190,20 @@ Honest scoping — current limits, and what does not work yet:
 - **Shell:** runs `nvidia-smi` and `rocm-smi` (read-only GPU queries) and
   checks `PATH` for the `strata` CLI. Hardware probes also read system state
   directly: amdgpu sysfs on Linux and the Windows memory API
-  (`GlobalMemoryStatusEx`). No engine installer or launcher is run by the
-  plugin.
-- **Background:** long model downloads run on a daemon background thread
-  (job records are pollable); it is the plugin's only background process.
+  (`GlobalMemoryStatusEx`). `model_forge_install` with `action=engine_install`
+  executes vendor-official install commands in a background process, but only
+  after explicit user approval at the human-approval gate: Ollama
+  (`curl -fsSL https://ollama.com/install.sh | sh`), Strata
+  (`curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh`),
+  and Project Maya (`git clone https://github.com/mw00/project-maya && cd project-maya && ./setup.sh`).
+  llama.cpp is never installed — it defers to Hermes core's managed llama.cpp
+  runtime (the built-in Local Models catalog and downloads). No engine
+  launcher is run by the plugin.
+- **Background:** long model downloads and approved engine installs run on
+  a daemon background thread (job records are pollable with
+  `model_forge_install` `job_id`); installer jobs carry a hard timeout (900
+  seconds) that kills the installer's process group, so nothing hangs
+  unattended. These are the plugin's only background processes.
 - **Files:** writes downloaded model files (with `.part` resume files),
   download job records, and discovery caches under its own plugin data dir;
   `download_roots` (**Settings → Plugins**) can widen where downloads land
@@ -201,11 +218,14 @@ Honest scoping — current limits, and what does not work yet:
   dir and the HuggingFace hub cache under your home directory);
   `model_forge_storage` with `action=delete` removes the user-approved files
   and folders from those roots.
-- **Approvals:** three actions escalate to Hermes' human-approval gate and
-  fail closed on denial — registering a compute target, writing the
-  default model config (`model_forge_activate` with `apply=true`), and
+- **Approvals:** four actions escalate to Hermes' human-approval gate and
+  fail closed on denial or timeout — registering a compute target, writing
+  the default model config (`model_forge_activate` with `apply=true`),
   deleting a model-storage entry (`model_forge_storage` with `action=delete`;
-  the prompt names the exact path and size).
+  the prompt names the exact path and size), and running a vendor engine
+  installer (`model_forge_install` with `action=engine_install`,
+  `execute=true`; the prompt shows the exact command, and denial or timeout
+  runs nothing).
 - **Credentials:** none required. HF/ModelScope tokens are optional, stored
   through Hermes' credential route (`Settings → Plugins`), read only via the
   secret scope.

@@ -54,7 +54,8 @@ def register(ctx):
         handler=tools.model_forge_storage,
     )
     # Policy gate: registering a compute target, rewriting the default model
-    # config, and deleting a model-storage entry are user decisions, not model
-    # decisions — tools.policy_hook escalates all three to Hermes'
-    # human-approval gate (fail closed on denial).
+    # config, deleting a model-storage entry, and running a vendor engine
+    # installer (model_forge_install action=engine_install, execute=true) are
+    # user decisions, not model decisions — tools.policy_hook escalates all
+    # four to Hermes' human-approval gate (fail closed on denial or timeout).
     ctx.register_hook("pre_tool_call", tools.policy_hook)
