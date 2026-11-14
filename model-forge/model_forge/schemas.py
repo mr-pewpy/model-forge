@@ -214,10 +214,12 @@ GENERATE_MEDIA = {
         "/v1/audio/music, /v1/audio/sfx). 3d: image to GLB (submit job, "
         "then poll with job_id). music/sfx: prompt to audio; the call "
         "blocks while the audio renders and the result is saved to the "
-        "plugin media directory. Known limit: the ComfyUI-native job flow "
-        "is not implemented — a plain ComfyUI endpoint does not serve "
-        "these lanes. Use when the user wants a 3D model, soundtrack, or "
-        "sound effect generated through a media gateway."
+        "plugin media directory. The GPU lane is claimed around the job and "
+        "released when the job completes or fails. Known limit: the "
+        "ComfyUI-native job flow is not implemented — a plain ComfyUI "
+        "endpoint does not serve these lanes. Use when the user wants a 3D "
+        "model, soundtrack, or sound effect generated through a media "
+        "gateway."
     ),
     "parameters": {
         "type": "object",
@@ -328,5 +330,72 @@ STORAGE = {
             },
         },
         "required": [],
+    },
+}
+
+BROKER = {
+    "name": "model_forge_broker",
+    "description": (
+        "Weight residency and workflow scopes on a compute target: what "
+        "weights are on disk and what is loaded in memory now, and the "
+        "claim/release verbs that let one GPU lane serve several models in "
+        "turn. 'status' (read-only) reports pulled weights with sizes, what "
+        "is resident, booked ceilings, and budget usage. 'claim' takes the "
+        "GPU lane for a modality or model: it runs the eviction policy, "
+        "steps down what must go, pre-warms the requested model, and "
+        "returns a scope id with honest progress states (queued / loading / "
+        "ready). 'release' ends a scope by id and restores exactly what was "
+        "resident at claim time. 'plan' is a dry run of claim — the "
+        "release/load steps with reasons, nothing executed. Use when the "
+        "user wants models swapped on one GPU (chat -> image generation -> "
+        "back to chat as one workflow), asks what is loaded and what it "
+        "costs, or wants to preview a swap."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["status", "claim", "release", "plan"],
+                "description": (
+                    "'status' = read-only residency summary; 'claim' = take "
+                    "the GPU lane for a modality or model and return a scope "
+                    "id; 'release' = end a scope and restore what was "
+                    "resident at claim time; 'plan' = dry run of claim "
+                    "(nothing executed)."
+                ),
+            },
+            "model_id": {
+                "type": "string",
+                "description": (
+                    "Catalog model id from model_forge_browse to claim the "
+                    "lane for (claim/plan)."
+                ),
+            },
+            "modality": {
+                "type": "string",
+                "description": (
+                    "Claim the lane for a whole modality instead of one "
+                    "model: its first curated model is used (pass model_id "
+                    "to pick a specific one)."
+                ),
+            },
+            "scope_id": {
+                "type": "string",
+                "description": (
+                    "For action=release: the scope id returned by claim. "
+                    "For action=claim: optional name for the scope (one is "
+                    "generated when omitted)."
+                ),
+            },
+            "target": {
+                "type": "string",
+                "description": (
+                    "Compute target id (default 'local'). See "
+                    "model_forge_status for the list."
+                ),
+            },
+        },
+        "required": ["action"],
     },
 }

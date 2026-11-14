@@ -20,6 +20,7 @@ from unittest import mock
 import pytest
 
 from model_forge import hardware, pull, schemas
+from model_forge.broker import EngineLifecycle
 from model_forge.registry import models_for
 from model_forge.targets import (
     ComputeTarget,
@@ -88,7 +89,8 @@ def test_schema_shapes():
                        ("model_forge_install", schemas.INSTALL),
                        ("model_forge_generate_media", schemas.GENERATE_MEDIA),
                        ("model_forge_activate", schemas.ACTIVATE),
-                       ("model_forge_storage", schemas.STORAGE)]:
+                       ("model_forge_storage", schemas.STORAGE),
+                       ("model_forge_broker", schemas.BROKER)]:
         assert spec["name"] == name
         assert spec["description"].strip()
         assert spec["parameters"]["type"] == "object"
@@ -1435,3 +1437,438 @@ def test_generate_media_3d_job_poll_http_error_surfaces_status_and_body(
     assert out["http_status"] == 503
     assert out["response_snippet"] == '{"detail":"queue is full"}'
     assert "503" in out["error"] and "queue is full" in out["error"]
+
+
+# --- model_forge_broker: weight residency + workflow scopes ------------------
+
+class _RecordingAdapter(EngineLifecycle):
+    """Engine lifecycle adapter that records every call into a shared log."""
+
+    def __init__(self, engine_id, calls):
+        self.engine_id = engine_id
+        self.calls = calls
+
+    def ensure_loaded(self, model_id, **kwargs):
+        self.calls.append(("ensure_loaded", self.engine_id, model_id))
+        return {"ok": True, "reason": "warmed"}
+
+    def release(self, model_id):
+        self.calls.append(("release", self.engine_id, model_id))
+        return {"ok": True, "reason": "evicted"}
+
+    def probe(self):
+        return {"ok": True, "state": "observed", "resident": []}
+
+
+def _residency_stack(target, calls, budget=48.0, adapters=None):
+    """A real residency stack (bookings, policy, scopes) with recording
+    engine adapters — everything through the broker library's public API."""
+    from model_forge import tools
+    from model_forge.broker import EvictionPlanner, Orchestrator, ResidencyLedger
+    bookings = tools.bookings_from_registry()
+    ledger = ResidencyLedger(bookings=bookings)
+    ledger.set_budget(target.id, budget)
+    if adapters is None:
+        adapters = {engine: _RecordingAdapter(engine, calls)
+                    for engine in ("ollama", "comfyui", "media-gateway")}
+    planner = EvictionPlanner(ledger)
+    orchestrator = Orchestrator(ledger, planner, adapters)
+    return {"target_id": target.id, "ledger": ledger, "planner": planner,
+            "orchestrator": orchestrator, "bookings": bookings,
+            "budget_gb": budget}
+
+
+def _book_chat_resident(stack):
+    """A claim-time chat resident with its own honest booking (catalog ids
+    cover the registry; this fixture models a running chat model)."""
+    spec = {"vram_gb": 6.0, "source": "catalog-vram-floor", "load_s": None}
+    stack["ledger"].book("chat-a", spec)
+    stack["bookings"]["chat-a"] = spec
+    stack["ledger"].record_resident("gpu-box", "chat-a", engine="ollama",
+                                    lane="chat")
+
+
+def _broker_env(monkeypatch, tmp_path, stack):
+    """Shared handler environment: remote target, isolated scope state, and
+    the residency stack behind the broker_stack seam."""
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "broker_stack", lambda target, **kw: stack)
+    monkeypatch.setattr(tools, "_ACTIVE_SCOPES", {})
+    monkeypatch.setattr(tools, "_MEDIA_SCOPE_JOBS", {})
+    return tools
+
+
+def test_register_wires_broker_tool_and_hook(tmp_path, monkeypatch):
+    import importlib.util
+    init_path = (Path(__file__).resolve().parent.parent
+                 / "model-forge" / "__init__.py")
+    spec = importlib.util.spec_from_file_location(
+        "model_forge_plugin_pkg", init_path,
+        submodule_search_locations=[str(init_path.parent)])
+    mod = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "model_forge_plugin_pkg", mod)
+    spec.loader.exec_module(mod)
+
+    class _Ctx:
+        def __init__(self):
+            self.tools = {}
+            self.hooks = []
+
+        def register_tool(self, name, toolset=None, schema=None, handler=None):
+            self.tools[name] = (toolset, schema, handler)
+
+        def register_hook(self, name, handler):
+            self.hooks.append((name, handler))
+
+    ctx = _Ctx()
+    mod.register(ctx)
+    assert len(ctx.tools) == 8
+    toolset, schema, handler = ctx.tools["model_forge_broker"]
+    assert toolset == "model_forge"
+    assert schema is mod.model_forge.schemas.BROKER
+    assert callable(handler)
+    assert ("pre_tool_call", mod.model_forge.tools.policy_hook) in ctx.hooks
+    # the catalog manifest lists the tool too
+    manifest = (init_path.parent / "plugin.yaml").read_text()
+    assert "model_forge_broker" in manifest
+
+
+def test_broker_schema_shape_is_verbs_not_knobs():
+    spec = schemas.BROKER
+    props = spec["parameters"]["properties"]
+    assert spec["name"] == "model_forge_broker"
+    assert props["action"]["enum"] == ["status", "claim", "release", "plan"]
+    assert spec["parameters"]["required"] == ["action"]
+    # minimal, self-explanatory surface: the four verbs plus what to act on
+    assert set(props) == {"action", "model_id", "modality", "scope_id",
+                         "target"}
+    assert "unload_policy" not in spec["description"]
+
+
+def test_bookings_helper_maps_model_entry_footprints():
+    from model_forge import tools
+    from model_forge.broker import ResidencyLedger
+    from model_forge.registry import ModelEntry
+    entries = (
+        ModelEntry(id="fx-img", name="FX Image", modality="image",
+                   engines=("vllm",), source="x/fx-img", size_gb=20.0,
+                   vram_gb_min=16.0),
+        ModelEntry(id="fx-moe", name="FX MoE", modality="chat",
+                   engines=("maya",), source="x/fx-moe", size_gb=66.0,
+                   ram_gb_min=64.0, engine_managed_fit=True),
+    )
+    bookings = tools.bookings_from_registry(entries)
+    # the published VRAM floor becomes the nominal booked ceiling, honestly
+    # labeled as a published floor — never as a measured peak
+    assert bookings["fx-img"] == {"vram_gb": 16.0,
+                                 "source": tools.BOOKING_SOURCE,
+                                 "load_s": None}
+    # no declared floor -> booked at zero, with the honest 'none declared'
+    # label so scopes can account for it without inventing a footprint
+    assert bookings["fx-moe"]["vram_gb"] == 0.0
+    assert "none declared" in bookings["fx-moe"]["source"]
+    # the dict is exactly what the residency layer takes
+    ledger = ResidencyLedger(bookings=bookings)
+    assert ledger.booked_vram_gb("fx-img") == 16.0
+    assert ledger.booked_vram_gb("fx-moe") == 0.0
+    # the full catalog maps every curated entry
+    all_bookings = tools.bookings_from_registry()
+    from model_forge.registry import models_for
+    assert set(all_bookings) == {m.id for m in models_for()}
+
+
+def test_broker_status_report_shape_with_fakes(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    _book_chat_resident(stack)
+    stack["ledger"].record_pull("gpu-box", "krea-2-turbo",
+                                "/models/krea.safetensors", 1234)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "status", "target": "gpu-box"}))
+    assert out["ok"] is True and out["action"] == "status"
+    assert out["pulled"] == [{"model_id": "krea-2-turbo",
+                              "path": "/models/krea.safetensors",
+                              "size_bytes": 1234}]
+    assert out["resident"] == [{"model_id": "chat-a", "engine": "ollama",
+                                "lane": "chat"}]
+    booked = {row["model_id"]: row for row in out["booked"]}
+    assert booked["krea-2-turbo"]["vram_gb"] == 16.0
+    assert booked["krea-2-turbo"]["source"] == tools.BOOKING_SOURCE
+    assert out["budget"] == {"nominal_gb": 48.0, "booked_now_gb": 6.0,
+                             "headroom_gb": 42.0}
+    assert out["unbooked_residents"] == []
+    # honest labels: published floors as ceilings, never a measured claim
+    assert "published" in out["note"] and "measured" in out["note"]
+    assert calls == []            # read-only: no engine call was driven
+
+
+def test_broker_claim_runs_plan_steps_in_order_with_honest_progress(
+        tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=24.0)
+    _book_chat_resident(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo",
+         "scope_id": "shot-1"}))
+    assert out["ok"] is True and out["action"] == "claim"
+    assert out["scope_id"] == "shot-1"
+    # the plan steps run in order: releases first, then the pre-warm load
+    assert [(s["action"], s["model_id"]) for s in out["steps"]] == [
+        ("release", "chat-a"), ("load", "krea-2-turbo")]
+    assert calls == [("release", "ollama", "chat-a"),
+                     ("ensure_loaded", "comfyui", "krea-2-turbo")]
+    # honest progress states — plain 'loading' with no invented timing
+    assert [p["state"] for p in out["progress"]] == ["queued", "loading",
+                                                    "ready"]
+    assert out["progress"][-1]["scope_id"] == "shot-1"
+    # the policy reasons ride along
+    assert "image generation" in out["plan"]["release_steps"][0]["reason"]
+
+
+def test_broker_claim_by_modality_uses_first_curated_model(tmp_path,
+                                                           monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    out = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "modality": "image",
+         "scope_id": "shot-m"}))
+    assert out["ok"] is True
+    assert out["model_id"] == "krea-2-turbo"   # first curated image model
+    assert out["scope_id"] == "shot-m"
+
+
+def test_broker_claim_fails_closed_over_budget(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=8.0)
+    _book_chat_resident(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    assert out["ok"] is False and out["action"] == "claim_failed"
+    assert out["scope_id"] is None
+    assert "exceeds the nominal budget" in out["error"]
+    assert "fail-closed" in out["error"]
+    assert calls == []            # a refused claim executes nothing
+
+
+def test_broker_release_restores_claim_time_residents(tmp_path, monkeypatch):
+    # the vision gesture at handler level: with a chat model resident, claim
+    # image generation, then release — chat comes back, in order
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=24.0)
+    _book_chat_resident(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo",
+         "scope_id": "chat-to-image"}))
+    assert out["ok"] is True
+    out = json.loads(tools.model_forge_broker(
+        {"action": "release", "scope_id": "chat-to-image"}))
+    assert out["ok"] is True and out["action"] == "release"
+    assert calls == [
+        ("release", "ollama", "chat-a"),
+        ("ensure_loaded", "comfyui", "krea-2-turbo"),
+        ("release", "comfyui", "krea-2-turbo"),
+        ("ensure_loaded", "ollama", "chat-a")]
+    residents = {r.model_id for r in stack["ledger"].residents("gpu-box")}
+    assert residents == {"chat-a"}     # exactly the claim-time set is back
+
+
+def test_broker_plan_dry_run_executes_nothing(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=24.0)
+    _book_chat_resident(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "plan", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    assert out["ok"] is True and out["action"] == "plan"
+    assert out["dry_run"] is True
+    would = out["would"]
+    assert would["ok"] is True
+    assert [(s["action"], s["model_id"]) for s in would["release_steps"]] == \
+        [("release", "chat-a")]
+    assert [(s["action"], s["model_id"]) for s in would["load_steps"]] == \
+        [("load", "krea-2-turbo")]
+    assert would["release_steps"][0]["reason"]
+    assert calls == []            # dry run: nothing loaded, released, moved
+    assert stack["ledger"].is_resident("gpu-box", "chat-a")
+    assert not stack["ledger"].is_resident("gpu-box", "krea-2-turbo")
+    # an impossible claim previews the refusal instead of executing anything
+    stack["ledger"].set_budget("gpu-box", 2.0)
+    out = json.loads(tools.model_forge_broker(
+        {"action": "plan", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    assert out["would"]["ok"] is False
+    assert "exceeds the nominal budget" in out["would"]["reason"]
+    assert calls == []
+
+
+def test_generate_media_claims_and_releases_lane(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    _book_chat_resident(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    monkeypatch.setattr(
+        tools, "media_plan",
+        lambda modality, base_url: {"ok": True, "action": "submit",
+                                    "submit": "http://gpu-box.example.com"
+                                              ":8080/v1/audio/music"})
+    _fake_urlopen(monkeypatch, json.dumps({"url": "http://x/a.mp3"}).encode())
+
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "music", "target": "gpu-box", "model": "gen/music",
+         "prompt": "lofi"}))
+    assert out["ok"] is True and out["action"] == "done"
+    # one workflow scope around the job: claim the lane, release on completion
+    assert calls == [("ensure_loaded", "media-gateway", "gen/music"),
+                     ("release", "media-gateway", "gen/music")]
+    lane = out["lane_claim"]
+    assert lane["state"] == "released"
+    assert [p["state"] for p in lane["progress"]] == ["queued", "loading",
+                                                     "ready"]
+    # the gateway model books the modality's largest published floor as its
+    # nominal stand-in ceiling — honestly labeled as a stand-in
+    spec = stack["bookings"]["gen/music"]
+    assert spec["vram_gb"] == 20.0
+    assert "stand-in" in spec["source"] and "ace-step" in spec["source"]
+
+
+def test_generate_media_releases_lane_on_submit_failure(tmp_path, monkeypatch):
+    # failure-path release: the scope ends and claim-time residents return
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    _book_chat_resident(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    monkeypatch.setattr(
+        tools, "media_plan",
+        lambda modality, base_url: {"ok": True, "action": "submit",
+                                    "submit": "http://gpu-box.example.com"
+                                              ":8080/v1/audio/music"})
+    _fake_urlopen(monkeypatch, b"", exc=RuntimeError("conn refused"))
+
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "music", "target": "gpu-box", "model": "gen/music",
+         "prompt": "lofi"}))
+    assert out["ok"] is False and out["action"] == "submit_failed"
+    assert out["lane_claim"]["state"] == "released"
+    assert calls == [("ensure_loaded", "media-gateway", "gen/music"),
+                     ("release", "media-gateway", "gen/music")]
+    assert stack["ledger"].is_resident("gpu-box", "chat-a")
+    assert not stack["ledger"].is_resident("gpu-box", "gen/music")
+
+
+def test_generate_media_claim_failure_fails_closed(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=5.0)   # over budget
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    monkeypatch.setattr(
+        tools, "media_plan",
+        lambda modality, base_url: {"ok": True, "action": "submit",
+                                    "submit": "http://gpu-box.example.com"
+                                              ":8080/v1/audio/music"})
+
+    def _no_call(req, timeout=None):
+        raise AssertionError("a refused claim must never reach the target")
+
+    monkeypatch.setattr("urllib.request.urlopen", _no_call)
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "music", "target": "gpu-box", "model": "gen/music",
+         "prompt": "lofi"}))
+    assert out["ok"] is False and out["action"] == "claim_failed"
+    assert "exceeds the nominal budget" in out["error"]
+    assert "nothing was submitted" in out["detail"]
+    assert calls == []
+
+
+def test_generate_media_3d_holds_scope_until_job_completes(tmp_path,
+                                                           monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    _book_chat_resident(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    monkeypatch.setattr(
+        tools, "media_plan",
+        lambda modality, base_url: {"ok": True, "action": "submit_job",
+                                    "submit": "http://gpu-box.example.com"
+                                              ":8080/jobs"})
+    _fake_urlopen(monkeypatch, json.dumps({"id": "3djob-9"}).encode())
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box", "model": "gen/3d",
+         "image": "https://example.com/x.png"}))
+    assert out["ok"] is True and out["action"] == "submitted"
+    assert out["lane_claim"]["state"] == "held"
+    assert "3djob-9" in tools._MEDIA_SCOPE_JOBS
+
+    # a still-running job keeps the lane claimed (never guess completion)
+    _fake_urlopen(monkeypatch, json.dumps({"status": "running"}).encode())
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box", "job_id": "3djob-9"}))
+    assert out["lane_claim"]["state"] == "held"
+    assert "release" not in [c[0] for c in calls]
+    assert "3djob-9" in tools._MEDIA_SCOPE_JOBS
+
+    # terminal state: the scope releases and claim-time residents return
+    _fake_urlopen(monkeypatch, json.dumps({"status": "done"}).encode())
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box", "job_id": "3djob-9"}))
+    assert out["job"] == {"status": "done"}
+    assert out["lane_claim"]["state"] == "released"
+    assert "3djob-9" not in tools._MEDIA_SCOPE_JOBS
+    assert calls == [("ensure_loaded", "media-gateway", "gen/3d"),
+                     ("release", "media-gateway", "gen/3d")]
+    assert {r.model_id for r in stack["ledger"].residents("gpu-box")} == \
+        {"chat-a"}
+
+
+def test_broker_stack_threads_injectable_engine_seams(tmp_path, monkeypatch):
+    # the engine adapters take injectable HTTP/process seams — the real
+    # stack wires them through, so nothing here touches the network
+    from model_forge import tools
+    http_calls = []
+
+    def fake_http(method, url, body=None, timeout=None):
+        http_calls.append((method, url, body))
+        return {"models": []}
+
+    spawn_calls = []
+
+    def fake_runner(argv):
+        spawn_calls.append(list(argv))
+        raise AssertionError("no process may be spawned in this test")
+
+    stack = tools.broker_stack(_REMOTE, http=fake_http, runner=fake_runner,
+                               which=lambda binary: None, fresh=True)
+    assert stack["budget_gb"] == 48.0
+    assert stack["ledger"].booked_vram_gb("krea-2-turbo") == 16.0
+    _book_chat_resident(stack)
+    tools_env = _broker_env(monkeypatch, tmp_path, stack)
+
+    # claim image generation: the resident chat model is evicted through the
+    # Ollama adapter's real warm/evict call shape, on the fake HTTP seam
+    out = json.loads(tools_env.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo",
+         "scope_id": "seam-1"}))
+    assert out["ok"] is True
+    evict = [body for _, url, body in http_calls
+             if isinstance(body, dict) and body.get("keep_alive") == 0]
+    assert evict and evict[0]["model"] == "chat-a"
+    # release: the claim-time chat model is warmed back through the same seam
+    out = json.loads(tools_env.model_forge_broker(
+        {"action": "release", "scope_id": "seam-1"}))
+    assert out["ok"] is True
+    warm = [body for _, url, body in http_calls
+            if isinstance(body, dict) and body.get("model") == "chat-a"
+            and body.get("keep_alive") not in (0, None)]
+    assert warm
+    assert spawn_calls == []

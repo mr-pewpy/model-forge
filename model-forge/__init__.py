@@ -53,6 +53,12 @@ def register(ctx):
         schema=schemas.STORAGE,
         handler=tools.model_forge_storage,
     )
+    ctx.register_tool(
+        name="model_forge_broker",
+        toolset="model_forge",
+        schema=schemas.BROKER,
+        handler=tools.model_forge_broker,
+    )
     # Policy gate: registering a compute target, rewriting the default model
     # config, deleting a model-storage entry, and running a vendor engine
     # installer (model_forge_install action=engine_install, execute=true) are

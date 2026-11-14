@@ -51,5 +51,6 @@ provides_tools:
   - model_forge_activate
   - model_forge_generate_media
   - model_forge_storage
+  - model_forge_broker
 provides_hooks:
   - pre_tool_call

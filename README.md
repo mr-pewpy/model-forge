@@ -23,11 +23,14 @@ VRAM numbers. Model Forge closes that gap: one registry of
 > the exact command) → you start the engine → Model Forge connects it to
 > Hermes → you use it.
 
-One honest caveat up front: **Model Forge does not start engines.** Install
+One honest caveat up front: **Model Forge does not install or launch engine
+stacks.** Install
 either downloads model files, drives a running engine's own pull API, prints
 the exact command for you to run, or — behind the human-approval gate — runs
 an engine vendor's official installer (`action=engine_install`). Engines
-stay yours to launch.
+stay yours to launch. The one exception is weight residency: a claim or
+release on a llama.cpp target starts and stops its `llama-server` process as
+part of the swap (see "One GPU lane, many models" below).
 
 ## The demo (90 seconds, one gaming PC, zero cloud)
 
@@ -52,11 +55,47 @@ run through a user-configured OpenAI-compatible media gateway.
 | `model_forge_activate` | Connect a running chat model as Hermes' default (plan-only; `apply=true` writes config after human approval) |
 | `model_forge_generate_media` | 3D (image→GLB), music, SFX — jobs through a user-configured OpenAI-compatible media gateway |
 | `model_forge_storage` | Model weights on disk (downloads dir, Ollama models dir, HuggingFace hub cache): list names, sizes and modification times; delete a listed entry after your approval |
+| `model_forge_broker` | Weight residency on a compute target: what weights are on disk and what is loaded now, what that books against the budget (`status`), and the claim/release verbs that run a multi-step swap (chat → image generation → back to chat) as one workflow scope; `plan` previews the steps first |
 
 Plus `tts/model_forge_tts.py` — a config-driven TTS/voice-clone command
 provider for any OpenAI-style `/v1/audio/speech` endpoint (see `tts/`), and
 a **cockpit desktop pane** (`model-forge-desktop/`) showing every compute
 target with live engine probes and model counts.
+
+## One GPU lane, many models (weight residency)
+
+One card cannot hold a big chat model and an image model at once. Model
+Forge makes the swap a first-class verb instead of manual load/unload
+bookkeeping — verbs, not knobs:
+
+- **`model_forge_broker` `claim`** takes the GPU lane for a modality or a
+  model: the eviction policy runs (recently used models stay warm longest;
+  image generation takes the whole card), what must go steps down, the
+  requested model is pre-warmed, and you get a scope id with honest
+  progress states — `queued`, `loading`, `ready`. Never a silent stall.
+- **`release`** ends the scope and restores exactly what was resident when
+  you claimed it.
+- **`plan`** is a dry run of claim: the release/load steps with their
+  reasons, nothing executed.
+- **`status`** is a read-only residency summary: pulled weights with sizes,
+  what is loaded now, booked ceilings, and budget usage.
+
+**The orchestration model, honestly.** Hermes core owns `image_generate`
+and `video_generate`, and Model Forge cannot wrap those tools. What Model
+Forge provides is the verbs the agent calls *around* them: to run "chat
+model resident → image generation → back to chat" as ONE workflow, the
+agent claims the lane before the core tool call and releases it after —
+the scope restores the chat model automatically. `model_forge_generate_media`
+does the same automatically for its own jobs: it claims the lane before the
+job is submitted and releases it when the job completes or fails (a refused
+claim fails closed and submits nothing).
+
+Fit is gated on booked ceilings — the catalog's published VRAM floors until
+a measured peak replaces them — while live free VRAM only decides which
+model loads first, never whether one fits. Engines that own their own
+load/swap policy (llama-swap, ComfyUI, vLLM, media gateways) are recorded
+honestly as claimed for the scope; the engine moves the weights itself on
+first use, and the step reasons say so.
 
 ## Model discovery
 
@@ -164,8 +203,12 @@ Honest scoping — current limits, and what does not work yet:
 - **`model_forge_generate_media` speaks the media gateway job API only**
   (`/v1/videos/generations`, `/v1/audio/music`, `/v1/audio/sfx`). The
   ComfyUI-native job flow (`/prompt` + `/history`) is not implemented.
-- **No engine lifecycle management.** Model Forge never starts engines —
-  it detects them, pulls model files, and emits run commands. Installing
+- **Engine lifecycle management is limited to weight residency.** Model
+  Forge never installs or launches full engine stacks — it detects engines,
+  pulls model files, and emits run commands. Claim and release do drive
+  per-model load/unload calls on your compute targets (an Ollama warm/evict
+  call, a llama-server process start/stop); engines that own their own
+  load/swap policy are recorded honestly as claimed, not driven. Installing
   engine *software* is available for Ollama, Strata and Project Maya via
   `model_forge_install` with `action=engine_install`: the plan shows the
   vendor's exact official install command, and it runs as a background job
@@ -183,7 +226,12 @@ Honest scoping — current limits, and what does not work yet:
   from the URL the engine or registry names (HuggingFace / ModelScope
   resolve links). Media jobs (`model_forge_generate_media`) POST prompts and
   image bytes to user-configured compute targets, and Maya pulls POST to the
-  target's `/api/pull`. The TTS helper (`tts/model_forge_tts.py`) POSTs the
+  target's `/api/pull`. Weight residency claims and releases
+  (`model_forge_broker`, and the automatic scope around
+  `model_forge_generate_media` jobs) drive engine load and unload calls on
+  your user-configured compute-target endpoints — for example an Ollama
+  warm/evict call carrying `keep_alive`, or llama-server process starts and
+  stops. The TTS helper (`tts/model_forge_tts.py`) POSTs the
   text to speak plus base64-encoded voice-clone reference audio to a
   user-configured `/v1/audio/speech` endpoint. If pull credentials are
   configured, they are sent only to `huggingface.co` / `modelscope.cn` hosts.
@@ -197,8 +245,10 @@ Honest scoping — current limits, and what does not work yet:
   (`curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh`),
   and Project Maya (`git clone https://github.com/mw00/project-maya && cd project-maya && ./setup.sh`).
   llama.cpp is never installed — it defers to Hermes core's managed llama.cpp
-  runtime (the built-in Local Models catalog and downloads). No engine
-  launcher is run by the plugin.
+  runtime (the built-in Local Models catalog and downloads). Outside of
+  weight residency claims and releases (which may start and stop a
+  `llama-server` process on this machine), no engine launcher is run by the
+  plugin.
 - **Background:** long model downloads and approved engine installs run on
   a daemon background thread (job records are pollable with
   `model_forge_install` `job_id`); installer jobs carry a hard timeout (900

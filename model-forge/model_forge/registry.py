@@ -9,6 +9,7 @@ catalog (GGUF chat models, hardware-priced) is deliberately NOT duplicated here
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 # Modalities, in demo-storyboard order.
@@ -363,6 +364,43 @@ MODELS: tuple[ModelEntry, ...] = (
 )
 
 _BY_ID = {m.id: m for m in MODELS}
+
+
+def registry_bookings(entries=None) -> dict[str, dict]:
+    """Registry-to-bookings: the curated entries as the bookings dict shape
+    broker.py's ``ResidencyLedger`` consumes — each entry's ``vram_gb_min``
+    floor as its PUBLISHED ceiling (``{"vram_gb": …, "source": "published"}``,
+    advisory). This is the source-of-truth helper next to ``ModelEntry``.
+
+    Only entries the registry actually gives a VRAM floor book anything:
+    entries without a declared floor (engine-managed fit — the engine sizes
+    itself at launch) and ``stub`` entries carry no published ceiling, so
+    they are left unbooked and the planner fails closed on them until a
+    measured peak is recorded. Booking a literal 0 GB there would be a
+    guessed fit, and the policy layer never guesses fits.
+
+    Published footprints are advisory: re-feeding this dict over a ledger
+    never downgrades a measured booking (``ResidencyLedger.book`` keeps
+    measured peaks)."""
+    out: dict[str, dict] = {}
+    for m in (MODELS if entries is None else entries):
+        if m.status == "stub":
+            continue
+        floor = _finite_vram(m.vram_gb_min)
+        if floor is None:
+            continue
+        out[m.id] = {"vram_gb": floor, "source": "published"}
+    return out
+
+
+def _finite_vram(value) -> float | None:
+    try:
+        gb = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(gb) or gb <= 0.0:
+        return None
+    return gb
 
 
 def models_for(modality: str | None = None, engine: str | None = None) -> list[ModelEntry]:

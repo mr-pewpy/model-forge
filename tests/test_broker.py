@@ -20,6 +20,7 @@ from model_forge.broker import (
     LlamaSwapLifecycle,
     LoadPlan,
     LoadRequest,
+    MeasuredFootprintRecorder,
     OllamaLifecycle,
     Orchestrator,
     ResidencyLedger,
@@ -783,3 +784,287 @@ def test_plan_refusal_surfaces_as_error_progress_row():
     assert res["ok"] is False
     assert adapter.calls == []
     assert orch.progress("local:m")["state"].startswith("error: ")
+
+
+# --- measured footprints: the bench-window write path ------------------------
+
+class FakeSampler:
+    """Injectable VRAM sampler: canned readings in order (the last reading
+    repeats when the list runs out; an Exception value is raised; an empty
+    list raises)."""
+
+    def __init__(self, readings):
+        self.readings = list(readings)
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if not self.readings:
+            raise LookupError("sampler exhausted")
+        reading = self.readings[min(self.calls - 1, len(self.readings) - 1)]
+        if isinstance(reading, Exception):
+            raise reading
+        return reading
+
+
+def test_measured_recorder_books_the_observed_peak():
+    clock = FakeClock()
+    ledger = ResidencyLedger(clock=clock)
+    ledger.book("chat-a", 8.0, source="published")
+    sampler = FakeSampler([8.2, 9.5, 8.7])
+    with MeasuredFootprintRecorder(sampler, "chat-a", ledger,
+                                   clock=clock) as rec:
+        rows = [rec.sample() for _ in range(3)]      # caller-run bench window
+    assert all(r["ok"] for r in rows)
+    assert [r["peak_gb"] for r in rows] == [8.2, 9.5, 9.5]
+    # closing the window recorded the observed peak as the booked ceiling
+    row = rec.recorded
+    assert row["ok"] is True and row["vram_gb"] == 9.5
+    assert row["source"] == "measured"
+    assert sampler.calls == 3
+    assert ledger.booked_vram_gb("chat-a") == 9.5
+    booking = ledger.booking("chat-a")
+    assert booking.is_measured is True
+    assert booking.label == "measured peak (bench)"
+
+
+def test_measured_recorder_is_fail_soft_on_sampler_errors():
+    ledger = ResidencyLedger()
+    sampler = FakeSampler([8.0, Exception("nvml gone"), float("nan"), 8.5])
+    rec = MeasuredFootprintRecorder(sampler, "m", ledger)
+    rows = [rec.sample() for _ in range(4)]
+    assert rows[0]["ok"] is True and rows[0]["peak_gb"] == 8.0
+    assert rows[1]["ok"] is False and "nvml gone" in rows[1]["reason"]
+    assert rows[2]["ok"] is False and "not counted as a peak" in rows[2]["reason"]
+    assert rows[3]["ok"] is True and rows[3]["peak_gb"] == 8.5
+    assert rec.sample_count == 2                 # failed readings never count
+    assert rec.peak_gb == 8.5
+
+
+def test_measured_recorder_fails_closed_without_valid_readings():
+    ledger = ResidencyLedger()
+    rec = MeasuredFootprintRecorder(FakeSampler([]), "m", ledger)
+    assert rec.sample()["ok"] is False
+    row = rec.record()
+    assert row["ok"] is False
+    assert "fail-closed" in row["error"]
+    assert "guessed peak" in row["error"]
+    assert ledger.booked_vram_gb("m") is None     # nothing guessed, nothing booked
+    assert ledger.booking("m") is None
+
+
+def test_measured_peak_upgrades_published_booking():
+    clock = FakeClock()
+    ledger = ResidencyLedger(
+        bookings={"chat-a": {"vram_gb": 8.0, "source": "published"}},
+        clock=clock)
+    assert ledger.booked_vram_gb("chat-a") == 8.0
+    with MeasuredFootprintRecorder(FakeSampler([8.2, 9.6]), "chat-a", ledger,
+                                   clock=clock) as rec:
+        rec.sample()
+        rec.sample()
+    # measured peaks replace published footprints in the bookings (P4)
+    assert ledger.booked_vram_gb("chat-a") == 9.6
+    assert ledger.booking("chat-a").label == "measured peak (bench)"
+
+
+def test_measured_booking_is_never_downgraded_by_published_updates():
+    ledger = ResidencyLedger()
+    ledger.record_measured_peak("chat-a", 9.5, load_s=35.0)
+    assert ledger.booked_vram_gb("chat-a") == 9.5
+    # a later published-footprint update must not downgrade the measured peak
+    row = ledger.book("chat-a", {"vram_gb": 7.5, "source": "published"})
+    assert row["ok"] is True and row["kept"].startswith("measured booking kept")
+    assert ledger.booked_vram_gb("chat-a") == 9.5
+    assert ledger.estimated_load_s("chat-a") == 35.0
+    # …including a whole-dict refresh (the registry-to-bookings path)
+    for model_id, spec in {"chat-a": {"vram_gb": 7.5,
+                                      "source": "published"}}.items():
+        ledger.book(model_id, spec)
+    assert ledger.booked_vram_gb("chat-a") == 9.5
+    # a NEWER measured peak (a fresh bench) may replace the older one
+    row = ledger.record_measured_peak("chat-a", 10.5)
+    assert row["ok"] is True and row["source"] == "measured"
+    assert ledger.booked_vram_gb("chat-a") == 10.5
+
+
+def test_booking_report_labels_measured_vs_published():
+    ledger = ResidencyLedger(bookings={
+        "pub-m": {"vram_gb": 4.0, "source": "published"},
+        "reg-m": 2.0})
+    ledger.record_measured_peak("meas-m", 9.0, load_s=33.0)
+    report = ledger.booking_report()
+    rows = {r["model_id"]: r for r in report}
+    assert [r["model_id"] for r in report] == sorted(rows)   # stable order
+    assert rows["pub-m"]["label"] == "published footprint (advisory)"
+    assert rows["reg-m"]["label"] == "published footprint (advisory)"
+    assert rows["meas-m"]["label"] == "measured peak (bench)"
+    assert rows["meas-m"]["source"] == "measured"
+    assert rows["meas-m"]["vram_gb"] == 9.0
+    assert rows["meas-m"]["load_s"] == 33.0
+
+
+def test_measured_peak_replaces_published_in_the_fit_gate():
+    clock = FakeClock()
+    ledger = ResidencyLedger(
+        bookings={"chat-a": 8.0,
+                  "chat-b": {"vram_gb": 10.0, "source": "published"}},
+        clock=clock)
+    ledger.set_budget("local", 20.0)
+    ledger.record_resident("local", "chat-a", engine="ollama", lane="chat")
+    planner = EvictionPlanner(ledger, clock=clock)
+    # published 10 GB fits beside chat-a (8 + 10 <= 20): nothing evicted
+    plan = planner.plan_load("local", LoadRequest("chat-b", "ollama"))
+    assert plan.ok is True and plan.release_steps == ()
+    # the bench measures the real peak at 13 GB — the measured peak replaces
+    # the published footprint as the booking, and the fit gate follows it
+    with MeasuredFootprintRecorder(FakeSampler([13.0]), "chat-b", ledger,
+                                   clock=clock) as rec:
+        rec.sample()
+    assert ledger.booked_vram_gb("chat-b") == 13.0
+    plan = planner.plan_load("local", LoadRequest("chat-b", "ollama"))
+    assert plan.ok is True
+    assert [s.model_id for s in plan.release_steps] == ["chat-a"]   # 8+13 > 20
+
+
+# --- orchestrator: the end-to-end workflow gesture ---------------------------
+
+def test_image_generation_gesture_end_to_end_with_fake_seams():
+    """The P2/P3 acceptance gesture at library level, on the existing fake
+    seams: chat model resident -> image-generation claim evicts GPU residents
+    per policy -> image model loads with honest progress states -> release
+    restores the chat model. No network, no processes — FakeHttp, FakeRunner,
+    FakeClock only."""
+    clock = FakeClock()
+    ledger = ResidencyLedger(bookings={
+        "chat-a": {"vram_gb": 6.0, "source": "published", "load_s": 12.0},
+        "image-x": {"vram_gb": 18.0, "source": "published", "load_s": 40.0}},
+        clock=clock)
+    ledger.set_budget("local", 24.0)
+    http = FakeHttp()
+    runner = FakeRunner()
+    chat = OllamaLifecycle(base_url="http://127.0.0.1:11434", http=http,
+                           keep_alive="5m")
+    image = LlamaCppServerLifecycle(runner=runner,
+                                    which=lambda name: f"/usr/bin/{name}")
+    orch = Orchestrator(ledger, EvictionPlanner(ledger, clock=clock),
+                        {"ollama": chat, "llamacpp": image}, clock=clock)
+
+    # the chat model is resident (warmed over the fake HTTP seam)
+    warmed = orch.prewarm("local", LoadRequest("chat-a", "ollama", lane="chat"))
+    assert warmed["ok"] is True
+    assert ledger.is_resident("local", "chat-a")
+    assert http.calls[0]["body"]["keep_alive"] == "5m"
+
+    # the image-generation claim evicts GPU residents per policy (whole card)
+    claimed = orch.claim("shot", "local", LoadRequest(
+        "image-x", "llamacpp", lane="image", modality="image",
+        weights_path="/models/image-x.safetensors", estimated_s=40.0))
+    assert claimed["ok"] is True
+    assert not ledger.is_resident("local", "chat-a")
+    assert ledger.is_resident("local", "image-x")
+    evict_reason = claimed["plan"].release_steps[0].reason
+    assert "whole GPU" in evict_reason and "every time" in evict_reason
+    # the eviction was the keep_alive=0 evict call on the fake HTTP seam
+    assert http.calls[1]["body"] == {"model": "chat-a", "prompt": "",
+                                     "stream": False, "keep_alive": 0}
+    # the image model loaded as a process on the fake runner seam
+    assert runner.argvs == [["/usr/bin/llama-server", "-m",
+                             "/models/image-x.safetensors", "--port", "8080"]]
+    # honest progress states through the swap
+    assert [r["state"] for r in orch.history("shot")] == [
+        "queued", "loading (~40s)", "ready"]
+
+    # release: the image model steps down, the chat model is restored
+    released = orch.release("shot")
+    assert released["ok"] is True
+    assert ledger.is_resident("local", "chat-a")
+    assert not ledger.is_resident("local", "image-x")
+    assert runner.proc.terminated is True and runner.proc.waited is True
+    assert http.calls[2]["body"]["keep_alive"] == "5m"   # chat re-warmed
+    assert [r["state"] for r in orch.history("shot")] == [
+        "queued", "loading (~40s)", "ready",
+        "queued", "loading (~12s)", "ready"]
+    assert released["progress"]["state"] == "ready"
+
+
+# --- orchestrator: restore semantics for interleaved scopes ------------------
+
+def test_release_restores_evicted_mid_scope_model_with_its_weights_path():
+    """The evicted model was itself mid-scope: its request (weights path,
+    load estimate) lives in another open scope. The release that restores it
+    must carry the original weights path — a llama.cpp restore without one
+    fails closed on a guessed path."""
+    clock = FakeClock()
+    ledger = ResidencyLedger(bookings={"chat-a": 6.0, "image-x": 18.0},
+                             clock=clock)
+    ledger.set_budget("local", 24.0)
+    runner = FakeRunner()
+    http = FakeHttp()
+    chat = LlamaCppServerLifecycle(runner=runner,
+                                   which=lambda name: f"/usr/bin/{name}")
+    image = OllamaLifecycle(http=http)
+    orch = Orchestrator(ledger, EvictionPlanner(ledger, clock=clock),
+                        {"llamacpp": chat, "ollama": image}, clock=clock)
+
+    # s1 claims a big chat model on llama.cpp — process stop/start means
+    # every load, restores included, needs the real weights path.
+    assert orch.claim("s1", "local", LoadRequest(
+        "chat-a", "llamacpp", lane="chat",
+        weights_path="/models/chat-a.gguf", estimated_s=30.0))["ok"]
+    assert [argv[2] for argv in runner.argvs] == ["/models/chat-a.gguf"]
+
+    # s2 claims image generation: the image entry fully evicts chat-a even
+    # though chat-a is s1's mid-scope model.
+    assert orch.claim("s2", "local", LoadRequest(
+        "image-x", "ollama", lane="image", modality="image"))["ok"]
+    assert not ledger.is_resident("local", "chat-a")
+
+    # s2 release restores the evicted mid-scope model with its ORIGINAL
+    # weights path and honest load estimate — not a guessed one.
+    released = orch.release("s2")
+    assert released["ok"] is True
+    assert ledger.is_resident("local", "chat-a")
+    assert [argv[2] for argv in runner.argvs] == ["/models/chat-a.gguf"] * 2
+    states = [r["state"] for r in orch.history("s2")]
+    assert states[-3:] == ["queued", "loading (~30s)", "ready"]
+
+    # s1 release afterwards steps down s1's own model and restores its set.
+    released1 = orch.release("s1")
+    assert released1["ok"] is True
+    assert not ledger.is_resident("local", "chat-a")
+
+
+def test_scope_release_steps_down_only_what_the_scope_brought_in():
+    """Interleaved scopes: releasing the evicted model's own scope must not
+    step down the OTHER live scope's model, and a release keeps its exact
+    claim-time restore set."""
+    clock = FakeClock()
+    ledger = ResidencyLedger(bookings={"chat-a": 6.0, "image-x": 18.0},
+                             clock=clock)
+    ledger.set_budget("local", 24.0)
+    adapter = RecordingLifecycle("ollama")
+    orch = Orchestrator(ledger, EvictionPlanner(ledger, clock=clock),
+                        {"ollama": adapter}, clock=clock)
+
+    assert orch.claim("s1", "local",
+                      LoadRequest("chat-a", "ollama", lane="chat"))["ok"]
+    assert orch.claim("s2", "local", LoadRequest(
+        "image-x", "ollama", lane="image", modality="image"))["ok"]
+    assert {r.model_id for r in ledger.residents("local")} == {"image-x"}
+
+    # s1 (whose chat model was evicted mid-scope) releases while s2 is live:
+    # s2's image model must survive untouched.
+    adapter.calls.clear()
+    released = orch.release("s1")
+    assert released["ok"] is True
+    assert _call_names(adapter) == []
+    assert ledger.is_resident("local", "image-x")
+
+    # s2 release: its own model steps down, and the claim-time set restores —
+    # including the model that was evicted from s1 mid-scope.
+    released2 = orch.release("s2")
+    assert released2["ok"] is True
+    assert _call_names(adapter) == [("release", "image-x"),
+                                    ("ensure_loaded", "chat-a")]
+    assert {r.model_id for r in ledger.residents("local")} == {"chat-a"}

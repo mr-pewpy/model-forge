@@ -19,6 +19,12 @@ when a task needs a different model. Four pieces:
   recently-used models warm ahead of pure LRU, image-generation entry evicts
   GPU residents every time, and loads fire one at a time (the plan is an
   ordered, serialized list — concurrency control belongs to the caller).
+- ``MeasuredFootprintRecorder`` — the measured-footprint write path
+  (roadmap §5a / P4): given an injectable VRAM sampler and a model id,
+  sample during a caller-run bench window and record the observed peak as
+  that model's booked ceiling. Measured bookings are never downgraded by
+  later published-footprint updates, and ledger reports label every booking
+  honestly as measured or published.
 - ``Orchestrator`` — claim/release workflow scopes (a scope claims the lane
   for a modality and restores what was resident on release), pre-warm on
   intent, and honest progress states (``queued`` / ``loading (~Ns)`` /
@@ -56,6 +62,7 @@ __all__ = [
     "LlamaSwapLifecycle",
     "LoadPlan",
     "LoadRequest",
+    "MeasuredFootprintRecorder",
     "OllamaLifecycle",
     "Orchestrator",
     "PlanStep",
@@ -164,6 +171,19 @@ class Booking:
     source: str = "registry"
     load_s: float | None = None     # honest load-duration estimate, when known
 
+    @property
+    def is_measured(self) -> bool:
+        """True for a bench-measured peak — the booking number that wins."""
+        return self.source == "measured"
+
+    @property
+    def label(self) -> str:
+        """Honest provenance label for ledger reports: a measured peak is
+        never presented as an advisory published figure, or vice versa."""
+        if self.source == "measured":
+            return "measured peak (bench)"
+        return "published footprint (advisory)"
+
 
 @dataclass(frozen=True)
 class PullRecord:
@@ -238,11 +258,12 @@ class ResidencyLedger:
                     and spec.source != "measured"):
                 return {"ok": True, "model_id": model_id,
                         "vram_gb": existing.vram_gb, "source": existing.source,
+                        "label": existing.label,
                         "kept": "measured booking kept — published footprints "
                                 "are advisory"}
             self._bookings[model_id] = spec
         return {"ok": True, "model_id": model_id, "vram_gb": spec.vram_gb,
-                "source": spec.source}
+                "source": spec.source, "label": spec.label}
 
     def booking(self, model_id) -> Booking | None:
         return self._bookings.get(model_id)
@@ -254,6 +275,26 @@ class ResidencyLedger:
     def estimated_load_s(self, model_id) -> float | None:
         b = self._bookings.get(model_id)
         return b.load_s if b else None
+
+    def record_measured_peak(self, model_id, peak_gb, load_s=None) -> dict:
+        """The measured-footprint write path: book an observed bench peak as
+        this model's MEASURED ceiling. Routed through ``book`` so the
+        no-downgrade invariant holds — a later published footprint never
+        replaces a measured peak — while a newer measured peak may (the
+        latest bench wins over an older one)."""
+        return self.book(model_id, peak_gb, source="measured", load_s=load_s)
+
+    def booking_report(self) -> tuple[dict, ...]:
+        """Every booked ceiling with an honest provenance label —
+        ``measured peak (bench)`` vs ``published footprint (advisory)`` —
+        so no report ever presents a measured booking as advisory or an
+        advisory figure as measured."""
+        with self._lock:
+            items = sorted(self._bookings.items())
+        return tuple(
+            {"model_id": model_id, "vram_gb": b.vram_gb, "source": b.source,
+             "label": b.label, "load_s": b.load_s}
+            for model_id, b in items)
 
     def set_budget(self, target_id, vram_gb) -> dict:
         """Declare a target's nominal VRAM budget — the capacity every fit
@@ -360,6 +401,103 @@ class ResidencyLedger:
             return tuple(rec.model_id for rec in
                          self._residents.get(target_id, {}).values()
                          if rec.model_id not in self._bookings)
+
+
+# --- measured footprints ----------------------------------------------------
+
+class MeasuredFootprintRecorder:
+    """The measured-footprint recorder (roadmap §5a, P4 acceptance): sample
+    VRAM through an INJECTED sampler during a caller-run bench window, then
+    record the observed peak as that model's booked ceiling.
+
+    This is the write path for measured bookings: ``record`` books the peak
+    via ``ResidencyLedger.record_measured_peak`` (``source="measured"``) —
+    through the same ``book`` gate that never lets a later published
+    footprint downgrade a measured value. Ledger reports label the result
+    ``measured peak (bench)`` so it is never confused with an advisory
+    published figure.
+
+    The bench window is the caller's: call ``sample()`` between bench
+    iterations (the ``with`` block IS the window; closing it records the
+    peak). A failing or non-finite sampler reading is skipped with an honest
+    row, never a raise; a window with no valid reading fails closed — a
+    booked ceiling must be an observation, never a guess."""
+
+    def __init__(self, sampler, model_id, ledger, clock=None):
+        self._sampler = sampler
+        self._model_id = model_id
+        self._ledger = ledger
+        self._clock = clock or ledger.clock
+        self._peak: float | None = None
+        self._samples = 0
+        self._recorded: dict | None = None
+
+    @property
+    def model_id(self) -> str:
+        return self._model_id
+
+    @property
+    def peak_gb(self) -> float | None:
+        """The highest valid reading seen so far (None until one lands)."""
+        return self._peak
+
+    @property
+    def sample_count(self) -> int:
+        """How many valid readings landed in the bench window."""
+        return self._samples
+
+    @property
+    def recorded(self) -> dict | None:
+        """The booking row from the last ``record()`` (None until recorded)."""
+        return self._recorded
+
+    def sample(self) -> dict:
+        """Take one reading from the injected sampler and track the peak.
+        Fail-soft: a raising or non-finite sampler is an honest row, never an
+        exception — and never counted as a peak."""
+        try:
+            reading = self._sampler()
+        except Exception as exc:  # noqa: BLE001 — honest row, never a raise
+            return {"ok": False, "model_id": self._model_id,
+                    "peak_gb": self._peak,
+                    "reason": f"VRAM sampler failed: "
+                              f"{type(exc).__name__}: {exc}"}
+        gb = _finite_gb(reading)
+        if gb is None:
+            return {"ok": False, "model_id": self._model_id,
+                    "peak_gb": self._peak,
+                    "reason": f"sampler returned {reading!r} — not a finite, "
+                              f"non-negative VRAM reading; not counted as a "
+                              f"peak"}
+        self._samples += 1
+        if self._peak is None or gb > self._peak:
+            self._peak = gb
+        return {"ok": True, "model_id": self._model_id, "gb": gb,
+                "peak_gb": self._peak}
+
+    def record(self, load_s=None) -> dict:
+        """Record the observed peak as the model's booked ceiling. Fails
+        closed with no valid readings — no guessed peak is ever booked."""
+        if self._peak is None:
+            row = {"ok": False, "model_id": self._model_id,
+                   "error": "no valid VRAM readings in the bench window — "
+                            "refusing to book a guessed peak (fail-closed)"}
+            self._recorded = row
+            return row
+        row = self._ledger.record_measured_peak(self._model_id, self._peak,
+                                                load_s=load_s)
+        self._recorded = row
+        return row
+
+    # -- the caller-run bench window --
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._recorded is None:
+            self.record()
+        return None    # never swallow the caller's bench exception
 
 
 # --- engine lifecycle adapters ----------------------------------------------
@@ -833,6 +971,12 @@ class Orchestrator:
         self._scopes: dict[str, dict] = {}
         self._history: dict[str, list] = {}
         self._current: dict[str, dict] = {}
+        # Per-target load specs of successfully loaded models (weights path,
+        # load estimate) — a scope release restores claim-time residents with
+        # the fidelity their original load had, even when the evicted model
+        # belongs to another still-open scope whose request is not visible
+        # from the releasing scope.
+        self._load_specs: dict[tuple[str, str], dict] = {}
 
     # -- workflow scopes --
 
@@ -856,9 +1000,16 @@ class Orchestrator:
             self._planner.plan_load_many(target_id, [request]),
             key=scope_id, scope_id=scope_id, ready_model=request.model_id)
         if result["ok"]:
-            self._scopes[scope_id] = {"target_id": target_id,
-                                      "request": request,
-                                      "restore": restore}
+            self._scopes[scope_id] = {
+                "target_id": target_id,
+                "request": request,
+                "restore": restore,
+                # what this scope's plan actually loaded — the only models
+                # its release may step down
+                "brought_in": frozenset(
+                    step.model_id for step in result["steps"]
+                    if step.action == "load"),
+            }
         return result
 
     def release(self, scope_id) -> dict:
@@ -871,12 +1022,15 @@ class Orchestrator:
                               f"release (fail-closed)", "", None)
         target_id = scope["target_id"]
         restore = scope["restore"]
-        restore_ids = {rec.model_id for rec in restore}
+        # The scope's own models: what its claim plan loaded. Step-down is
+        # scoped to those — releasing one live scope must never step down a
+        # model another still-open scope brought in.
+        brought_in = scope["brought_in"]
 
-        # Phase 1: step down whatever is resident that was not resident at
-        # claim time (the scope's own models).
+        # Phase 1: step down what this scope brought in that is still
+        # resident (models evicted mid-scope have nothing to step down).
         down = [rec for rec in self._ledger.residents(target_id)
-                if rec.model_id not in restore_ids]
+                if rec.model_id in brought_in]
         stepdown = LoadPlan(
             target_id, True,
             f"scope {scope_id!r} released",
@@ -892,10 +1046,18 @@ class Orchestrator:
         if not r1["ok"]:
             return r1
 
-        # Phase 2: restore the claim-time residents, per policy.
-        requests = [LoadRequest(model_id=rec.model_id, engine=rec.engine,
-                                lane=rec.lane, modality="restore")
-                    for rec in restore]
+        # Phase 2: restore the claim-time residents, per policy. Restore
+        # fidelity comes from the load specs recorded when each model was
+        # actually loaded — a restored model keeps its weights path and load
+        # estimate even when the evicted model was itself mid-scope (its
+        # request lives in another open scope the planner cannot see).
+        requests = []
+        for rec in restore:
+            spec = self._load_specs.get((target_id, rec.model_id), {})
+            requests.append(LoadRequest(
+                model_id=rec.model_id, engine=rec.engine, lane=rec.lane,
+                modality="restore", weights_path=spec.get("weights_path"),
+                estimated_s=spec.get("estimated_s")))
         plan = self._planner.plan_load_many(target_id, requests)
         r2 = self._run_plan(plan, key=scope_id, scope_id=scope_id)
         if r2["ok"]:
@@ -984,6 +1146,10 @@ class Orchestrator:
                 self._ledger.record_resident(step.target_id, step.model_id,
                                              engine=step.engine,
                                              lane=step.lane)
+                self._load_specs[(step.target_id, step.model_id)] = {
+                    "weights_path": step.weights_path,
+                    "estimated_s": step.estimated_s,
+                }
                 executed.append(step)
             if emit_progress:
                 self._record(key, progress_row(

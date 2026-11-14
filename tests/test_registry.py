@@ -156,3 +156,60 @@ def test_python_notes_state_unmanaged_env():
 def test_status_values_are_known():
     for m in MODELS:
         assert m.status in ("validated", "known", "stub"), (m.id, m.status)
+
+
+# --- registry-to-bookings: published ceilings for the residency ledger --------
+
+def test_registry_bookings_are_published_vram_floors():
+    from model_forge.registry import registry_bookings
+
+    bookings = registry_bookings()
+    assert bookings
+    for mid, spec in bookings.items():
+        entry = next(m for m in MODELS if m.id == mid)
+        # vram floors as published ceilings, marked published
+        assert spec == {"vram_gb": entry.vram_gb_min, "source": "published"}, mid
+        assert spec["vram_gb"] > 0
+    assert bookings["deepseek-ocr-2"] == {"vram_gb": 10.0, "source": "published"}
+    assert bookings["krea-2-turbo"] == {"vram_gb": 16.0, "source": "published"}
+
+
+def test_registry_bookings_skip_entries_without_a_published_floor():
+    from model_forge.registry import registry_bookings
+
+    bookings = registry_bookings()
+    for m in MODELS:
+        if m.status == "stub" or not m.vram_gb_min:
+            # engine-managed fit / stub entries declare no VRAM floor: there
+            # is no published ceiling to book, and a literal 0 GB booking
+            # would be a guessed fit — the planner fails closed instead
+            assert m.id not in bookings, m.id
+    assert "core-gguf-catalog" not in bookings
+    assert "qwen3.8-flash-next" not in bookings
+    assert "world-model-slot" not in bookings
+
+
+def test_registry_bookings_accepts_an_entries_subset():
+    from model_forge.registry import registry_bookings
+
+    entries = [m for m in MODELS if m.id == "minicpm-v-4.6"]
+    assert registry_bookings(entries) == {
+        "minicpm-v-4.6": {"vram_gb": 4.0, "source": "published"}}
+
+
+def test_registry_bookings_feed_the_ledger_and_never_downgrade_measured():
+    from model_forge.broker import ResidencyLedger
+    from model_forge.registry import registry_bookings
+
+    ledger = ResidencyLedger(bookings=registry_bookings())
+    assert ledger.booked_vram_gb("deepseek-ocr-2") == 10.0
+    booking = ledger.booking("deepseek-ocr-2")
+    assert booking.source == "published"
+    assert booking.label == "published footprint (advisory)"
+    # a measured peak upgrades the published floor …
+    ledger.record_measured_peak("deepseek-ocr-2", 11.5)
+    # … and a later registry refresh never downgrades it
+    for mid, spec in registry_bookings().items():
+        ledger.book(mid, spec)
+    assert ledger.booked_vram_gb("deepseek-ocr-2") == 11.5
+    assert ledger.booking("deepseek-ocr-2").label == "measured peak (bench)"

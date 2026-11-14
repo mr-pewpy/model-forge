@@ -17,6 +17,11 @@ import time
 import urllib.request
 import uuid
 
+from .broker import (
+    EngineLifecycle, EvictionPlanner, LlamaCppServerLifecycle,
+    LlamaSwapLifecycle, LoadRequest, OllamaLifecycle, Orchestrator,
+    ResidencyLedger,
+)
 from .credentials import status as credentials_status
 from .engines import detect_engines
 from .engines import llamacpp as llamacpp_adapter
@@ -988,7 +993,9 @@ def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
     """Generate 3D models / music / SFX through a compute target's
     media-gateway endpoint. 3d submits a job (poll with job_id); music/sfx
     run synchronously and return audio (JSON result bodies are passed
-    through)."""
+    through). The GPU lane is claimed as one workflow scope before the job
+    is submitted and released when the job completes or fails; a refused
+    claim fails closed with an honest error and submits nothing."""
     args = args or {}
     try:
         import json as _json
@@ -1012,14 +1019,42 @@ def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
                     f"{root}/jobs/{job_id}")
                 try:
                     with urllib.request.urlopen(req, timeout=30.0) as resp:
-                        return _dump({"job": _json.loads(
-                            resp.read().decode("utf-8", "replace"))})
+                        job = _json.loads(
+                            resp.read().decode("utf-8", "replace"))
                 except Exception as exc:  # noqa: BLE001
                     # Same honesty as the submit paths: name the HTTP status
                     # and a response snippet instead of a generic error.
                     out = _submit_failure(exc)
                     out["action"] = "poll_failed"
                     return _dump(out)
+                out = {"job": job}
+                held = _MEDIA_SCOPE_JOBS.get(job_id)
+                if held is not None:
+                    scope_id = held["scope_id"]
+                    history = [dict(row) for row in broker_stack(target)
+                               ["orchestrator"].history(scope_id)]
+                    claim = {"scope_id": scope_id,
+                             "model_id": held.get("model_id"),
+                             "modality": held.get("modality"),
+                             "progress": history}
+                    if _media_job_finished(job):
+                        _MEDIA_SCOPE_JOBS.pop(job_id, None)
+                        out["lane_claim"] = _lane_block(
+                            claim,
+                            released=_release_media_lane(target, scope_id),
+                            note="job complete — the lane scope was released "
+                                 "and what was resident at claim time is "
+                                 "restored")
+                    else:
+                        out["lane_claim"] = _lane_block(
+                            claim,
+                            note="the job is still running (or its state is "
+                                 "unclear) — the lane stays claimed; poll "
+                                 "again and the scope releases when the job "
+                                 "finishes, or end it now with "
+                                 "model_forge_broker action=release, "
+                                 f"scope_id={scope_id!r}")
+                return _dump(out)
             model = str(args.get("model", "")).strip()
             image = str(args.get("image", "")).strip()
             if not model or not image:
@@ -1034,19 +1069,64 @@ def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
             body = {"model": model, "image": image_ref}
             if args.get("prompt"):
                 body["prompt"] = str(args["prompt"])
-            req = urllib.request.Request(
-                plan["submit"], data=_json.dumps(body).encode(),
-                headers={"Content-Type": "application/json"}, method="POST")
+            # Claim the GPU lane around the job as one workflow scope: the
+            # eviction policy runs, what must go steps down, and the scope is
+            # released when the job completes or fails.
+            claim = _claim_media_lane(target, modality, model)
+            if not claim.get("ok"):
+                return _dump({"ok": False, "action": "claim_failed",
+                              "error": claim.get("error") or
+                                       "the lane claim was refused",
+                              "lane_claim": _lane_block(claim),
+                              "detail": "the GPU lane claim was refused (fail "
+                                        "closed) — nothing was submitted"})
+            settled = []
+
+            def _settle(note):
+                rel = _release_media_lane(target, claim["scope_id"])
+                settled.append(rel)
+                return _lane_block(claim, released=rel, note=note)
+
             try:
-                with urllib.request.urlopen(req, timeout=60.0) as resp:
-                    out = _json.loads(resp.read().decode("utf-8", "replace"))
-            except Exception as exc:  # noqa: BLE001
-                return _dump(_submit_failure(exc))
-            return _dump({"ok": True, "action": "submitted",
-                          "submitted": out,
-                          "poll": f"model_forge_generate_media with "
-                                  f"modality=3d, target={target.id}, "
-                                  f"job_id={out.get('id', '')}"})
+                req = urllib.request.Request(
+                    plan["submit"], data=_json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST")
+                try:
+                    with urllib.request.urlopen(req, timeout=60.0) as resp:
+                        out = _json.loads(resp.read().decode("utf-8", "replace"))
+                except Exception as exc:  # noqa: BLE001
+                    failure = _submit_failure(exc)
+                    failure["lane_claim"] = _settle(
+                        "the job failed to start — the lane scope was "
+                        "released and what was resident at claim time is "
+                        "restored")
+                    return _dump(failure)
+                job_id = str(out.get("id", "") or "")
+                if job_id and _JOB_TOKEN_RE.fullmatch(job_id):
+                    _MEDIA_SCOPE_JOBS[job_id] = {
+                        "scope_id": claim["scope_id"], "target_id": target.id,
+                        "model_id": model, "modality": modality}
+                    settled.append(True)   # held: the scope outlives this call
+                    lane = _lane_block(
+                        claim,
+                        note="the lane stays claimed until the job "
+                             f"completes; poll with job_id={job_id} — the "
+                             "scope releases and what was resident at claim "
+                             "time is restored when the job finishes")
+                else:
+                    lane = _settle(
+                        "no pollable job id came back — the lane scope was "
+                        "released immediately")
+                return _dump({"ok": True, "action": "submitted",
+                              "submitted": out,
+                              "lane_claim": lane,
+                              "poll": f"model_forge_generate_media with "
+                                      f"modality=3d, target={target.id}, "
+                                      f"job_id={out.get('id', '')}"})
+            finally:
+                if not settled:
+                    _release_media_lane(target, claim["scope_id"])
         # music / sfx: synchronous POST. The caller waits while the engine
         # renders; gateways return audio bytes, some return a JSON body.
         model = str(args.get("model", "")).strip()
@@ -1055,35 +1135,65 @@ def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
             return _dump({"ok": False, "action": "needs_args",
                           "detail": f"{modality} needs model and prompt"})
         body = {"model": model, "prompt": prompt}
-        req = urllib.request.Request(
-            plan["submit"], data=_json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"}, method="POST")
-        started = time.monotonic()
+        # Claim the GPU lane around the job as one workflow scope; it is
+        # released when the render completes or on any failure.
+        claim = _claim_media_lane(target, modality, model)
+        if not claim.get("ok"):
+            return _dump({"ok": False, "action": "claim_failed",
+                          "error": claim.get("error") or
+                                   "the lane claim was refused",
+                          "lane_claim": _lane_block(claim),
+                          "detail": "the GPU lane claim was refused (fail "
+                                    "closed) — nothing was submitted"})
+        settled = []
+
+        def _settle(note):
+            rel = _release_media_lane(target, claim["scope_id"])
+            settled.append(rel)
+            return _lane_block(claim, released=rel, note=note)
+
         try:
-            with urllib.request.urlopen(req, timeout=600.0) as resp:
-                raw = resp.read()
-                try:
-                    content_type = resp.headers.get("Content-Type") or ""
-                except Exception:  # noqa: BLE001 — headers are best-effort
-                    content_type = ""
-        except Exception as exc:  # noqa: BLE001
-            return _dump(_submit_failure(exc))
-        waited = time.monotonic() - started
-        wait_note = (f"this call blocked {waited:.1f} s until the engine "
-                     "finished rendering")
-        try:
-            out = _json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            out = None
-        if out is not None:
-            return _dump({"ok": True, "action": "done", "result": out,
+            req = urllib.request.Request(
+                plan["submit"], data=_json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            started = time.monotonic()
+            try:
+                with urllib.request.urlopen(req, timeout=600.0) as resp:
+                    raw = resp.read()
+                    try:
+                        content_type = resp.headers.get("Content-Type") or ""
+                    except Exception:  # noqa: BLE001 — headers are best-effort
+                        content_type = ""
+            except Exception as exc:  # noqa: BLE001
+                failure = _submit_failure(exc)
+                failure["lane_claim"] = _settle(
+                    "the job failed — the lane scope was released and what "
+                    "was resident at claim time is restored")
+                return _dump(failure)
+            waited = time.monotonic() - started
+            wait_note = (f"this call blocked {waited:.1f} s until the engine "
+                         "finished rendering")
+            lane = _settle(
+                "the render completed — the lane scope was released and what "
+                "was resident at claim time is restored")
+            try:
+                out = _json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                out = None
+            if out is not None:
+                return _dump({"ok": True, "action": "done", "result": out,
+                              "waited_seconds": round(waited, 3),
+                              "lane_claim": lane,
+                              "note": wait_note})
+            path = _save_generated_audio(modality, raw, content_type)
+            return _dump({"ok": True, "action": "done", "audio": str(path),
+                          "bytes": len(raw), "content_type": content_type,
                           "waited_seconds": round(waited, 3),
-                          "note": wait_note})
-        path = _save_generated_audio(modality, raw, content_type)
-        return _dump({"ok": True, "action": "done", "audio": str(path),
-                      "bytes": len(raw), "content_type": content_type,
-                      "waited_seconds": round(waited, 3),
-                      "note": wait_note + f"; audio saved to {path}"})
+                          "lane_claim": lane,
+                          "note": wait_note + f"; audio saved to {path}"})
+        finally:
+            if not settled:
+                _release_media_lane(target, claim["scope_id"])
     except Exception as exc:
         return _err(exc)
 
@@ -1315,3 +1425,473 @@ def _as_data_url(value: str) -> str:
         raise ValueError(
             "image content does not match its extension (magic bytes)")
     return f"data:{mime};base64," + base64.b64encode(p.read_bytes()).decode()
+
+
+# --- weight residency: bookings, engine adapters, workflow scopes ------------
+
+# Booked ceilings come from the curated catalog's published VRAM floors,
+# honestly labeled wherever they surface: a floor is a published minimum used
+# as the nominal ceiling until a measured peak replaces it (a measured booking
+# is never downgraded by a published one).
+BOOKING_SOURCE = "catalog-vram-floor"
+BOOKING_SOURCE_NONE = "catalog-vram-floor (none declared)"
+BOOKING_SOURCE_NOTE = (
+    "booked ceilings are the curated catalog's published VRAM floors used as "
+    "nominal ceilings — advisory published minimums, not measured peaks; a "
+    "measured peak replaces one and is never downgraded. A model that "
+    "declares no VRAM floor (engine-sized at launch) is booked at 0 GB so "
+    "workflow scopes can still account for it.")
+
+
+def bookings_from_registry(entries=None) -> dict:
+    """Curated catalog ModelEntry footprints -> the bookings dict the
+    residency layer takes.
+
+    Each entry's published ``vram_gb_min`` floor becomes its nominal booked
+    ceiling, with honest labeling (``BOOKING_SOURCE`` / ``BOOKING_SOURCE_NONE``
+    for entries that declare no floor). Stdlib-only and pure: no I/O."""
+    out = {}
+    for m in (models_for() if entries is None else entries):
+        try:
+            floor = float(m.vram_gb_min or 0.0)
+        except (TypeError, ValueError):
+            floor = 0.0
+        out[m.id] = {
+            "vram_gb": floor,
+            "source": BOOKING_SOURCE if floor > 0 else BOOKING_SOURCE_NONE,
+            "load_s": None,
+        }
+    return out
+
+
+class _PassThroughLifecycle(EngineLifecycle):
+    """Observational pass-through for engines whose load/evict policy the
+    engine itself owns (Model Forge has no explicit lifecycle control for
+    them). The llama-swap honesty rule: report state, never drive the
+    engine — loading is engine-native on first use, reclaim is engine-native
+    later, and both are reported as such."""
+
+    def __init__(self, engine_id: str):
+        self.engine_id = engine_id
+        self.no_control = (
+            f"'{engine_id}' loads and reclaims models on its own; Model Forge "
+            f"has no explicit load or eviction control for it")
+
+    def ensure_loaded(self, model_id, **_ignored) -> dict:
+        return {"ok": True, "engine": self.engine_id, "action": "load",
+                "model_id": model_id, "state": "pass-through",
+                "reason": self.no_control + " (loading is engine-native on "
+                          "first use) — recorded as claimed for the scope"}
+
+    def release(self, model_id) -> dict:
+        return {"ok": True, "engine": self.engine_id, "action": "release",
+                "model_id": model_id, "state": "pass-through",
+                "reason": self.no_control + " (reclaim happens on the "
+                          "engine's own schedule)"}
+
+    def probe(self) -> dict:
+        return {"ok": True, "engine": self.engine_id, "state": "unknown",
+                "resident": [], "reason": self.no_control}
+
+# Engines with explicit load/evict control (real lifecycle adapters), and the
+# engines whose lifecycle the engine itself owns (observational pass-through).
+_LIFECYCLE_ENGINES = ("ollama", "llama-swap", "llamacpp")
+_PASS_THROUGH_ENGINES = ("comfyui", "vllm", "sglang", "strata", "maya",
+                         "openai-compatible", "python", "media-gateway")
+
+
+def _adapter_catalog(target, http=None, runner=None, which=None) -> dict:
+    """Engine lifecycle adapters for a compute target. Real control where the
+    engine exposes it (Ollama warm/evict calls, llama-swap observation,
+    llama.cpp process start/stop) — every external seam (HTTP function,
+    process runner, binary lookup) is injectable so nothing touches the
+    network or spawns a process unless the caller allows it. Everything else
+    is an honest pass-through. Load/unload calls go to the target's
+    user-configured endpoint."""
+    root = root_url(target.base_url) or "http://127.0.0.1"
+    catalog = {
+        "ollama": OllamaLifecycle(base_url=root, http=http),
+        "llama-swap": LlamaSwapLifecycle(base_url=root, http=http),
+        "llamacpp": LlamaCppServerLifecycle(runner=runner, which=which),
+    }
+    for engine_id in _PASS_THROUGH_ENGINES:
+        catalog[engine_id] = _PassThroughLifecycle(engine_id)
+    return catalog
+
+
+_BROKER_LOCK = threading.Lock()
+_BROKER_STACKS: dict = {}
+# Workflow scopes opened around media jobs (media job id -> scope record), so
+# an async job's scope is released when the job completes.
+_MEDIA_SCOPE_JOBS: dict = {}
+# Every open workflow scope (scope id -> record), for the read-only summary.
+_ACTIVE_SCOPES: dict = {}
+
+
+def _build_broker_stack(target, *, http=None, runner=None, which=None,
+                        clock=None, adapters=None) -> dict:
+    """Build the weight-residency stack for a compute target: the residency
+    summary (bookings from the catalog's published VRAM floors, budget from
+    the target's declared VRAM), the eviction policy, and the claim/release
+    orchestrator with engine lifecycle adapters. Construction only performs
+    I/O through the injected seams; pass adapters= to replace the adapter
+    catalog wholesale (tests)."""
+    bookings = bookings_from_registry()
+    ledger = ResidencyLedger(bookings=bookings, clock=clock)
+    try:
+        budget = float(_hw_for_target(target).total_vram_gb or 0.0)
+    except Exception:  # noqa: BLE001 — honest: unknown budget stays undeclared
+        budget = 0.0
+    if budget > 0:
+        ledger.set_budget(target.id, budget)
+    if adapters is None:
+        adapters = _adapter_catalog(target, http=http, runner=runner,
+                                    which=which)
+    planner = EvictionPlanner(ledger, clock=clock)
+    orchestrator = Orchestrator(ledger, planner, adapters, clock=clock)
+    return {"target_id": target.id, "ledger": ledger, "planner": planner,
+            "orchestrator": orchestrator, "bookings": bookings,
+            "budget_gb": budget}
+
+
+def broker_stack(target, **seams):
+    """The weight-residency stack for a compute target, cached per target so
+    workflow scopes survive across tool calls (claim, then release later).
+    Any injected seam (http / runner / which / clock / adapters) or
+    fresh=True builds an isolated stack that never enters the cache."""
+    fresh = bool(seams.pop("fresh", False))
+    if seams or fresh:
+        return _build_broker_stack(target, **seams)
+    with _BROKER_LOCK:
+        stack = _BROKER_STACKS.get(target.id)
+        if stack is None:
+            stack = _build_broker_stack(target)
+            _BROKER_STACKS[target.id] = stack
+    return stack
+
+
+def _step_rows(steps) -> list:
+    return [{"action": s.action, "model_id": s.model_id, "engine": s.engine,
+             "lane": s.lane, "reason": s.reason} for s in (steps or ())]
+
+
+def _claim_engine(entry: ModelEntry) -> str:
+    """The engine that will serve a claim's warm: the first engine Model Forge
+    can actually run for the entry, else the entry's first engine (the
+    pass-through adapter labels what that means), else ''."""
+    for engine_id in entry.engines:
+        if engine_id not in PHANTOM_ENGINES:
+            return engine_id
+    return entry.engines[0] if entry.engines else ""
+
+
+def _claim_request(entry):
+    engine = _claim_engine(entry)
+    if not engine:
+        return None, (f"'{entry.id}' has no engine that can serve it — "
+                      "nothing to warm")
+    return LoadRequest(model_id=entry.id, engine=engine, lane=entry.modality,
+                       modality=entry.modality), ""
+
+
+def _claim_entry(model_id: str = "", modality: str = ""):
+    """What to claim: an explicit catalog model id, or a modality's default
+    curated model (its first non-stub, non-catalog-marker entry)."""
+    model_id = (model_id or "").strip()
+    modality = (modality or "").strip()
+    if not model_id and not modality:
+        return None, ("pass model_id (a catalog model id from "
+                      "model_forge_browse) or modality to claim the lane for")
+    if modality and modality not in MODALITIES:
+        return None, (f"unknown modality: {modality!r}; valid modalities: "
+                      f"{list(MODALITIES)}")
+    if model_id:
+        entry = next((m for m in models_for() if m.id == model_id), None)
+        if entry is None:
+            return None, f"unknown model_id: {model_id}"
+        return entry, ""
+    for entry in models_for(modality=modality):
+        if entry.status != "stub" and entry.id not in _CATALOG_MARKER_IDS:
+            return entry, ""
+    return None, (f"no curated {modality} model exists yet — claim a specific "
+                  "model_id instead")
+
+
+def _seed_local_pulls(stack: dict, target) -> None:
+    """Record the local target's on-disk weights (the model storage
+    inventory) in the residency summary — a read-only scan, fail-soft. Remote
+    targets are never scanned: they report only what was recorded for them."""
+    if target.kind != "local" or stack.get("pulls_seeded"):
+        return
+    stack["pulls_seeded"] = True
+    try:
+        from . import storage
+        listing = storage.list_storage()
+    except Exception:  # noqa: BLE001 — the summary degrades, never crashes
+        return
+    ledger = stack["ledger"]
+    for row in listing.get("entries") or ():
+        path = str(row.get("path") or "")
+        if path:
+            ledger.record_pull(target.id, str(row.get("name") or path),
+                               path, row.get("size_bytes"))
+
+
+def _broker_status(stack: dict, target) -> dict:
+    """Honest read-only residency summary: pulled weights with sizes, what is
+    resident now, booked ceilings, and current budget usage."""
+    ledger = stack["ledger"]
+    _seed_local_pulls(stack, target)
+    budget = ledger.budget_gb(target.id)
+    booked_now = ledger.booked_total_gb(target.id)
+    return {
+        "ok": True,
+        "action": "status",
+        "target": target.id,
+        "pulled": [{"model_id": r.model_id, "path": r.path,
+                    "size_bytes": r.size_bytes}
+                   for r in ledger.pulled(target.id)],
+        "resident": [{"model_id": r.model_id, "engine": r.engine,
+                      "lane": r.lane} for r in ledger.residents(target.id)],
+        "booked": [{"model_id": model_id, "vram_gb": spec["vram_gb"],
+                    "source": spec["source"]}
+                   for model_id, spec in sorted(stack["bookings"].items())],
+        "budget": {
+            "nominal_gb": budget,
+            "booked_now_gb": round(booked_now, 3),
+            "headroom_gb": (round(budget - booked_now, 3)
+                            if budget is not None else None),
+        },
+        "unbooked_residents": list(ledger.unbooked_residents(target.id)),
+        "active_scopes": [
+            {"scope_id": sid, "model_id": rec.get("model_id"),
+             "modality": rec.get("modality"), "kind": rec.get("kind")}
+            for sid, rec in sorted(_ACTIVE_SCOPES.items())
+            if rec.get("target_id") == target.id],
+        "note": ("Read-only report. " + BOOKING_SOURCE_NOTE
+                 + " Live free VRAM, when sampled, only orders which model "
+                   "loads first — it never gates fit."),
+    }
+
+
+def _broker_plan(stack: dict, target, request) -> dict:
+    """Dry run of a claim: the release/load steps with reasons — the policy
+    planner is pure, so nothing is loaded, released or recorded here."""
+    plan = stack["planner"].plan_load_many(target.id, [request])
+    return {
+        "ok": True,
+        "action": "plan",
+        "dry_run": True,
+        "target": target.id,
+        "model_id": request.model_id,
+        "modality": request.modality,
+        "would": {
+            "ok": plan.ok,
+            "reason": plan.reason,
+            "release_steps": _step_rows(plan.release_steps),
+            "load_steps": _step_rows(plan.load_steps),
+        },
+        "note": ("dry run — nothing was loaded, released or recorded; "
+                 "action=claim executes exactly these steps and returns a "
+                 "scope id"),
+    }
+
+
+def _broker_claim(stack: dict, target, request, scope_id: str = "") -> dict:
+    scope_id = (scope_id or "").strip() or f"scope-{uuid.uuid4().hex[:8]}"
+    orchestrator = stack["orchestrator"]
+    result = orchestrator.claim(scope_id, target.id, request)
+    ok = bool(result.get("ok"))
+    out = {
+        "ok": ok,
+        "action": "claim" if ok else "claim_failed",
+        "scope_id": scope_id if ok else None,
+        "target": target.id,
+        "model_id": request.model_id,
+        "modality": request.modality,
+        "steps": _step_rows(result.get("steps")),
+        "progress": [dict(row) for row in orchestrator.history(scope_id)],
+        "reason": result.get("reason", ""),
+    }
+    plan = result.get("plan")
+    if plan is not None:
+        out["plan"] = {"reason": plan.reason,
+                       "release_steps": _step_rows(plan.release_steps),
+                       "load_steps": _step_rows(plan.load_steps)}
+    if ok:
+        _ACTIVE_SCOPES[scope_id] = {"target_id": target.id,
+                                    "model_id": request.model_id,
+                                    "modality": request.modality,
+                                    "kind": "workflow"}
+        out["note"] = (
+            f"the GPU lane is claimed for this scope; when the workflow is "
+            f"done, release it with model_forge_broker action=release, "
+            f"scope_id={scope_id!r} — that restores exactly what was "
+            f"resident at claim time")
+    else:
+        out["error"] = result.get("reason", "the lane claim was refused")
+        out["note"] = ("fail closed — the claim was refused and nothing is "
+                       "held; see steps for anything already executed before "
+                       "the refusal")
+    return out
+
+
+def _broker_release(stack: dict, scope_id: str) -> dict:
+    orchestrator = stack["orchestrator"]
+    result = orchestrator.release(scope_id)
+    ok = bool(result.get("ok"))
+    _ACTIVE_SCOPES.pop(scope_id, None)
+    out = {
+        "ok": ok,
+        "action": "release" if ok else "release_failed",
+        "scope_id": scope_id,
+        "target": result.get("target_id", stack["target_id"]),
+        "steps": _step_rows(result.get("steps")),
+        "progress": [dict(row) for row in orchestrator.history(scope_id)],
+        "reason": result.get("reason", ""),
+    }
+    if not ok:
+        out["error"] = result.get("reason", "the scope could not be released")
+    return out
+
+
+def model_forge_broker(args: dict | None = None, **kwargs) -> str:
+    """Weight residency and workflow scopes on a compute target. Verbs:
+    status (read-only residency summary), claim (take the GPU lane for a
+    modality or model — evict per policy, pre-warm, return a scope id with
+    honest progress states), release (end a scope and restore what was
+    resident at claim time), plan (dry run of claim — nothing executed)."""
+    args = args or {}
+    try:
+        action = str(args.get("action") or "").strip()
+        if action not in ("status", "claim", "release", "plan"):
+            return _dump({"error": f"unknown action: {action!r}; valid "
+                                   f"actions: ['status', 'claim', 'release', "
+                                   f"'plan']"})
+        if action == "release":
+            scope_id = str(args.get("scope_id") or "").strip()
+            if not scope_id:
+                return _dump({"error": "scope_id required for action=release: "
+                                       "pass the scope id returned by claim"})
+            target_id = (str(args.get("target") or "").strip()
+                         or _ACTIVE_SCOPES.get(scope_id, {}).get("target_id")
+                         or "")
+            target = get_target(target_id or None)
+            if target is None:
+                target = get_target(None)
+            return _dump(_broker_release(broker_stack(target), scope_id))
+        target = get_target(args.get("target"))
+        if target is None:
+            return _dump({"error": f"unknown target: {args.get('target')}"})
+        stack = broker_stack(target)
+        if action == "status":
+            return _dump(_broker_status(stack, target))
+        entry, err = _claim_entry(str(args.get("model_id") or ""),
+                                 str(args.get("modality") or ""))
+        if err:
+            return _dump({"error": err})
+        request, err = _claim_request(entry)
+        if err:
+            return _dump({"error": err})
+        if action == "plan":
+            return _dump(_broker_plan(stack, target, request))
+        return _dump(_broker_claim(stack, target, request,
+                                  scope_id=str(args.get("scope_id") or "")))
+    except Exception as exc:
+        return _err(exc)
+
+
+# --- media job lane claims ---------------------------------------------------
+
+_MEDIA_JOB_TERMINAL = frozenset({
+    "done", "succeeded", "success", "completed", "finished",
+    "error", "failed", "cancelled", "canceled"})
+
+
+def _media_job_finished(job: dict) -> bool:
+    """True when a media job record shows a terminal state. An unknown state
+    reads as still running — the scope stays claimed and the output says how
+    to end it (never guess completion)."""
+    status = str((job or {}).get("status") or "").strip().lower()
+    return status in _MEDIA_JOB_TERMINAL
+
+
+def _media_stand_in(modality: str):
+    """The curated entry whose published VRAM floor stands in as the nominal
+    booked ceiling for a media-gateway model (a gateway model's own footprint
+    is not published): the largest declared floor among the modality's
+    curated entries, honestly labeled when booked."""
+    best = None
+    for entry in models_for(modality=modality):
+        if entry.status == "stub":
+            continue
+        try:
+            floor = float(entry.vram_gb_min or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if floor > 0 and (best is None or floor > best.vram_gb_min):
+            best = entry
+    return best
+
+
+def _claim_media_lane(target, modality: str, model: str) -> dict:
+    """Claim the GPU lane around one media job as a single workflow scope:
+    run the eviction policy, step down what must go, and record the job's
+    model as claimed for the scope (a media gateway loads it itself — the
+    pass-through adapter says so)."""
+    stack = broker_stack(target)
+    ledger = stack["ledger"]
+    stand_in = _media_stand_in(modality)
+    if ledger.booked_vram_gb(model) is None and stand_in is not None:
+        spec = {"vram_gb": float(stand_in.vram_gb_min),
+                "source": f"{BOOKING_SOURCE} stand-in ({stand_in.id})",
+                "load_s": None}
+        ledger.book(model, spec)
+        stack["bookings"][model] = spec
+    request = LoadRequest(model_id=model, engine="media-gateway",
+                          lane=modality, modality=modality)
+    scope_id = f"media-{uuid.uuid4().hex[:8]}"
+    result = stack["orchestrator"].claim(scope_id, target.id, request)
+    ok = bool(result.get("ok"))
+    out = {"ok": ok, "scope_id": scope_id if ok else None,
+           "model_id": model, "modality": modality,
+           "steps": _step_rows(result.get("steps")),
+           "progress": [dict(row)
+                        for row in stack["orchestrator"].history(scope_id)],
+           "reason": result.get("reason", "")}
+    if ok:
+        _ACTIVE_SCOPES[scope_id] = {"target_id": target.id, "model_id": model,
+                                    "modality": modality, "kind": "media-job"}
+    else:
+        out["error"] = result.get("reason", "the lane claim was refused")
+    return out
+
+
+def _release_media_lane(target, scope_id: str) -> dict:
+    stack = broker_stack(target)
+    result = stack["orchestrator"].release(scope_id)
+    _ACTIVE_SCOPES.pop(scope_id, None)
+    out = {"ok": bool(result.get("ok")), "scope_id": scope_id,
+           "steps": _step_rows(result.get("steps")),
+           "progress": [dict(row)
+                        for row in stack["orchestrator"].history(scope_id)],
+           "reason": result.get("reason", "")}
+    if not out["ok"]:
+        out["error"] = result.get("reason", "the scope could not be released")
+    return out
+
+
+def _lane_block(claim: dict, released: dict | None = None,
+                note: str = "") -> dict:
+    block = {"scope_id": claim.get("scope_id"),
+             "model_id": claim.get("model_id"),
+             "modality": claim.get("modality"),
+             "progress": claim.get("progress") or []}
+    if released is not None:
+        block["state"] = "released"
+        block["released"] = released
+    else:
+        block["state"] = "held"
+    if note:
+        block["note"] = note
+    return block
