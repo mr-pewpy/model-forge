@@ -14,16 +14,19 @@ from __future__ import annotations
 
 from model_forge.broker import (
     Booking,
+    ComfyUiLifecycle,
     EngineLifecycle,
     EvictionPlanner,
     LlamaCppServerLifecycle,
     LlamaSwapLifecycle,
     LoadPlan,
     LoadRequest,
+    MayaLifecycle,
     MeasuredFootprintRecorder,
     OllamaLifecycle,
     Orchestrator,
     ResidencyLedger,
+    VllmServerLifecycle,
     is_image_generation,
     loading_state,
 )
@@ -333,6 +336,257 @@ def test_llamacpp_refuses_to_guess_weights_path():
     assert res["ok"] is False
     assert "fail-closed" in res["reason"]
     assert runner.argvs == []
+
+
+# --- adapter call shapes: ComfyUI (readiness + cache-free) ------------------
+
+def test_comfyui_ensure_loaded_is_readiness_not_a_weights_pin():
+    http = FakeHttp(responses={"/system_stats": {"system": {"comfyui-version":
+                                                           "0.3.0"}}})
+    comfy = ComfyUiLifecycle(base_url="http://127.0.0.1:8188", http=http)
+    res = comfy.ensure_loaded("sdxl")
+    assert res["ok"] is True
+    assert res["state"] == "ready"
+    assert res["contract"] == "readiness + cache-free"
+    assert res["cache_freed"] is False
+    # Honest behavior label: ComfyUI loads models per-workflow — this is a
+    # readiness + cache-free contract, never a weights pin.
+    assert "per-workflow" in res["reason"]
+    assert "not a weights pin" in res["reason"]
+    # First job: readiness only — GET /system_stats, nothing freed yet.
+    assert [c["method"] for c in http.calls] == ["GET"]
+    assert http.calls[0]["url"].endswith("/system_stats")
+
+
+def test_comfyui_back_to_back_jobs_free_cache_between_jobs():
+    http = FakeHttp(responses={"/system_stats": {"devices": [{"name": "gpu"}]}})
+    comfy = ComfyUiLifecycle(http=http)
+    comfy.ensure_loaded("sdxl")           # job 1: nothing held before it
+    res = comfy.ensure_loaded("sdxl")     # job 2: back-to-back — free first
+    assert res["ok"] is True
+    assert res["cache_freed"] is True
+    assert "back-to-back" in res["reason"]
+    free_calls = [c for c in http.calls if c["url"].endswith("/free")]
+    assert len(free_calls) == 1
+    # The battle rule's call shape: POST /free with both reclaim flags.
+    assert free_calls[0]["method"] == "POST"
+    assert free_calls[0]["body"] == {"unload_models": True, "free_memory": True}
+    # The free lands between the jobs: during job 2's ensure_loaded, after
+    # its readiness check — not before job 1.
+    assert http.calls[1]["url"].endswith("/system_stats")
+    assert http.calls[2]["url"].endswith("/free")
+    # A third consecutive job frees again: every back-to-back boundary.
+    res3 = comfy.ensure_loaded("sdxl")
+    assert res3["cache_freed"] is True
+    assert len([c for c in http.calls if c["url"].endswith("/free")]) == 2
+
+
+def test_comfyui_release_is_the_explicit_cache_free():
+    http = FakeHttp(responses={"/system_stats": {"system": {}}})
+    comfy = ComfyUiLifecycle(http=http)
+    # Release with nothing held: an honest no-op, nothing sent.
+    res = comfy.release("sdxl")
+    assert res["ok"] is True
+    assert res["cache_freed"] is False
+    assert "nothing to free" in res["reason"]
+    assert http.calls == []
+
+    comfy.ensure_loaded("sdxl")
+    http.calls.clear()
+    res = comfy.release("sdxl")
+    assert res["ok"] is True
+    assert res["cache_freed"] is True
+    assert res["contract"] == "explicit cache-free"
+    assert "holds allocations" in res["reason"]
+    call = http.calls[0]
+    assert call["method"] == "POST"
+    assert call["url"].endswith("/free")
+    assert call["body"] == {"unload_models": True, "free_memory": True}
+
+    # With the cache freed, the next job is no longer back-to-back.
+    http.calls.clear()
+    res = comfy.ensure_loaded("sdxl")
+    assert res["cache_freed"] is False
+    assert [c["url"].rsplit("/", 1)[-1] for c in http.calls] == ["system_stats"]
+
+
+def test_comfyui_http_failures_are_honest_rows_not_raises():
+    down = ComfyUiLifecycle(http=FakeHttp(
+        responses={"/system_stats": Exception("connection refused")}))
+    res = down.ensure_loaded("sdxl")
+    assert res["ok"] is False
+    assert "connection refused" in res["reason"]
+    assert down.probe()["state"] == "unknown"
+
+    # A failing cache free is an honest row — never a raise.
+    http = FakeHttp(responses={"/system_stats": {"system": {}},
+                              "/free": Exception("boom")})
+    comfy = ComfyUiLifecycle(http=http)
+    comfy.ensure_loaded("sdxl")
+    res = comfy.release("sdxl")
+    assert res["ok"] is False
+    assert "boom" in res["reason"]
+    assert res["cache_freed"] is False
+
+
+def test_comfyui_probe_reports_readiness_without_a_residency_listing():
+    http = FakeHttp(responses={"/system_stats": {"system": {"comfyui-version":
+                                                           "0.3.0"}}})
+    comfy = ComfyUiLifecycle(http=http)
+    res = comfy.probe()
+    assert res["ok"] is True
+    assert res["state"] == "observed"
+    # ComfyUI exposes no weights-residency listing — honest empty resident.
+    assert res["resident"] == []
+    assert "per-workflow" in res["reason"]
+
+
+# --- adapter call shapes: vLLM server (process stop/start only) -------------
+
+def test_vllm_ensure_loaded_starts_process_with_argv():
+    runner = FakeRunner()
+    vllm = VllmServerLifecycle(
+        binary="vllm", port=8000, extra_args=("--tensor-parallel-size", "2"),
+        runner=runner, which=lambda name: f"/usr/bin/{name}",
+        exists=lambda p: True)
+    res = vllm.ensure_loaded("qwen", weights_path="/models/qwen")
+    assert res["ok"] is True
+    assert runner.argvs == [["/usr/bin/vllm", "serve", "/models/qwen",
+                             "--port", "8000", "--tensor-parallel-size", "2"]]
+    assert res["argv"] == runner.argvs[0]
+    # Process restart only — engine sleep/wake must NOT be used.
+    assert "sleep/wake" in res["lifecycle"]
+    assert "process restart is the reliable path" in res["reason"]
+
+    # The model id is the launch argument when no weights path is given (the
+    # constructor's extra args still apply).
+    res = vllm.ensure_loaded("meta/llama-3")
+    assert res["ok"] is True
+    assert runner.argvs[-1] == ["/usr/bin/vllm", "serve", "meta/llama-3",
+                                "--port", "8000", "--tensor-parallel-size",
+                                "2"]
+
+
+def test_vllm_release_stops_the_process():
+    runner = FakeRunner()
+    vllm = VllmServerLifecycle(runner=runner,
+                               which=lambda name: f"/usr/bin/{name}",
+                               exists=lambda p: True)
+    vllm.ensure_loaded("qwen", weights_path="/models/qwen")
+    res = vllm.release("qwen")
+    assert res["ok"] is True
+    assert runner.proc.terminated is True
+    assert runner.proc.waited is True
+    assert "stopped the vLLM server" in res["reason"]
+    # Second release: nothing left to stop, honestly reported.
+    assert "nothing to stop" in vllm.release("qwen")["reason"]
+
+
+def test_vllm_probe_reports_process_state():
+    runner = FakeRunner()
+    vllm = VllmServerLifecycle(runner=runner,
+                               which=lambda name: f"/usr/bin/{name}",
+                               exists=lambda p: True)
+    assert vllm.probe() == {"ok": True, "engine": "vllm", "state": "idle",
+                            "resident": []}
+    vllm.ensure_loaded("qwen", weights_path="/models/qwen")
+    probe = vllm.probe()
+    assert probe["state"] == "running"
+    assert probe["resident"] == ["qwen"]
+    vllm.release("qwen")
+    assert vllm.probe()["state"] == "idle"
+
+
+def test_vllm_absent_binary_fails_closed():
+    runner = FakeRunner()
+    vllm = VllmServerLifecycle(runner=runner, which=lambda name: None,
+                               exists=lambda p: True)
+    res = vllm.ensure_loaded("qwen", weights_path="/models/qwen")
+    assert res["ok"] is False
+    assert "fail-closed" in res["reason"]
+    assert "not found" in res["reason"]
+    # Fail closed: no argv built, nothing spawned.
+    assert runner.argvs == []
+
+
+def test_vllm_missing_weights_fails_closed():
+    runner = FakeRunner()
+    vllm = VllmServerLifecycle(runner=runner,
+                               which=lambda name: f"/usr/bin/{name}",
+                               exists=lambda p: False)
+    res = vllm.ensure_loaded("qwen", weights_path="/models/gone")
+    assert res["ok"] is False
+    assert "fail-closed" in res["reason"]
+    assert "not found" in res["reason"]
+    assert runner.argvs == []
+
+
+# --- adapter call shapes: Maya (engine-native, no unload primitive) ---------
+
+def test_maya_ensure_loaded_maps_only_what_exists():
+    http = FakeHttp(responses={"/api/ps": {"models": [{"name": "glm-flash"}]}})
+    maya = MayaLifecycle(base_url="http://127.0.0.1:8080", http=http)
+    res = maya.ensure_loaded("glm-flash")
+    assert res["ok"] is True
+    assert res["state"] == "resident"
+    assert http.calls[0]["method"] == "GET"
+    assert http.calls[0]["url"].endswith("/api/ps")
+
+    # Not yet loaded: readiness over /api/show — loading is engine-native.
+    http2 = FakeHttp(responses={"/api/ps": {"models": []},
+                               "/api/show": {"name": "glm-flash"}})
+    maya2 = MayaLifecycle(http=http2)
+    res = maya2.ensure_loaded("glm-flash")
+    assert res["ok"] is True
+    assert res["state"] == "ready-on-demand"
+    assert "auto-swap" in res["load_control"]
+    assert "not a weights pin" in res["reason"]
+    show = http2.calls[-1]
+    assert show["method"] == "POST"
+    assert show["url"].endswith("/api/show")
+    assert show["body"] == {"name": "glm-flash"}
+
+
+def test_maya_release_never_fakes_an_unload():
+    http = FakeHttp()
+    maya = MayaLifecycle(http=http)
+    res = maya.release("glm-flash")
+    assert res["ok"] is True
+    # The honest label: Maya has no unload primitive and none is faked.
+    assert res["unload_control"] == "no-unload-primitive"
+    assert "no unload primitive" in res["reason"]
+    assert "never faked" in res["reason"]
+    # Nothing is sent to the engine — especially never /api/delete.
+    assert http.calls == []
+
+
+def test_maya_unknown_model_and_down_engine_are_honest_rows():
+    http = FakeHttp(responses={"/api/ps": {"models": []}, "/api/show": None})
+    maya = MayaLifecycle(http=http)
+    res = maya.ensure_loaded("no-such-model")
+    assert res["ok"] is False
+    assert "does not know" in res["reason"]
+
+    down = MayaLifecycle(http=FakeHttp(
+        responses={"/api/ps": Exception("connection refused")}))
+    res = down.ensure_loaded("glm-flash")
+    assert res["ok"] is False
+    assert "connection refused" in res["reason"]
+
+
+def test_maya_probe_reads_api_ps_and_fails_soft():
+    http = FakeHttp(responses={"/api/ps": {"models": [{"name": "a"},
+                                                     {"name": "b"}]}})
+    maya = MayaLifecycle(http=http)
+    res = maya.probe()
+    assert res["ok"] is True
+    assert res["state"] == "observed"
+    assert res["resident"] == ["a", "b"]
+    assert http.calls[0]["url"].endswith("/api/ps")
+
+    down = MayaLifecycle(http=FakeHttp(
+        responses={"/api/ps": Exception("down")}))
+    assert down.probe()["state"] == "unknown"
 
 
 # --- eviction planner: booked gating vs live-free ordering -----------------
@@ -1068,3 +1322,74 @@ def test_scope_release_steps_down_only_what_the_scope_brought_in():
     assert _call_names(adapter) == [("release", "image-x"),
                                     ("ensure_loaded", "chat-a")]
     assert {r.model_id for r in ledger.residents("local")} == {"chat-a"}
+
+
+# --- orchestrator: the P4 adapters as plan steps -----------------------------
+
+def test_comfyui_vllm_and_maya_run_as_orchestrator_plan_steps():
+    """A plan can name the P4 adapters and the planner treats their bookings
+    like any other engine's; each step drives the engine's own contract."""
+    clock = FakeClock()
+    ledger = ResidencyLedger(
+        bookings={"sdxl": 8.0, "qwen": 8.0, "glm-flash": 8.0, "flux": 10.0},
+        clock=clock)
+    ledger.set_budget("local", 24.0)
+    comfy_http = FakeHttp(
+        responses={"/system_stats": {"system": {"comfyui-version": "0.3.0"}}})
+    maya_http = FakeHttp(responses={"/api/ps": {"models": []},
+                                   "/api/show": {"name": "glm-flash"}})
+    runner = FakeRunner()
+    adapters = {
+        "comfyui": ComfyUiLifecycle(http=comfy_http),
+        "vllm": VllmServerLifecycle(runner=runner,
+                                    which=lambda name: f"/usr/bin/{name}",
+                                    exists=lambda p: True),
+        "maya": MayaLifecycle(http=maya_http),
+    }
+    orch = Orchestrator(ledger, EvictionPlanner(ledger, clock=clock),
+                        adapters, clock=clock)
+
+    # The planner treats their bookings like any other engine's.
+    r1 = orch.prewarm("local", LoadRequest(
+        model_id="sdxl", engine="comfyui", lane="image", modality="image"))
+    assert r1["ok"] is True
+    assert r1["plan"].load_steps[0].engine == "comfyui"
+    assert comfy_http.calls[0]["url"].endswith("/system_stats")
+
+    r2 = orch.prewarm("local", LoadRequest(
+        model_id="qwen", engine="vllm", lane="chat",
+        weights_path="/models/qwen"))
+    assert r2["ok"] is True
+    assert r2["plan"].load_steps[0].engine == "vllm"
+    assert runner.argvs == [["/usr/bin/vllm", "serve", "/models/qwen",
+                             "--port", "8000"]]
+
+    r3 = orch.prewarm("local", LoadRequest(
+        model_id="glm-flash", engine="maya", lane="chat"))
+    assert r3["ok"] is True
+    assert r3["plan"].load_steps[0].engine == "maya"
+    assert maya_http.calls[-1]["url"].endswith("/api/show")
+
+    assert {r.model_id for r in ledger.residents("local")} == {"sdxl", "qwen",
+                                                              "glm-flash"}
+    assert ledger.booked_total_gb("local") == 24.0
+
+    # An image-generation entry releases every resident through its own
+    # engine's release contract: ComfyUI frees the cache, vLLM stops the
+    # process, Maya honestly reports no unload primitive.
+    comfy_http.calls.clear()
+    maya_http.calls.clear()
+    r4 = orch.prewarm("local", LoadRequest(
+        model_id="flux", engine="comfyui", lane="image", modality="image"))
+    assert r4["ok"] is True
+    release_engines = sorted(step.engine for step in r4["plan"].release_steps)
+    assert release_engines == ["comfyui", "maya", "vllm"]
+    assert runner.proc.terminated is True
+    freed = [c for c in comfy_http.calls
+             if c["url"].endswith("/free") and c["method"] == "POST"]
+    assert freed and freed[0]["body"] == {"unload_models": True,
+                                          "free_memory": True}
+    # Maya's release step sent nothing to the engine — never a fake unload.
+    assert maya_http.calls == []
+    assert {r.model_id for r in ledger.residents("local")} == {"flux"}
+    assert orch.progress("local:flux")["state"] == "ready"

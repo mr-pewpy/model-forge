@@ -346,30 +346,39 @@ BROKER = {
         "returns a scope id with honest progress states (queued / loading / "
         "ready). 'release' ends a scope by id and restores exactly what was "
         "resident at claim time. 'plan' is a dry run of claim — the "
-        "release/load steps with reasons, nothing executed. Use when the "
-        "user wants models swapped on one GPU (chat -> image generation -> "
+        "release/load steps with reasons, nothing executed. 'bench' "
+        "measures what you run: a short VRAM measurement window on a "
+        "loaded (or about-to-run) model records its real observed peak and "
+        "books it as the model's nominal ceiling — measured peaks replace "
+        "published estimates and are never downgraded. Use when the user "
+        "wants models swapped on one GPU (chat -> image generation -> "
         "back to chat as one workflow), asks what is loaded and what it "
-        "costs, or wants to preview a swap."
+        "costs, wants to preview a swap, or wants a model's true VRAM "
+        "footprint measured."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["status", "claim", "release", "plan"],
+                "enum": ["status", "claim", "release", "plan", "bench"],
                 "description": (
                     "'status' = read-only residency summary; 'claim' = take "
                     "the GPU lane for a modality or model and return a scope "
                     "id; 'release' = end a scope and restore what was "
                     "resident at claim time; 'plan' = dry run of claim "
-                    "(nothing executed)."
+                    "(nothing executed); 'bench' = measure a model's VRAM "
+                    "peak over a short window and book it as its nominal "
+                    "ceiling (pass model_id)."
                 ),
             },
             "model_id": {
                 "type": "string",
                 "description": (
                     "Catalog model id from model_forge_browse to claim the "
-                    "lane for (claim/plan)."
+                    "lane for (claim/plan), or the model id to measure "
+                    "(bench — load it first, or exercise it during the "
+                    "bench window)."
                 ),
             },
             "modality": {

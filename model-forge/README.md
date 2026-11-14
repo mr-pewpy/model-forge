@@ -55,7 +55,7 @@ run through a user-configured OpenAI-compatible media gateway.
 | `model_forge_activate` | Connect a running chat model as Hermes' default (plan-only; `apply=true` writes config after human approval) |
 | `model_forge_generate_media` | 3D (image→GLB), music, SFX — jobs through a user-configured OpenAI-compatible media gateway |
 | `model_forge_storage` | Model weights on disk (downloads dir, Ollama models dir, HuggingFace hub cache): list names, sizes and modification times; delete a listed entry after your approval |
-| `model_forge_broker` | Weight residency on a compute target: what weights are on disk and what is loaded now, what that books against the budget (`status`), and the claim/release verbs that run a multi-step swap (chat → image generation → back to chat) as one workflow scope; `plan` previews the steps first |
+| `model_forge_broker` | Weight residency on a compute target: what weights are on disk and what is loaded now, what that books against the budget (`status`), and the claim/release verbs that run a multi-step swap (chat → image generation → back to chat) as one workflow scope; `plan` previews the steps first, `bench` measures a model's real VRAM peak and books it as its nominal ceiling |
 
 Plus `tts/model_forge_tts.py` — a config-driven TTS/voice-clone command
 provider for any OpenAI-style `/v1/audio/speech` endpoint (see `tts/`), and
@@ -77,6 +77,10 @@ bookkeeping — verbs, not knobs:
   you claimed it.
 - **`plan`** is a dry run of claim: the release/load steps with their
   reasons, nothing executed.
+- **`bench`** measures what you run: a short VRAM measurement window on a
+  loaded (or about-to-run) model records its observed peak and books it as
+  the model's nominal ceiling — measured peaks replace published estimates
+  and are never downgraded by them.
 - **`status`** is a read-only residency summary: pulled weights with sizes,
   what is loaded now, booked ceilings, and budget usage.
 
@@ -92,7 +96,10 @@ claim fails closed and submits nothing).
 
 Fit is gated on booked ceilings — the catalog's published VRAM floors until
 a measured peak replaces them — while live free VRAM only decides which
-model loads first, never whether one fits. Engines that own their own
+model loads first, never whether one fits. A model with no published VRAM
+floor (the engine-managed chat tiers) stays unbooked: the planner refuses
+to gate it until a measured peak lands, and `status` marks those rows
+`unbooked — run bench after first load`. Engines that own their own
 load/swap policy (llama-swap, ComfyUI, vLLM, media gateways) are recorded
 honestly as claimed for the scope; the engine moves the weights itself on
 first use, and the step reasons say so.
@@ -200,6 +207,10 @@ Honest scoping — current limits, and what does not work yet:
   no music-vs-sfx pipeline tags.
 - **World model is an empty stub.** No local open engine with a stable API
   exists yet; the slot ships so the flow works the day one lands.
+- **Engine-managed chat tiers have no published VRAM floor.** They stay
+  unbooked and the planner refuses to gate them until a measured peak lands
+  — run `model_forge_broker` `action=bench` after the model's first load
+  (`status` marks those rows `unbooked — run bench after first load`).
 - **`model_forge_generate_media` speaks the media gateway job API only**
   (`/v1/videos/generations`, `/v1/audio/music`, `/v1/audio/sfx`). The
   ComfyUI-native job flow (`/prompt` + `/history`) is not implemented.
@@ -235,7 +246,8 @@ Honest scoping — current limits, and what does not work yet:
   text to speak plus base64-encoded voice-clone reference audio to a
   user-configured `/v1/audio/speech` endpoint. If pull credentials are
   configured, they are sent only to `huggingface.co` / `modelscope.cn` hosts.
-- **Shell:** runs `nvidia-smi` and `rocm-smi` (read-only GPU queries) and
+- **Shell:** runs `nvidia-smi` and `rocm-smi` (read-only GPU queries,
+  including the `bench` action's VRAM measurement window) and
   checks `PATH` for the `strata` CLI. Hardware probes also read system state
   directly: amdgpu sysfs on Linux and the Windows memory API
   (`GlobalMemoryStatusEx`). `model_forge_install` with `action=engine_install`

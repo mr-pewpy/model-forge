@@ -1541,12 +1541,16 @@ def test_broker_schema_shape_is_verbs_not_knobs():
     spec = schemas.BROKER
     props = spec["parameters"]["properties"]
     assert spec["name"] == "model_forge_broker"
-    assert props["action"]["enum"] == ["status", "claim", "release", "plan"]
+    assert props["action"]["enum"] == ["status", "claim", "release", "plan",
+                                      "bench"]
     assert spec["parameters"]["required"] == ["action"]
-    # minimal, self-explanatory surface: the four verbs plus what to act on
+    # minimal, self-explanatory surface: the five verbs plus what to act on
     assert set(props) == {"action", "model_id", "modality", "scope_id",
                          "target"}
     assert "unload_policy" not in spec["description"]
+    # bench is a verb with a model id, nothing more — no window knobs
+    assert "bench" in spec["description"]
+    assert "bench" in props["action"]["description"]
 
 
 def test_bookings_helper_maps_model_entry_footprints():
@@ -1567,18 +1571,19 @@ def test_bookings_helper_maps_model_entry_footprints():
     assert bookings["fx-img"] == {"vram_gb": 16.0,
                                  "source": tools.BOOKING_SOURCE,
                                  "load_s": None}
-    # no declared floor -> booked at zero, with the honest 'none declared'
-    # label so scopes can account for it without inventing a footprint
-    assert bookings["fx-moe"]["vram_gb"] == 0.0
-    assert "none declared" in bookings["fx-moe"]["source"]
+    # no declared floor -> stays unbooked: a guessed 0 GB would be a guessed
+    # fit, and the planner refuses to gate it until a measured peak lands
+    assert "fx-moe" not in bookings
     # the dict is exactly what the residency layer takes
     ledger = ResidencyLedger(bookings=bookings)
     assert ledger.booked_vram_gb("fx-img") == 16.0
-    assert ledger.booked_vram_gb("fx-moe") == 0.0
-    # the full catalog maps every curated entry
+    assert ledger.booked_vram_gb("fx-moe") is None
+    # the full catalog books every curated entry with a declared floor, and
+    # only those — engine-managed entries and stubs stay unbooked
     all_bookings = tools.bookings_from_registry()
     from model_forge.registry import models_for
-    assert set(all_bookings) == {m.id for m in models_for()}
+    assert set(all_bookings) == {m.id for m in models_for()
+                                 if float(m.vram_gb_min or 0.0) > 0}
 
 
 def test_broker_status_report_shape_with_fakes(tmp_path, monkeypatch):
@@ -1606,6 +1611,39 @@ def test_broker_status_report_shape_with_fakes(tmp_path, monkeypatch):
     # honest labels: published floors as ceilings, never a measured claim
     assert "published" in out["note"] and "measured" in out["note"]
     assert calls == []            # read-only: no engine call was driven
+
+
+def test_broker_status_marks_unbooked_engine_managed_rows(tmp_path,
+                                                          monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    _book_chat_resident(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "status", "target": "gpu-box"}))
+    rows = {row["model_id"]: row for row in out["unbooked"]}
+    # the engine-managed chat tiers declare no VRAM floor: they stay
+    # unbooked, with an honest hint instead of a guessed 0 GB ceiling
+    assert set(rows) == {"qwen3.8-flash-next", "deepseek-v4.1-flash",
+                         "minimax-m3.1-flash", "glm-5.3-flash"}
+    for row in rows.values():
+        assert row["vram_gb"] is None
+        assert row["hint"] == "unbooked — run bench after first load"
+    # never presented as booked ceilings (and stubs/markers stay out)
+    booked_ids = {row["model_id"] for row in out["booked"]}
+    assert not set(rows) & booked_ids
+    assert "world-model-slot" not in rows and "core-gguf-catalog" not in rows
+
+    # a measured peak books one — the hint row is gone, the label is honest
+    stack["ledger"].record_measured_peak("glm-5.3-flash", 30.0)
+    out = json.loads(tools.model_forge_broker(
+        {"action": "status", "target": "gpu-box"}))
+    assert "glm-5.3-flash" not in {row["model_id"]
+                                   for row in out["unbooked"]}
+    booked = {row["model_id"]: row for row in out["booked"]}
+    assert booked["glm-5.3-flash"]["vram_gb"] == 30.0
+    assert booked["glm-5.3-flash"]["label"] == "measured peak (bench)"
 
 
 def test_broker_claim_runs_plan_steps_in_order_with_honest_progress(
@@ -1712,6 +1750,115 @@ def test_broker_plan_dry_run_executes_nothing(tmp_path, monkeypatch):
     assert out["would"]["ok"] is False
     assert "exceeds the nominal budget" in out["would"]["reason"]
     assert calls == []
+
+
+def test_bench_records_measured_peak_and_gates_fit(tmp_path, monkeypatch):
+    # wiring: action=bench through the handler with an injected VRAM sampler
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    monkeypatch.setattr(tools, "_BENCH_INTERVAL_S", 0.0)
+    mid = "qwen3.8-flash-next"     # engine-managed: no published VRAM floor
+    from model_forge.broker import LoadRequest
+
+    def request():
+        return LoadRequest(model_id=mid, engine="strata", lane="chat",
+                           modality="chat")
+
+    # before: the planner refuses to gate it — no booked ceiling at all
+    plan = stack["planner"].plan_load(_REMOTE.id, request())
+    assert plan.ok is False and "no booked footprint" in plan.reason
+
+    readings = [4.0, 12.5, 9.0, 7.0, 12.4, 6.0]
+    seen = {"i": 0}
+
+    def fake_sampler():
+        value = readings[seen["i"] % len(readings)]
+        seen["i"] += 1
+        return value
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "bench", "model_id": mid, "target": "gpu-box"},
+        sampler=fake_sampler))
+    assert out["ok"] is True and out["action"] == "bench"
+    assert out["peak_gb"] == 12.5          # the peak, not the last reading
+    assert out["label"] == "measured peak (bench)"
+    assert out["booking"] == {"model_id": mid, "vram_gb": 12.5,
+                              "source": "measured",
+                              "label": "measured peak (bench)"}
+    assert out["gates_fit"] is True
+    assert "planner" in out["note"] and "never downgraded" in out["note"]
+    assert out["samples"] == len(readings)
+    # the measured peak is the booked ceiling and the planner gates fit on it
+    assert stack["ledger"].booked_vram_gb(mid) == 12.5
+    plan = stack["planner"].plan_load(_REMOTE.id, request())
+    assert plan.ok is True
+    # a measured peak is never downgraded by a published footprint
+    row = stack["ledger"].book(mid, {"vram_gb": 2.0,
+                                     "source": tools.BOOKING_SOURCE})
+    assert "kept" in row
+    assert stack["ledger"].booked_vram_gb(mid) == 12.5
+    assert calls == []            # bench drives no engine, only measures
+
+
+def test_bench_fails_soft_without_a_gpu(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    from model_forge.registry import HardwareProfile
+    monkeypatch.setattr(tools, "probe_hardware",
+                        lambda: HardwareProfile(gpus=(), total_vram_gb=0.0,
+                                                ram_gb=32.0,
+                                                platform="linux"))
+    out = json.loads(tools.model_forge_broker(
+        {"action": "bench", "model_id": "qwen3.8-flash-next",
+         "target": "gpu-box"}))
+    assert out["ok"] is False and out["action"] == "bench"
+    assert "no GPU is present" in out["error"]
+    # fail soft: nothing was measured and nothing was booked
+    assert stack["ledger"].booking("qwen3.8-flash-next") is None
+    assert calls == []
+
+
+def test_bench_window_without_a_valid_reading_fails_closed(tmp_path,
+                                                           monkeypatch):
+    # a booked ceiling must be an observation, never a guess
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    monkeypatch.setattr(tools, "_BENCH_INTERVAL_S", 0.0)
+    out = json.loads(tools.model_forge_broker(
+        {"action": "bench", "model_id": "krea-2-turbo", "target": "gpu-box"},
+        sampler=lambda: None))
+    assert out["ok"] is False
+    assert "no valid VRAM readings" in out["error"]
+    # the published booking is untouched — no guessed peak was booked
+    booking = stack["ledger"].booking("krea-2-turbo")
+    assert booking.source == tools.BOOKING_SOURCE
+
+
+def test_bench_requires_a_model_id(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    out = json.loads(tools.model_forge_broker({"action": "bench",
+                                               "target": "gpu-box"}))
+    assert "model_id" in out["error"] and "bench" in out["error"]
+
+
+def test_live_bench_sampler_parses_nvidia_smi_used_memory(monkeypatch):
+    # the live sampler reads real GPU memory in the hardware-probe style:
+    # nvidia-smi CSV query, MiB readings summed across GPUs into GB
+    import subprocess
+    from model_forge import tools
+    monkeypatch.setattr(tools.shutil, "which",
+                        lambda _: "/usr/bin/nvidia-smi")
+    fake = subprocess.CompletedProcess(args=tools._NVIDIA_SMI_USED,
+                                       stdout="1024\n2048\n",
+                                       stderr="", returncode=0)
+    monkeypatch.setattr(tools.subprocess, "run",
+                        lambda *a, **kw: fake)
+    assert tools.gpu_vram_used_gb() == 3.0
 
 
 def test_generate_media_claims_and_releases_lane(tmp_path, monkeypatch):
@@ -1839,16 +1986,32 @@ def test_broker_stack_threads_injectable_engine_seams(tmp_path, monkeypatch):
 
     def fake_http(method, url, body=None, timeout=None):
         http_calls.append((method, url, body))
+        if url.endswith("/system_stats"):
+            # ComfyUI readiness fingerprint
+            return {"system": {"comfyui_version": "test"}, "devices": []}
         return {"models": []}
 
     spawn_calls = []
 
+    class _Proc:
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+        def poll(self):
+            return None
+
     def fake_runner(argv):
+        # engine processes may only be spawned through this seam — recorded,
+        # never real
         spawn_calls.append(list(argv))
-        raise AssertionError("no process may be spawned in this test")
+        return _Proc()
 
     stack = tools.broker_stack(_REMOTE, http=fake_http, runner=fake_runner,
-                               which=lambda binary: None, fresh=True)
+                               which=lambda binary: "/fake/" + binary,
+                               fresh=True)
     assert stack["budget_gb"] == 48.0
     assert stack["ledger"].booked_vram_gb("krea-2-turbo") == 16.0
     _book_chat_resident(stack)
@@ -1871,4 +2034,7 @@ def test_broker_stack_threads_injectable_engine_seams(tmp_path, monkeypatch):
             if isinstance(body, dict) and body.get("model") == "chat-a"
             and body.get("keep_alive") not in (0, None)]
     assert warm
+    # krea-2-turbo is ComfyUI-served: its readiness + cache-free contract
+    # rides the HTTP seam and spawns no engine process
+    assert any(url.endswith("/system_stats") for _, url, _ in http_calls)
     assert spawn_calls == []

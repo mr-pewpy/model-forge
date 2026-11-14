@@ -9,9 +9,18 @@ when a task needs a different model. Four pieces:
 - ``EngineLifecycle`` adapters — ``ensure_loaded`` / ``release`` / ``probe``
   per engine: Ollama (warm via a generate call with ``keep_alive``, evict
   with ``keep_alive=0``), llama-swap (observational pass-through — it swaps
-  models on demand by route and exposes no eviction control), and llama.cpp
+  models on demand by route and exposes no eviction control), llama.cpp
   llama-server (process start/stop on a weights path; the process runner is
-  injectable and a missing binary fails closed).
+  injectable and a missing binary fails closed), ComfyUI (readiness plus the
+  explicit cache free between back-to-back generative jobs via its
+  ``POST /free`` route — ComfyUI loads models per-workflow, so this is a
+  readiness + cache-free contract, never a weights pin), vLLM (process
+  start/stop of the server with the model as a launch argument — engine
+  sleep/wake is deliberately not used; wake endpoints are unreliable
+  upstream and process restart is the reliable path), and Maya (engine-native
+  readiness over its model-management API — Maya exposes no unload
+  primitive, so release is a ledger-side acknowledgment and never fakes an
+  unload).
 - ``EvictionPlanner`` — the battle-tested serving policy (roadmap §3) as
   pure plan data: fit gates on NOMINAL booked ceilings (live free VRAM only
   orders candidates — booked-vs-live comparisons cause false evictions), a
@@ -45,6 +54,7 @@ from __future__ import annotations
 import abc
 import json
 import math
+import os
 import shutil
 import subprocess
 import threading
@@ -56,12 +66,15 @@ from typing import Protocol
 __all__ = [
     "RECENCY_WINDOW_S",
     "Booking",
+    "ComfyUILifecycle",
+    "ComfyUiLifecycle",
     "EngineLifecycle",
     "EvictionPlanner",
     "LlamaCppServerLifecycle",
     "LlamaSwapLifecycle",
     "LoadPlan",
     "LoadRequest",
+    "MayaLifecycle",
     "MeasuredFootprintRecorder",
     "OllamaLifecycle",
     "Orchestrator",
@@ -69,6 +82,8 @@ __all__ = [
     "PullRecord",
     "ResidencyLedger",
     "ResidentRecord",
+    "VllmLifecycle",
+    "VllmServerLifecycle",
     "is_image_generation",
     "loading_state",
 ]
@@ -533,7 +548,10 @@ def _http_json(method: str, url: str, body: dict | None = None,
     req = urllib.request.Request(url, data=data, method=method,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8", "replace"))
+        text = resp.read().decode("utf-8", "replace")
+    # An empty success body (e.g. ComfyUI's POST /free answers 200 with no
+    # body) is a valid JSON response of ``{}`` here, not a parse error.
+    return json.loads(text) if text.strip() else {}
 
 
 class OllamaLifecycle(EngineLifecycle):
@@ -732,6 +750,305 @@ class LlamaCppServerLifecycle(EngineLifecycle):
                 "state": "running" if running else "stopped",
                 "resident": [self._serving] if (running and self._serving)
                            else []}
+
+
+class ComfyUiLifecycle(EngineLifecycle):
+    """ComfyUI lifecycle: readiness plus the explicit cache free between
+    back-to-back generative jobs (roadmap §3 — engines hold allocations after
+    a job; an explicit cache free between consecutive generative jobs keeps
+    the next one honest).
+
+    ComfyUI loads models per-workflow from its workflow queue and exposes no
+    per-model weights pin or eviction control, so ``ensure_loaded`` is a
+    READINESS + CACHE-FREE contract, never a weights pin: it confirms ComfyUI
+    answers (``GET /system_stats``) and — when the previous generative job
+    still holds allocations — signals the cache free first. ``release`` is
+    the same explicit cache free after a job. The free rides ComfyUI's
+    documented ``POST /free`` route (``{"unload_models": true,
+    "free_memory": true}``); ComfyUI applies it when the queue next goes
+    idle, so the call returns immediately.
+
+    The HTTP function is injectable; the default is stdlib urllib."""
+
+    engine_id = "comfyui"
+    FREE_BODY = {"unload_models": True, "free_memory": True}
+    CONTRACT = "readiness + cache-free"
+    RELEASE_CONTRACT = "explicit cache-free"
+
+    def __init__(self, base_url="http://127.0.0.1:8188", http=None):
+        self._root = (base_url or "").rstrip("/")
+        self._http = http or _http_json
+        self._allocations_held = False
+
+    def _free_cache(self, model_id, action):
+        """The explicit cache free (``POST /free``): ``None`` on success, an
+        honest error row on failure — never raises."""
+        try:
+            self._http("POST", f"{self._root}/free", dict(self.FREE_BODY))
+        except Exception as exc:  # noqa: BLE001 — honest row, never a raise
+            return {"ok": False, "engine": self.engine_id, "action": action,
+                    "model_id": model_id, "cache_freed": False,
+                    "reason": f"comfyui cache free (POST /free) failed: "
+                              f"{type(exc).__name__}: {exc}"}
+        return None
+
+    def ensure_loaded(self, model_id, **_ignored) -> dict:
+        row = {"ok": False, "engine": self.engine_id, "action": "load",
+               "model_id": model_id, "contract": self.CONTRACT,
+               "cache_freed": False}
+        try:
+            stats = self._http("GET", f"{self._root}/system_stats")
+        except Exception as exc:  # noqa: BLE001 — honest row, never a raise
+            return {**row, "reason": f"comfyui readiness check "
+                                     f"(GET /system_stats) failed: "
+                                     f"{type(exc).__name__}: {exc}"}
+        if not (isinstance(stats, dict)
+                and ("system" in stats or "devices" in stats)):
+            return {**row, "reason": "comfyui readiness check: unexpected "
+                                     "/system_stats response — ComfyUI is "
+                                     "not ready"}
+        freed = False
+        if self._allocations_held:
+            err = self._free_cache(model_id, "load")
+            if err is not None:
+                return err
+            freed = True
+        self._allocations_held = True
+        reason = ("ComfyUI is ready — readiness + cache-free only: ComfyUI "
+                  "loads models per-workflow, not a weights pin")
+        if freed:
+            reason += ("; freed held allocations from the previous "
+                       "generative job first (back-to-back generative jobs "
+                       "free the cache between them)")
+        return {"ok": True, "engine": self.engine_id, "action": "load",
+                "model_id": model_id, "state": "ready",
+                "contract": self.CONTRACT, "cache_freed": freed,
+                "reason": reason}
+
+    def release(self, model_id) -> dict:
+        base = {"engine": self.engine_id, "action": "release",
+                "model_id": model_id, "contract": self.RELEASE_CONTRACT}
+        if not self._allocations_held:
+            return {**base, "ok": True, "cache_freed": False,
+                    "reason": "no held allocations from a previous "
+                              "generative job — nothing to free"}
+        err = self._free_cache(model_id, "release")
+        if err is not None:
+            return err
+        self._allocations_held = False
+        return {**base, "ok": True, "cache_freed": True,
+                "reason": "explicit cache free between generative jobs "
+                          "(POST /free: unload_models + free_memory) — "
+                          "ComfyUI holds allocations after a job and "
+                          "reclaims them when the queue next goes idle"}
+
+    def probe(self) -> dict:
+        try:
+            stats = self._http("GET", f"{self._root}/system_stats")
+        except Exception as exc:  # noqa: BLE001 — probes fail soft
+            return {"ok": False, "engine": self.engine_id, "state": "unknown",
+                    "resident": [],
+                    "allocations_held": self._allocations_held,
+                    "reason": f"comfyui /system_stats unreachable: "
+                              f"{type(exc).__name__}: {exc}"}
+        ready = isinstance(stats, dict) and ("system" in stats
+                                             or "devices" in stats)
+        return {"ok": ready, "engine": self.engine_id,
+                "state": "observed" if ready else "unknown",
+                "resident": [], "allocations_held": self._allocations_held,
+                "reason": "ComfyUI loads models per-workflow and exposes no "
+                          "weights-residency listing — residency is managed "
+                          "through the job lifecycle (readiness + cache-free)"}
+
+
+# Spelling aliases so callers can name the ComfyUI acronym either way.
+ComfyUILifecycle = ComfyUiLifecycle
+
+
+class VllmServerLifecycle(EngineLifecycle):
+    """vLLM is a process: ``vllm serve <model>`` starts the server, stopping
+    the process evicts (roadmap §3). PROCESS STOP/START ONLY — engine
+    sleep/wake is deliberately not used: some engines' wake endpoints are
+    unreliable upstream, and process restart is the reliable path for large
+    loads.
+
+    The model is the launch argument: a local weights path when one is given
+    (and it must be on disk — missing weights fail closed), or the model id
+    itself when vLLM is left to resolve it. The process runner and the binary
+    lookup are injectable so tests spawn nothing — and a missing binary fails
+    closed: no argv is even built, no half-started server."""
+
+    engine_id = "vllm"
+    LIFECYCLE = "process stop/start (engine sleep/wake is not used)"
+
+    def __init__(self, binary="vllm", port=8000, extra_args=(),
+                 runner=None, which=None, exists=None):
+        self._binary = binary
+        self._port = port
+        self._extra_args = tuple(extra_args)
+        self._runner = runner or _spawn_process
+        self._which = which or shutil.which
+        self._exists = exists or os.path.exists
+        self._handle: ProcessHandle | None = None
+        self._serving: str | None = None
+
+    def ensure_loaded(self, model_id, *, weights_path=None, port=None,
+                      extra_args=None, **_ignored) -> dict:
+        row = {"ok": False, "engine": self.engine_id, "action": "load",
+               "model_id": model_id, "lifecycle": self.LIFECYCLE}
+        weights = str(weights_path or "").strip()
+        if weights:
+            if not self._exists(weights):
+                return {**row, "reason": f"vLLM weights not found at "
+                                         f"{weights!r} — refusing to start "
+                                         f"(fail-closed)"}
+            serve_target = weights
+        else:
+            serve_target = str(model_id)
+        found = self._which(self._binary)
+        if not found:
+            return {**row, "reason": f"vLLM binary {self._binary!r} not "
+                                     f"found on PATH — refusing to start "
+                                     f"(fail-closed)"}
+        argv = [found, "serve", serve_target,
+                "--port", str(self._port if port is None else port)]
+        argv += list(self._extra_args if extra_args is None else extra_args)
+        try:
+            handle = self._runner(argv)
+        except Exception as exc:  # noqa: BLE001 — honest row, never a raise
+            return {**row, "reason": f"vLLM server start failed: "
+                                     f"{type(exc).__name__}: {exc}"}
+        self._handle = handle
+        self._serving = model_id
+        return {"ok": True, "engine": self.engine_id, "action": "load",
+                "model_id": model_id, "argv": argv,
+                "lifecycle": self.LIFECYCLE,
+                "reason": f"started the vLLM server for {model_id} on port "
+                          f"{argv[4]} (process stop/start — engine sleep/wake "
+                          f"is not used; process restart is the reliable "
+                          f"path)"}
+
+    def release(self, model_id) -> dict:
+        if self._handle is None:
+            return {"ok": True, "engine": self.engine_id, "action": "release",
+                    "model_id": model_id, "lifecycle": self.LIFECYCLE,
+                    "reason": f"no vLLM server process for {model_id} — "
+                              f"nothing to stop"}
+        handle, self._handle, self._serving = self._handle, None, None
+        try:
+            handle.terminate()
+            handle.wait(timeout=10.0)
+        except Exception as exc:  # noqa: BLE001 — honest row, never a raise
+            return {"ok": False, "engine": self.engine_id, "action": "release",
+                    "model_id": model_id, "lifecycle": self.LIFECYCLE,
+                    "reason": f"vLLM server stop failed: "
+                              f"{type(exc).__name__}: {exc}"}
+        return {"ok": True, "engine": self.engine_id, "action": "release",
+                "model_id": model_id, "lifecycle": self.LIFECYCLE,
+                "reason": f"stopped the vLLM server for {model_id} (process "
+                          f"stop/start — engine sleep/wake is not used; "
+                          f"process restart is the reliable path)"}
+
+    def probe(self) -> dict:
+        if self._handle is None:
+            return {"ok": True, "engine": self.engine_id, "state": "idle",
+                    "resident": []}
+        running = self._handle.poll() is None
+        return {"ok": True, "engine": self.engine_id,
+                "state": "running" if running else "stopped",
+                "resident": [self._serving] if (running and self._serving)
+                           else []}
+
+
+# Spelling alias matching the llama.cpp adapter's naming shape.
+VllmLifecycle = VllmServerLifecycle
+
+
+class MayaLifecycle(EngineLifecycle):
+    """Maya's engine-native model-management API (roadmap §5b: Maya/Strata
+    speak session/pull APIs). What honestly exists: ``GET /api/ps`` reports
+    the loaded session, ``POST /api/show`` confirms a model is known, and a
+    request naming a model auto-swaps to it — loading is engine-native, so
+    ``ensure_loaded`` is a readiness check over those endpoints, never a
+    weights pin. ``/api/pull`` downloads weights (pull management, not
+    load).
+
+    Maya exposes NO unload primitive. ``release`` manages only what exists:
+    it sends nothing to the engine and answers with an honest ledger-side
+    acknowledgment labeled ``no-unload-primitive`` — an unload is never
+    faked. ``POST /api/delete`` removes a model's files (destructive) and is
+    never used as a release.
+
+    The HTTP function is injectable; the default is stdlib urllib."""
+
+    engine_id = "maya"
+    LOAD_CONTROL = ("engine-native auto-swap — Maya loads a model when a "
+                    "request names it; no explicit load endpoint exists")
+    NO_UNLOAD = ("Maya exposes no unload primitive — release is a "
+                 "ledger-side acknowledgment only; nothing is sent to the "
+                 "engine and an unload is never faked (POST /api/delete "
+                 "removes a model's files and is destructive — never used "
+                 "as a release)")
+
+    def __init__(self, base_url="http://127.0.0.1:8080", http=None):
+        self._root = (base_url or "").rstrip("/")
+        self._http = http or _http_json
+
+    def ensure_loaded(self, model_id, **_ignored) -> dict:
+        row = {"ok": False, "engine": self.engine_id, "action": "load",
+               "model_id": model_id, "load_control": self.LOAD_CONTROL}
+        try:
+            data = self._http("GET", f"{self._root}/api/ps")
+        except Exception as exc:  # noqa: BLE001 — honest row, never a raise
+            return {**row, "reason": f"maya /api/ps unreachable: "
+                                     f"{type(exc).__name__}: {exc}"}
+        models = data.get("models") if isinstance(data, dict) else None
+        loaded = [m.get("name", "") for m in (models or [])
+                  if isinstance(m, dict)]
+        if model_id in loaded:
+            return {"ok": True, "engine": self.engine_id, "action": "load",
+                    "model_id": model_id, "state": "resident",
+                    "load_control": self.LOAD_CONTROL,
+                    "reason": f"{model_id} is already loaded in Maya's "
+                              f"session (GET /api/ps) — nothing to load"}
+        try:
+            shown = self._http("POST", f"{self._root}/api/show",
+                               {"name": model_id})
+        except Exception as exc:  # noqa: BLE001 — honest row, never a raise
+            return {**row, "reason": f"maya /api/show failed for {model_id}: "
+                                     f"{type(exc).__name__}: {exc}"}
+        if not isinstance(shown, dict) or not shown:
+            return {**row, "reason": f"Maya does not know {model_id} "
+                                     f"(POST /api/show returned nothing) — "
+                                     f"not ready (fail-soft)"}
+        return {"ok": True, "engine": self.engine_id, "action": "load",
+                "model_id": model_id, "state": "ready-on-demand",
+                "load_control": self.LOAD_CONTROL,
+                "reason": f"{model_id} is known to Maya and loads "
+                          f"engine-natively on the first request naming it "
+                          f"(auto-swap); no explicit load endpoint exists — "
+                          f"a readiness check, not a weights pin"}
+
+    def release(self, model_id) -> dict:
+        return {"ok": True, "engine": self.engine_id, "action": "release",
+                "model_id": model_id,
+                "unload_control": "no-unload-primitive",
+                "reason": self.NO_UNLOAD}
+
+    def probe(self) -> dict:
+        try:
+            data = self._http("GET", f"{self._root}/api/ps")
+        except Exception as exc:  # noqa: BLE001 — probes fail soft
+            return {"ok": False, "engine": self.engine_id, "state": "unknown",
+                    "resident": [],
+                    "reason": f"maya /api/ps unreachable: "
+                              f"{type(exc).__name__}: {exc}"}
+        models = data.get("models") if isinstance(data, dict) else None
+        resident = [m.get("name", "") for m in (models or [])
+                    if isinstance(m, dict)]
+        return {"ok": True, "engine": self.engine_id, "state": "observed",
+                "resident": [n for n in resident if n],
+                "reason": self.NO_UNLOAD}
 
 
 # --- eviction planner -------------------------------------------------------

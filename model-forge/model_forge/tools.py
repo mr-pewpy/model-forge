@@ -19,8 +19,9 @@ import uuid
 
 from .broker import (
     EngineLifecycle, EvictionPlanner, LlamaCppServerLifecycle,
-    LlamaSwapLifecycle, LoadRequest, OllamaLifecycle, Orchestrator,
-    ResidencyLedger,
+    LlamaSwapLifecycle, LoadRequest, MayaLifecycle, MeasuredFootprintRecorder,
+    OllamaLifecycle, Orchestrator, ResidencyLedger, ComfyUiLifecycle,
+    VllmServerLifecycle,
 )
 from .credentials import status as credentials_status
 from .engines import detect_engines
@@ -1439,8 +1440,21 @@ BOOKING_SOURCE_NOTE = (
     "booked ceilings are the curated catalog's published VRAM floors used as "
     "nominal ceilings — advisory published minimums, not measured peaks; a "
     "measured peak replaces one and is never downgraded. A model that "
-    "declares no VRAM floor (engine-sized at launch) is booked at 0 GB so "
-    "workflow scopes can still account for it.")
+    "declares no VRAM floor (engine-managed fit) stays unbooked and the "
+    "planner refuses to gate it until a measured peak lands — run bench "
+    "after its first load.")
+UNBOOKED_HINT = "unbooked — run bench after first load"
+
+
+def _declared_floor(m: ModelEntry) -> float | None:
+    """The entry's published VRAM floor in GB, or None when it declares none
+    (engine-managed fit). None means unbooked — never a guessed 0 GB: the
+    policy layer gates fit on booked ceilings and never guesses fits."""
+    try:
+        floor = float(m.vram_gb_min or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return floor if floor > 0.0 else None
 
 
 def bookings_from_registry(entries=None) -> dict:
@@ -1448,17 +1462,23 @@ def bookings_from_registry(entries=None) -> dict:
     residency layer takes.
 
     Each entry's published ``vram_gb_min`` floor becomes its nominal booked
-    ceiling, with honest labeling (``BOOKING_SOURCE`` / ``BOOKING_SOURCE_NONE``
-    for entries that declare no floor). Stdlib-only and pure: no I/O."""
+    ceiling, honestly labeled ``BOOKING_SOURCE``. Entries that declare no
+    VRAM floor (engine-managed fit) and stub entries stay UNBOOKED — a
+    guessed 0 GB would be a guessed fit, and the policy layer never guesses
+    fits. Unbooked entries surface in broker status with the
+    ``UNBOOKED_HINT`` hint, and the planner refuses to gate them until a
+    measured peak is recorded (``model_forge_broker`` ``action=bench``).
+    Stdlib-only and pure: no I/O."""
     out = {}
     for m in (models_for() if entries is None else entries):
-        try:
-            floor = float(m.vram_gb_min or 0.0)
-        except (TypeError, ValueError):
-            floor = 0.0
+        if m.status == "stub":
+            continue
+        floor = _declared_floor(m)
+        if floor is None:
+            continue
         out[m.id] = {
             "vram_gb": floor,
-            "source": BOOKING_SOURCE if floor > 0 else BOOKING_SOURCE_NONE,
+            "source": BOOKING_SOURCE,
             "load_s": None,
         }
     return out
@@ -1495,24 +1515,30 @@ class _PassThroughLifecycle(EngineLifecycle):
 
 # Engines with explicit load/evict control (real lifecycle adapters), and the
 # engines whose lifecycle the engine itself owns (observational pass-through).
-_LIFECYCLE_ENGINES = ("ollama", "llama-swap", "llamacpp")
-_PASS_THROUGH_ENGINES = ("comfyui", "vllm", "sglang", "strata", "maya",
-                         "openai-compatible", "python", "media-gateway")
+_LIFECYCLE_ENGINES = ("ollama", "llama-swap", "llamacpp", "comfyui", "vllm",
+                      "maya")
+_PASS_THROUGH_ENGINES = ("sglang", "strata", "openai-compatible", "python",
+                         "media-gateway")
 
 
 def _adapter_catalog(target, http=None, runner=None, which=None) -> dict:
     """Engine lifecycle adapters for a compute target. Real control where the
-    engine exposes it (Ollama warm/evict calls, llama-swap observation,
-    llama.cpp process start/stop) — every external seam (HTTP function,
+    engine exposes it: Ollama warm/evict calls, llama-swap observation,
+    llama.cpp and vLLM process start/stop, ComfyUI readiness plus explicit
+    cache-free between generative jobs, Maya engine-native sessions (no
+    unload primitive — never faked). Every external seam (HTTP function,
     process runner, binary lookup) is injectable so nothing touches the
-    network or spawns a process unless the caller allows it. Everything else
-    is an honest pass-through. Load/unload calls go to the target's
+    network or spawns a process unless the caller allows it. Remaining
+    engines are an honest pass-through. Load/unload calls go to the target's
     user-configured endpoint."""
     root = root_url(target.base_url) or "http://127.0.0.1"
     catalog = {
         "ollama": OllamaLifecycle(base_url=root, http=http),
         "llama-swap": LlamaSwapLifecycle(base_url=root, http=http),
         "llamacpp": LlamaCppServerLifecycle(runner=runner, which=which),
+        "comfyui": ComfyUiLifecycle(base_url=root, http=http),
+        "vllm": VllmServerLifecycle(runner=runner, which=which),
+        "maya": MayaLifecycle(base_url=root, http=http),
     }
     for engine_id in _PASS_THROUGH_ENGINES:
         catalog[engine_id] = _PassThroughLifecycle(engine_id)
@@ -1639,11 +1665,22 @@ def _seed_local_pulls(stack: dict, target) -> None:
 
 def _broker_status(stack: dict, target) -> dict:
     """Honest read-only residency summary: pulled weights with sizes, what is
-    resident now, booked ceilings, and current budget usage."""
+    resident now, booked ceilings with provenance labels, catalog entries
+    that stay unbooked until benched, and current budget usage."""
     ledger = stack["ledger"]
     _seed_local_pulls(stack, target)
     budget = ledger.budget_gb(target.id)
     booked_now = ledger.booked_total_gb(target.id)
+    report = ledger.booking_report()
+    booked_ids = {row["model_id"] for row in report}
+    unbooked = [
+        {"model_id": m.id, "modality": m.modality, "vram_gb": None,
+         "label": BOOKING_SOURCE_NONE, "hint": UNBOOKED_HINT}
+        for m in models_for()
+        if (m.status != "stub" and m.id not in _CATALOG_MARKER_IDS
+            and _declared_floor(m) is None
+            and m.id not in booked_ids)
+    ]
     return {
         "ok": True,
         "action": "status",
@@ -1653,9 +1690,10 @@ def _broker_status(stack: dict, target) -> dict:
                    for r in ledger.pulled(target.id)],
         "resident": [{"model_id": r.model_id, "engine": r.engine,
                       "lane": r.lane} for r in ledger.residents(target.id)],
-        "booked": [{"model_id": model_id, "vram_gb": spec["vram_gb"],
-                    "source": spec["source"]}
-                   for model_id, spec in sorted(stack["bookings"].items())],
+        "booked": [{"model_id": row["model_id"], "vram_gb": row["vram_gb"],
+                    "source": row["source"], "label": row["label"]}
+                   for row in report],
+        "unbooked": unbooked,
         "budget": {
             "nominal_gb": budget,
             "booked_now_gb": round(booked_now, 3),
@@ -1669,8 +1707,9 @@ def _broker_status(stack: dict, target) -> dict:
             for sid, rec in sorted(_ACTIVE_SCOPES.items())
             if rec.get("target_id") == target.id],
         "note": ("Read-only report. " + BOOKING_SOURCE_NOTE
-                 + " Live free VRAM, when sampled, only orders which model "
-                   "loads first — it never gates fit."),
+                 + " Run action=bench to book a measured peak. Live free "
+                   "VRAM, when sampled, only orders which model loads first "
+                   "— it never gates fit."),
     }
 
 
@@ -1755,19 +1794,130 @@ def _broker_release(stack: dict, scope_id: str) -> dict:
     return out
 
 
-def model_forge_broker(args: dict | None = None, **kwargs) -> str:
+# --- measured footprints: the bench window -----------------------------------
+
+# How many VRAM readings action=bench takes, and how far apart. Fixed, not
+# caller-facing knobs (verbs, not knobs) — tests shorten the interval through
+# the module constant.
+_BENCH_SAMPLES = 6
+_BENCH_INTERVAL_S = 0.5
+# Same probe style as hardware.py's nvidia-smi CSV query: guarded binary use,
+# bounded timeout, tolerant line parsing — read-only memory query.
+_NVIDIA_SMI_USED = ("nvidia-smi", "--query-gpu=memory.used",
+                    "--format=csv,noheader,nounits")
+
+
+def gpu_vram_used_gb() -> float:
+    """Live bench sampler: total GPU memory in use across NVIDIA GPUs, in GB
+    (the machine running Model Forge — the same probe scope as the hardware
+    report). Raises on failure; the bench window turns a failing sampler into
+    an honest row, never a guessed peak."""
+    out = subprocess.run(
+        _NVIDIA_SMI_USED, capture_output=True, text=True, timeout=10,
+        check=True).stdout
+    total_mib = 0.0
+    seen = False
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            total_mib += float(line)
+        except ValueError:
+            continue
+        seen = True
+    if not seen:
+        raise ValueError("nvidia-smi returned no readable memory readings")
+    return total_mib / 1024.0
+
+
+def _live_bench_sampler():
+    """(sampler, "") for the live bench window — or (None, honest reason)
+    when this machine has no GPU memory the bench can sample. Fails soft:
+    the action reports the reason instead of guessing a footprint."""
+    hw = probe_hardware()
+    if hw.total_vram_gb <= 0:
+        return None, ("bench measures real GPU memory and no GPU is present "
+                      "on this machine — nothing to measure; run bench "
+                      "where the model is loaded")
+    if shutil.which("nvidia-smi") is None:
+        return None, ("a GPU is present but bench samples GPU memory through "
+                      "nvidia-smi, which is not available on this machine — "
+                      "nothing to sample")
+    return gpu_vram_used_gb, ""
+
+
+def _broker_bench(stack: dict, target, model_id: str, sampler=None) -> dict:
+    """Bench one model's VRAM footprint: measure what runs, book the peak.
+
+    The measurement window samples GPU memory through the VRAM sampler
+    (injectable; live it reads real GPU memory via the hardware-probe
+    nvidia-smi pattern) while the model is resident or being exercised. The
+    observed peak is booked as the model's nominal ceiling through the
+    measured-footprint recorder — a measured peak replaces any published
+    estimate and is never downgraded by one, and the planner gates fit on it
+    from then on. With no GPU to sample the action fails soft with an honest
+    reason; with no valid reading in the window it fails closed — a booked
+    ceiling must be an observation, never a guess."""
+    ledger = stack["ledger"]
+    if sampler is None:
+        sampler, reason = _live_bench_sampler()
+        if sampler is None:
+            return {"ok": False, "action": "bench", "target": target.id,
+                    "model_id": model_id, "error": reason}
+    recorder = MeasuredFootprintRecorder(sampler, model_id, ledger)
+    with recorder:
+        for _ in range(_BENCH_SAMPLES):
+            recorder.sample()
+            time.sleep(_BENCH_INTERVAL_S)
+    row = recorder.recorded or {}
+    if not row.get("ok"):
+        return {"ok": False, "action": "bench", "target": target.id,
+                "model_id": model_id, "samples": recorder.sample_count,
+                "error": row.get("error", "the bench window recorded no "
+                                          "peak"),
+                "note": ("no measured peak was booked — load the model (or "
+                         "exercise it) during the bench window so its VRAM "
+                         "footprint is observable")}
+    stack["bookings"][model_id] = {"vram_gb": row["vram_gb"],
+                                   "source": row["source"], "load_s": None}
+    return {
+        "ok": True,
+        "action": "bench",
+        "target": target.id,
+        "model_id": model_id,
+        "samples": recorder.sample_count,
+        "peak_gb": row["vram_gb"],
+        "label": row["label"],
+        "booking": {"model_id": model_id, "vram_gb": row["vram_gb"],
+                    "source": row["source"], "label": row["label"]},
+        "gates_fit": True,
+        "resident": ledger.is_resident(target.id, model_id),
+        "note": (f"measured peak {row['vram_gb']:g} GB booked as this "
+                 f"model's nominal ceiling ({row['label']}) — the planner "
+                 f"now gates fit on it; measured peaks replace published "
+                 f"estimates and are never downgraded by them"),
+    }
+
+
+def model_forge_broker(args: dict | None = None, sampler=None, **kwargs) -> str:
     """Weight residency and workflow scopes on a compute target. Verbs:
     status (read-only residency summary), claim (take the GPU lane for a
     modality or model — evict per policy, pre-warm, return a scope id with
     honest progress states), release (end a scope and restore what was
-    resident at claim time), plan (dry run of claim — nothing executed)."""
+    resident at claim time), plan (dry run of claim — nothing executed),
+    bench (measure a model's real VRAM peak over a short measurement window
+    and book it as the model's nominal ceiling — measured peaks replace
+    published estimates and are never downgraded). ``sampler`` is a test
+    seam for the bench window's VRAM sampler; the live action samples real
+    GPU memory."""
     args = args or {}
     try:
         action = str(args.get("action") or "").strip()
-        if action not in ("status", "claim", "release", "plan"):
+        if action not in ("status", "claim", "release", "plan", "bench"):
             return _dump({"error": f"unknown action: {action!r}; valid "
                                    f"actions: ['status', 'claim', 'release', "
-                                   f"'plan']"})
+                                   f"'plan', 'bench']"})
         if action == "release":
             scope_id = str(args.get("scope_id") or "").strip()
             if not scope_id:
@@ -1786,6 +1936,15 @@ def model_forge_broker(args: dict | None = None, **kwargs) -> str:
         stack = broker_stack(target)
         if action == "status":
             return _dump(_broker_status(stack, target))
+        if action == "bench":
+            model_id = str(args.get("model_id") or "").strip()
+            if not model_id:
+                return _dump({"error": "model_id required for action=bench: "
+                                       "pass the model id to measure (load "
+                                       "it first, or exercise it during the "
+                                       "bench window)"})
+            return _dump(_broker_bench(stack, target, model_id,
+                                       sampler=sampler))
         entry, err = _claim_entry(str(args.get("model_id") or ""),
                                  str(args.get("modality") or ""))
         if err:
