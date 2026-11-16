@@ -1,17 +1,30 @@
-// Model Forge — cockpit pane.
+// Model Forge — product cockpit pane.
 //
-// Targets + engines + live model counts for every compute target. Target
-// state is the union of both places the plugin keeps it (mirroring the
-// backend's targets.load_targets()):
-//   1. tool-registered targets — what model_forge_target_add persists in the
-//      plugin data dir (plugin-data/model-forge/targets.json), and
-//   2. the "Compute targets" Desktop setting (targets_json) — which wins on
-//      id conflicts, exactly like the backend store.
-// A hardcoded "This machine" default fills in only when neither source
-// declares it. Engine probes run directly against each target's HTTP API
-// (no generation, just /props, /version, /v1/models and friends) with the
-// same fingerprints and probe ports as the plugin's engine adapters. A
-// blocked fetch degrades to a hint row; a source read failure is surfaced,
+// Four sections, all read-only:
+//   1. GPU & compute targets — hardware + targets, with the pointing
+//      invitation (the exact next steps) when nothing is detected yet.
+//   2. Engines — declared (the "Declared engine endpoints" setting,
+//      engines_json: bring your own engine by pointing at its HTTP API) and
+//      detected (live probes of every target's HTTP API).
+//   3. Models — curated rows reusing the model_forge_browse fit data.
+//   4. Installed model storage — the model_forge_storage list shape (names,
+//      sizes, modification times). Read-only: deletion is a tool verb that
+//      rides the human-approval gate, so the pane names the delete verb
+//      honestly instead of offering an in-pane delete.
+//
+// Data doors (documented desktop SDK only):
+//   - plugins.manage list  — the plugin's settings (targets_json, engines_json)
+//   - shell.exec           — the tool-registered targets file in the plugin
+//                            data dir (the backend target store)
+//   - slash.exec           — the read-only /model-forge cockpit command (the
+//                            browse fit data + the model_forge_storage list);
+//                            needs an open chat session, degrades honestly
+//   - fetch()              — live engine probes against each target's own
+//                            HTTP API (no generation: /props, /version,
+//                            /v1/models and friends)
+// Target state is the union of the tool store and the settings field (the
+// settings win on id conflicts, mirroring the backend's targets.load_targets).
+// A blocked fetch degrades to a hint row; a source read failure is surfaced,
 // never silently defaulted away.
 
 import { host, PALETTE_AREA } from "@hermes/plugin-sdk";
@@ -28,11 +41,74 @@ const DEFAULT_TARGETS = [
 const LOCAL_PROBE_PORTS = [8080, 8081, 8000, 8001, 11434, 8188, 30000];
 const PROBE_TIMEOUT_MS = 2500;
 
+// The pointing invitation, pane-side copy (the tools return the same next
+// steps; when the /model-forge bridge answers, its invitation wins).
+const PANE_INVITATION = {
+  reason: "Nothing is detected yet: no compute targets are registered and no inference engine answered the pane's probes.",
+  next_steps: [
+    "Add a cloud GPU or another machine as a compute target with model_forge_target_add (id, base_url, and vram_gb / ram_gb for fit estimates) — the human-approval gate confirms each target before it is used.",
+    "Or declare an engine endpoint in Settings -> Plugins -> Model Forge ('Declared engine endpoints', the engines_json field): each entry is a label plus the engine's HTTP API base URL, and Model Forge probes it everywhere engines are detected.",
+  ],
+};
+
 // Set by the pane on mount so the palette command can force a reload.
 let refreshHook = null;
 
 function rootUrl(base) {
   return String(base || "").replace(/\/+$/, "").replace(/\/v1$/, "");
+}
+
+function fmtBytes(n) {
+  const bytes = Number(n) || 0;
+  if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + " GB";
+  if (bytes >= 1e6) return (bytes / 1e6).toFixed(1) + " MB";
+  if (bytes >= 1e3) return (bytes / 1e3).toFixed(1) + " KB";
+  return bytes + " B";
+}
+
+// --- settings (plugins.manage) -----------------------------------------------
+
+async function readSettings() {
+  // The plugin's settings through the documented read recipe: current values
+  // ride each settings_schema field's `value` (v6 rows), older shims expose an
+  // entries dict. Read failures are surfaced, never silently defaulted away.
+  try {
+    const res = await host.request("plugins.manage", { action: "list" });
+    let rawTargets = null;
+    let rawEngines = null;
+    if (res && Array.isArray(res.plugins)) {
+      const entry = res.plugins.find((r) => r && (r.key === "model-forge" || r.name === "model-forge")) || {};
+      const fields = entry.settings_schema || [];
+      rawTargets = (fields.find((f) => f && f.key === "targets_json") || {}).value;
+      rawEngines = (fields.find((f) => f && f.key === "engines_json") || {}).value;
+    } else {
+      const entries = (res && res.entries) || {};
+      const settings = (entries["model-forge"] || {}).settings || {};
+      rawTargets = settings.targets_json;
+      rawEngines = settings.engines_json;
+    }
+    const targets = (Array.isArray(rawTargets) ? rawTargets : [])
+      .filter((t) => t && t.id && t.base_url)
+      .map((t) => ({
+        id: t.id,
+        label: t.label || t.id,
+        base_url: t.base_url,
+        kind: t.kind || "lan",
+        vram_gb: t.vram_gb || 0,
+        ram_gb: t.ram_gb || 0,
+        source: "settings",
+      }));
+    const declared = (Array.isArray(rawEngines) ? rawEngines : [])
+      .filter((e) => e && /^https?:\/\//.test(String(e.base_url || "")))
+      .map((e) => ({
+        label: String(e.label || e.id || e.base_url),
+        base_url: String(e.base_url).replace(/\/+$/, ""),
+        source: "user-declared",
+      }));
+    return { targets, declared, error: "" };
+  } catch (err) {
+    return { targets: [], declared: [], error: "settings unreadable: " + ((err && err.message) || err) };
+  }
 }
 
 // --- target sources -----------------------------------------------------------
@@ -69,42 +145,10 @@ async function readDataDirTargets() {
   }
 }
 
-async function readSettingsTargets() {
-  try {
-    const res = await host.request("plugins.manage", { action: "list" });
-    // v6 rows: an array of { key, name, settings_schema: [{ key, value }] };
-    // older shims: an entries dict with .settings. Support both shapes.
-    let raw = null;
-    if (res && Array.isArray(res.plugins)) {
-      const entry = res.plugins.find((r) => r && (r.key === "model-forge" || r.name === "model-forge")) || {};
-      const field = (entry.settings_schema || []).find((f) => f && f.key === "targets_json") || {};
-      raw = field.value;
-    } else {
-      const entries = (res && res.entries) || {};
-      raw = ((entries["model-forge"] || {}).settings || {}).targets_json;
-    }
-    const rows = Array.isArray(raw) ? raw : [];
-    const targets = rows
-      .filter((t) => t && t.id && t.base_url)
-      .map((t) => ({
-        id: t.id,
-        label: t.label || t.id,
-        base_url: t.base_url,
-        kind: t.kind || "lan",
-        vram_gb: t.vram_gb || 0,
-        ram_gb: t.ram_gb || 0,
-        source: "settings",
-      }));
-    return { targets, error: "" };
-  } catch (err) {
-    return { targets: [], error: "settings targets unreadable: " + ((err && err.message) || err) };
-  }
-}
-
-async function readTargets() {
+async function readTargets(settingsRows) {
   const [tool, settings] = await Promise.all([
     readDataDirTargets(),
-    readSettingsTargets(),
+    settingsRows ? Promise.resolve({ targets: settingsRows, error: "" }) : readSettings(),
   ]);
   // Merge like targets.load_targets(): tool-registered rows first, settings
   // replace by id (settings win), the local default first only if missing.
@@ -116,6 +160,39 @@ async function readTargets() {
     list = [...DEFAULT_TARGETS, ...list];
   }
   return { targets: list, errors: [tool.error, settings.error].filter(Boolean) };
+}
+
+// --- the /model-forge cockpit bridge (browse fit data + storage list) ---------
+
+async function readCockpitBridge() {
+  // The plugin's read-only /model-forge cockpit command, run through the
+  // documented slash.exec door. It returns the browse fit rows and the
+  // model_forge_storage list shape. Needs an active chat session; without
+  // one (or on any failure) the pane degrades to an honest hint.
+  let sid = null;
+  try {
+    sid = host.state.activeSessionId.get();
+  } catch (err) {
+    sid = null;
+  }
+  if (!sid) {
+    return { data: null, hint: "Model and storage data need an open chat session (the /model-forge cockpit bridge); open a chat and refresh. Or ask for model_forge_browse / model_forge_storage." };
+  }
+  try {
+    const res = await host.request("slash.exec", { session_id: sid, command: "/model-forge cockpit" });
+    if (res && res.error) {
+      return { data: null, hint: "the /model-forge cockpit bridge answered with an error: " + (res.error.message || res.error) };
+    }
+    const raw = String((res && res.output) || "").trim();
+    if (!raw) return { data: null, hint: "the /model-forge cockpit bridge returned no output" };
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== "object") {
+      return { data: null, hint: "the /model-forge cockpit bridge returned an unexpected payload" };
+    }
+    return { data, hint: "" };
+  } catch (err) {
+    return { data: null, hint: "the /model-forge cockpit bridge is unavailable: " + ((err && err.message) || err) };
+  }
 }
 
 // --- engine probes ------------------------------------------------------------
@@ -208,24 +285,46 @@ async function probeTarget(target) {
   perRoot.forEach(({ root, engines: es }) => {
     es.forEach((e) => engines.push({ ...e, root }));
   });
-  if (!engines.some((e) => e.ok)) {
-    const shown = roots.slice(0, 4).join(", ") + (roots.length > 4 ? ", …" : "");
-    engines.push({
-      name: "none detected", ok: false,
-      detail: "no engine answered at " + shown +
-        " (or the app blocked the probe) — use the model_forge_status tool",
-    });
-  }
-  return { target, engines };
+  return { target, roots, engines };
+}
+
+async function probeDeclared(declared) {
+  // A declared engine endpoint is probed exactly like a local engine root —
+  // the bring-your-own-engine path, live.
+  return Promise.all(declared.map(async (row) => {
+    const engines = await probeRoot(rootUrl(row.base_url));
+    return { row, engines };
+  }));
 }
 
 // --- UI -----------------------------------------------------------------------
+
+function SectionTitle(props) {
+  return jsx("div", {
+    style: {
+      margin: "14px 0 4px", fontWeight: 600, fontSize: "12px",
+      textTransform: "uppercase", letterSpacing: "0.04em",
+      color: "var(--ui-text-secondary)",
+    },
+    children: props.children,
+  });
+}
 
 function Row(props) {
   return jsx("div", {
     style: {
       display: "flex", alignItems: "baseline", gap: "8px",
       padding: "4px 0", borderBottom: "1px solid var(--ui-stroke-secondary)",
+    },
+    children: props.children,
+  });
+}
+
+function Hint(props) {
+  return jsx("div", {
+    style: {
+      color: "var(--ui-text-quaternary)", fontSize: "11px",
+      padding: "3px 0", lineHeight: "1.5",
     },
     children: props.children,
   });
@@ -250,16 +349,280 @@ function EngineRow(props) {
   });
 }
 
+function Invitation(props) {
+  const inv = props.invitation;
+  return jsx("div", {
+    style: {
+      margin: "6px 0", padding: "8px",
+      border: "1px solid var(--ui-stroke-secondary)", borderRadius: "6px",
+    },
+    children: [
+      jsx("div", {
+        key: "r",
+        style: { color: "var(--ui-text-secondary)", fontSize: "12px",
+                 fontWeight: 600, marginBottom: "4px" },
+        children: "Point Model Forge at your compute",
+      }),
+      jsx("div", {
+        key: "why",
+        style: { color: "var(--ui-text-secondary)", fontSize: "12px",
+                 marginBottom: "4px" },
+        children: inv.reason,
+      }),
+      ...(inv.next_steps || []).map((step, i) =>
+        jsx("div", {
+          key: "s" + i,
+          style: { color: "var(--ui-text-secondary)", fontSize: "12px",
+                   padding: "2px 0 2px 10px", lineHeight: "1.5" },
+          children: (i + 1) + ". " + step,
+        })),
+    ],
+  });
+}
+
+function TargetSection(props) {
+  const { probed, bridge } = props;
+  const children = [jsx(SectionTitle, { key: "t", children: "GPU & compute targets" })];
+  // GPU hardware comes from the /model-forge cockpit bridge (the backend
+  // hardware probe); without it the pane says so instead of guessing.
+  const local = (bridge && bridge.targets || []).find((t) => t.id === "local");
+  const hw = local && local.hardware;
+  if (hw) {
+    const gpus = (hw.gpus || []).map((g) => (g.name || "GPU") + (g.vram_gb ? " (" + g.vram_gb + " GB)" : "")).join(", ");
+    children.push(jsx("div", {
+      key: "gpu",
+      style: { color: "var(--ui-text-secondary)", fontSize: "12px", padding: "2px 0" },
+      children: "This machine: " +
+        (gpus || "no GPU detected") +
+        (hw.total_vram_gb ? " · " + hw.total_vram_gb + " GB VRAM" : "") +
+        (hw.ram_gb ? " · " + hw.ram_gb + " GB RAM" : "") +
+        (hw.platform ? " · " + hw.platform : ""),
+    }));
+  } else {
+    children.push(jsx(Hint, {
+      key: "gpu",
+      children: "GPU hardware for this machine comes from the model_forge_status probe (the pane bridge needs an open chat session).",
+    }));
+  }
+  probed.forEach((r) => {
+    const t = r.target;
+    children.push(jsx("div", {
+      key: "h-" + t.id,
+      style: { margin: "8px 0 2px", fontWeight: 600 },
+      children: (t.label || t.id) +
+        " · " + (t.kind || "") +
+        (t.vram_gb ? " · " + t.vram_gb + " GB VRAM" : "") +
+        (t.ram_gb ? " · " + t.ram_gb + " GB RAM" : "") +
+        (t.source ? " · " + t.source : ""),
+    }));
+    children.push(jsx("div", {
+      key: "u-" + t.id,
+      style: { color: "var(--ui-text-quaternary)", fontSize: "11px" },
+      children: t.base_url,
+    }));
+  });
+  return children;
+}
+
+function EnginesSection(props) {
+  const { probed, declared } = props;
+  const children = [jsx(SectionTitle, { key: "t", children: "Engines" })];
+  children.push(jsx("div", {
+    key: "dl",
+    style: { color: "var(--ui-text-quaternary)", fontSize: "11px", padding: "2px 0" },
+    children: "Declared engine endpoints (user-declared — Settings -> Plugins -> Model Forge):",
+  }));
+  if (!declared.length) {
+    children.push(jsx(Hint, {
+      key: "dn",
+      children: "None declared. Point Model Forge at any engine HTTP API here (label + base_url) — the bring-your-own-engine path.",
+    }));
+  }
+  declared.forEach((d, i) => {
+    children.push(jsx(Row, {
+      key: "d-" + i,
+      children: [
+        jsx("span", {
+          key: "n",
+          style: { color: "var(--ui-accent)", minWidth: "130px" },
+          children: d.label,
+        }),
+        jsx("span", {
+          key: "u",
+          style: { color: "var(--ui-text-secondary)", fontSize: "12px" },
+          children: d.base_url,
+        }),
+        jsx("span", {
+          key: "s",
+          style: { color: "var(--ui-text-quaternary)", fontSize: "11px" },
+          children: d.source,
+        }),
+      ],
+    }));
+    (d.engines || []).forEach((e, j) => {
+      children.push(jsx(EngineRow, { key: "de-" + i + "-" + j, engine: e }));
+    });
+    if (!(d.engines || []).length) {
+      children.push(jsx(Hint, {
+        key: "dx-" + i,
+        children: "no engine answered at " + d.base_url + " (or the app blocked the probe)",
+      }));
+    }
+  });
+  children.push(jsx("div", {
+    key: "dt",
+    style: { color: "var(--ui-text-quaternary)", fontSize: "11px", padding: "6px 0 2px" },
+    children: "Detected on compute targets:",
+  }));
+  let any = false;
+  probed.forEach((r) => {
+    const okRows = r.engines.filter((e) => e.ok);
+    okRows.forEach((e, i) => { any = true; children.push(jsx(EngineRow, { key: "e-" + r.target.id + "-" + i, engine: e })); });
+    if (!okRows.length) {
+      const shown = r.roots.slice(0, 4).join(", ") + (r.roots.length > 4 ? ", …" : "");
+      children.push(jsx(EngineRow, {
+        key: "e-" + r.target.id + "-none",
+        engine: {
+          name: "none on " + r.target.id, ok: false,
+          detail: "no engine answered at " + shown + " (or the app blocked the probe)",
+        },
+      }));
+    }
+  });
+  return { children, anyDetected: any };
+}
+
+function ModelsSection(props) {
+  const { bridge, bridgeHint } = props;
+  const children = [jsx(SectionTitle, { key: "t", children: "Models (browse fit data)" })];
+  const rows = (bridge && bridge.models) || [];
+  if (!rows.length) {
+    children.push(jsx(Hint, {
+      key: "h",
+      children: "Model fit rows come from model_forge_browse (curated catalog). " +
+        (bridgeHint || "Ask for model_forge_browse, or open a chat session so this pane can load them."),
+    }));
+    return children;
+  }
+  children.push(jsx(Hint, {
+    key: "n",
+    children: "The model_forge_browse fit data (advisory; engines do authoritative memory sizing at launch).",
+  }));
+  rows.forEach((m, i) => {
+    const fit = m.fit || {};
+    children.push(jsx(Row, {
+      key: "m-" + i,
+      children: [
+        jsx("span", {
+          key: "n",
+          style: { minWidth: "150px", color: "var(--ui-text-secondary)" },
+          children: m.name,
+        }),
+        jsx("span", {
+          key: "mod",
+          style: { color: "var(--ui-text-quaternary)", fontSize: "11px", minWidth: "70px" },
+          children: m.modality_label || m.modality,
+        }),
+        jsx("span", {
+          key: "f",
+          style: { color: "var(--ui-accent)", fontSize: "12px", minWidth: "110px" },
+          children: fit.verdict || m.status || "",
+        }),
+        jsx("span", {
+          key: "d",
+          style: { color: "var(--ui-text-secondary)", fontSize: "12px" },
+          children: ((m.engines || []).join(", ") || "") +
+            (m.size_gb ? " · ~" + m.size_gb + " GB" : "") +
+            (fit.advisory ? " — " + fit.advisory : ""),
+        }),
+      ],
+    }));
+  });
+  return children;
+}
+
+function StorageSection(props) {
+  const { bridge, bridgeHint } = props;
+  const children = [jsx(SectionTitle, { key: "t", children: "Installed model storage" })];
+  const storage = bridge && bridge.storage;
+  const entries = (storage && storage.entries) || [];
+  if (!entries.length) {
+    children.push(jsx(Hint, {
+      key: "h",
+      children: "The installed-models list (names, sizes, modification times) comes from model_forge_storage. " +
+        (bridgeHint || "Ask for model_forge_storage, or open a chat session so this pane can load it."),
+    }));
+    return children;
+  }
+  children.push(jsx(Hint, {
+    key: "n",
+    children: storage.note || "Sizes are on-disk sizes; modification times are filesystem times.",
+  }));
+  entries.forEach((e, i) => {
+    children.push(jsx(Row, {
+      key: "s-" + i,
+      children: [
+        jsx("span", {
+          key: "n",
+          style: { minWidth: "150px", color: "var(--ui-text-secondary)" },
+          children: e.name,
+        }),
+        jsx("span", {
+          key: "z",
+          style: { color: "var(--ui-text-secondary)", fontSize: "12px", minWidth: "70px" },
+          children: fmtBytes(e.size_bytes),
+        }),
+        jsx("span", {
+          key: "m",
+          style: { color: "var(--ui-text-quaternary)", fontSize: "11px", minWidth: "150px" },
+          children: e.last_modified || "",
+        }),
+        jsx("span", {
+          key: "r",
+          style: { color: "var(--ui-text-quaternary)", fontSize: "11px" },
+          children: (e.root_label || e.root || "") + (e.type ? " · " + e.type : ""),
+        }),
+      ],
+    }));
+  });
+  // Deletion cannot ride the human-approval gate through a pane data read,
+  // so the pane renders this list read-only and names the delete verb.
+  children.push(jsx(Hint, {
+    key: "del",
+    children: bridge.delete_note ||
+      "Read-only listing. To delete an entry, run the model_forge_storage tool with action=delete and the entry id — the human-approval gate shows the exact path and size first. This pane never deletes files.",
+  }));
+  return children;
+}
+
 function Cockpit(props) {
   const ctx = props.ctx;
-  const [rows, setRows] = useState(null);
-  const [errors, setErrors] = useState([]);
+  const [state, setState] = useState(null);
   const load = () => {
-    readTargets().then(({ targets, errors: errs }) => {
-      setErrors(errs);
-      return Promise.all(targets.map(probeTarget));
-    }).then((probed) => {
-      if (probed) setRows(probed);
+    Promise.all([readSettings(), readCockpitBridge()]).then(([settings, bridge]) => {
+      return readTargets(settings.targets).then(({ targets, errors: errs }) => {
+        return Promise.all([
+          Promise.all(targets.map(probeTarget)),
+          probeDeclared(settings.declared),
+        ]).then(([probed, declaredProbed]) => {
+          const declared = settings.declared.map((row, i) => ({
+            ...row,
+            engines: (declaredProbed[i] && declaredProbed[i].engines) || [],
+          }));
+          setState({
+            probed,
+            declared,
+            bridge: bridge.data,
+            bridgeHint: bridge.hint,
+            errors: [settings.error, ...errs].filter(Boolean),
+          });
+        });
+      });
+    }).catch((err) => {
+      setState({
+        probed: [], declared: [], bridge: null,
+        bridgeHint: "", errors: ["cockpit load failed: " + ((err && err.message) || err)],
+      });
     });
   };
   useEffect(() => {
@@ -271,14 +634,24 @@ function Cockpit(props) {
       disposer();
     };
   }, []);
-  if (!rows) {
+  if (!state) {
     return jsx("div", {
       style: { color: "var(--ui-text-secondary)", padding: "8px" },
-      children: "Probing compute targets…",
+      children: "Loading the Model Forge cockpit…",
     });
   }
+  const engineSection = EnginesSection(state);
+  const anyEngine = engineSection.anyDetected;
+  const anyTarget = state.probed.some((r) => r.target.id !== "local");
+  const localHw = state.bridge && (state.bridge.targets || []).find((t) => t.id === "local");
+  const anyGpu = Boolean(localHw && localHw.hardware && ((localHw.hardware.gpus || []).length || localHw.hardware.total_vram_gb > 0));
+  const gpuKnown = Boolean(localHw);
+  const nothingDetected = !anyTarget && !anyEngine && (!gpuKnown || !anyGpu);
+  const invitation = (state.bridge && state.bridge.invitation) ||
+    (nothingDetected ? PANE_INVITATION : null);
+
   const children = [];
-  errors.forEach((msg, i) => {
+  state.errors.forEach((msg, i) => {
     children.push(jsx("div", {
       key: "err-" + i,
       style: { color: "var(--ui-text-quaternary)", fontSize: "11px",
@@ -286,27 +659,11 @@ function Cockpit(props) {
       children: msg,
     }));
   });
-  rows.forEach((r) => {
-    children.push(jsx("div", {
-      key: "t-" + r.target.id,
-      style: { margin: "10px 0 4px", fontWeight: 600 },
-      children: (r.target.label || r.target.id) +
-        " · " + (r.target.kind || "") +
-        (r.target.vram_gb ? " · " + r.target.vram_gb + " GB VRAM" : "") +
-        (r.target.ram_gb ? " · " + r.target.ram_gb + " GB RAM" : "") +
-        (r.target.source ? " · " + r.target.source : ""),
-    }));
-    children.push(jsx("div", {
-      key: "u-" + r.target.id,
-      style: { color: "var(--ui-text-quaternary)", fontSize: "11px" },
-      children: r.target.base_url,
-    }));
-    r.engines.forEach((e, i) => {
-      children.push(jsx(EngineRow, {
-        key: "e-" + r.target.id + "-" + i, engine: e,
-      }));
-    });
-  });
+  children.push(...TargetSection(state));
+  if (invitation) children.push(jsx(Invitation, { key: "inv", invitation }));
+  children.push(...engineSection.children);
+  children.push(...ModelsSection({ bridge: state.bridge, bridgeHint: state.bridgeHint }));
+  children.push(...StorageSection({ bridge: state.bridge, bridgeHint: state.bridgeHint }));
   return jsx("div", {
     style: { padding: "8px", overflowY: "auto" },
     children,

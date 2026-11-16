@@ -43,13 +43,16 @@ def _entry(mid):
 # --- shared stubs -----------------------------------------------------------
 
 def _stub_hermes_modules(monkeypatch, data_dir: Path):
-    """Point the lazy Hermes imports the handlers reach for at fakes."""
+    """Point the lazy Hermes imports the handlers reach for at fakes, and
+    HOME at a temp dir so the storage inventory never scans the real home."""
     plugins = types.ModuleType("plugins")
     storage = types.ModuleType("plugins.plugin_storage")
     storage.plugin_data_dir = lambda name: data_dir / name
     plugins.plugin_storage = storage
     monkeypatch.setitem(sys.modules, "plugins", plugins)
     monkeypatch.setitem(sys.modules, "plugins.plugin_storage", storage)
+    monkeypatch.setenv("HOME", str(data_dir / "home"))
+    (data_dir / "home").mkdir(exist_ok=True)
 
     cfg_mod = types.ModuleType("hermes_cli.config")
     cfg_mod.load_config_readonly = lambda: {}
@@ -75,7 +78,7 @@ def _ok_engine(monkeypatch, modalities=("chat",)):
                           modalities=modalities)
     monkeypatch.setattr(
         "model_forge.tools.detect_engines",
-        lambda base_url="": [e],
+        lambda base_url="", **kw: [e],
     )
 
 
@@ -460,7 +463,7 @@ def test_status_remote_hw_uses_declared_budget(tmp_path, monkeypatch):
 
     monkeypatch.setattr(tools, "load_targets",
                         lambda: load_targets(base_dir=tmp_path))
-    monkeypatch.setattr(tools, "detect_engines", lambda base_url="": [])
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
     out = json.loads(tools.model_forge_status())
     remote = next(t for t in out["targets"] if t["id"] == "gpu-box")
     # remote target -> declared VRAM, not a live probe
@@ -1077,7 +1080,7 @@ def test_browse_fresh_falsey_strings_skip_network(tmp_path, monkeypatch):
 
     monkeypatch.setattr(tools, "get_target",
                         lambda tid: get_target(tid, base_dir=tmp_path))
-    monkeypatch.setattr(tools, "detect_engines", lambda base_url="": [])
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
 
     def no_network(*a, **k):
         raise AssertionError("the live layer must not run for a falsey arg")
@@ -1310,7 +1313,7 @@ def test_engine_install_approved_flow_runs_and_polls(tmp_path, monkeypatch):
     calls = _installer_spy(monkeypatch)
     monkeypatch.setattr(
         tools, "detect_engines",
-        lambda base_url="": [EngineStatus(
+        lambda base_url="", **kw: [EngineStatus(
             id="ollama", display_name="Ollama", available=True,
             endpoint="http://127.0.0.1:11434", detail="running")])
     out = _simulate_approval_gate(
@@ -1517,12 +1520,16 @@ def test_register_wires_broker_tool_and_hook(tmp_path, monkeypatch):
         def __init__(self):
             self.tools = {}
             self.hooks = []
+            self.commands = {}
 
         def register_tool(self, name, toolset=None, schema=None, handler=None):
             self.tools[name] = (toolset, schema, handler)
 
         def register_hook(self, name, handler):
             self.hooks.append((name, handler))
+
+        def register_command(self, name, handler, description="", args_hint=""):
+            self.commands[name] = (handler, description, args_hint)
 
     ctx = _Ctx()
     mod.register(ctx)
@@ -1532,6 +1539,9 @@ def test_register_wires_broker_tool_and_hook(tmp_path, monkeypatch):
     assert schema is mod.model_forge.schemas.BROKER
     assert callable(handler)
     assert ("pre_tool_call", mod.model_forge.tools.policy_hook) in ctx.hooks
+    # the read-only cockpit data command behind the Desktop pane
+    cmd = ctx.commands.get("model-forge")
+    assert cmd is not None and cmd[0] is mod.model_forge.tools.cockpit_command
     # the catalog manifest lists the tool too
     manifest = (init_path.parent / "plugin.yaml").read_text()
     assert "model_forge_broker" in manifest
@@ -2038,3 +2048,269 @@ def test_broker_stack_threads_injectable_engine_seams(tmp_path, monkeypatch):
     # rides the HTTP seam and spawns no engine process
     assert any(url.endswith("/system_stats") for _, url, _ in http_calls)
     assert spawn_calls == []
+
+# --- settings: declared engine endpoints (extra_roots seam) -------------------
+
+def _stub_settings(monkeypatch, settings: dict):
+    """Point hermes_cli.config at a config carrying the plugin's settings."""
+    cfg_mod = types.ModuleType("hermes_cli.config")
+    cfg_mod.load_config_readonly = lambda: {
+        "plugins": {"entries": {"model-forge": {"settings": settings}}}}
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", cfg_mod)
+
+
+def test_declared_engines_feed_detection_extra_roots(tmp_path, monkeypatch):
+    # settings engines_json -> every detection call carries extra_roots
+    # (the engines.detect_engines seam), with rows normalized and labeled.
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    _stub_settings(monkeypatch, {"engines_json": [
+        {"label": "Workstation vLLM", "base_url": "http://gpu-box.example.com:8000"},
+        {"label": "Trailing slash", "base_url": "http://gpu-box-2.example.com:8080/"},
+        {"label": "Bad row", "base_url": "ftp://nope"},
+        "not-a-dict",
+    ]})
+    from model_forge import tools
+    seen = []
+
+    def fake_detect(base_url="", **kw):
+        seen.append((base_url, kw.get("extra_roots")))
+        return []
+
+    monkeypatch.setattr(tools, "detect_engines", fake_detect)
+    out = json.loads(tools.model_forge_status())
+    assert seen, "detection ran"
+    for base, extra in seen:
+        assert extra == ["http://gpu-box.example.com:8000", "http://gpu-box-2.example.com:8080"]
+    rows = out["declared_engines"]
+    assert [r["label"] for r in rows] == ["Workstation vLLM", "Trailing slash"]
+    assert [r["base_url"] for r in rows] == ["http://gpu-box.example.com:8000",
+                                             "http://gpu-box-2.example.com:8080"]
+    assert all(r["source"] == "user-declared" for r in rows)
+
+
+def test_declared_engines_reach_browse_detection(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    _stub_settings(monkeypatch, {"engines_json": [
+        {"label": "Box", "base_url": "http://gpu-box-3.example.com:8000"}]})
+    from model_forge import tools
+    seen = []
+
+    def fake_detect(base_url="", **kw):
+        seen.append(kw.get("extra_roots"))
+        return []
+
+    monkeypatch.setattr(tools, "detect_engines", fake_detect)
+    out = json.loads(tools.model_forge_browse({"modality": "image",
+                                               "fresh": False}))
+    assert seen and all(extra == ["http://gpu-box-3.example.com:8000"] for extra in seen)
+    assert "models" in out
+
+
+def test_no_declared_engines_passes_no_extra_roots(tmp_path, monkeypatch):
+    # the zero-config path stays exactly the plain auto-detection call
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    seen = []
+
+    def fake_detect(base_url="", **kw):
+        seen.append(kw)
+        return []
+
+    monkeypatch.setattr(tools, "detect_engines", fake_detect)
+    json.loads(tools.model_forge_status())
+    assert seen and all(kw == {} for kw in seen)
+
+
+# --- guided pointing invitation ----------------------------------------------
+
+_NO_GPU = None
+_GPU = None
+
+
+def _profiles():
+    global _NO_GPU, _GPU
+    from model_forge.registry import HardwareProfile
+    if _NO_GPU is None:
+        _NO_GPU = HardwareProfile(gpus=(), total_vram_gb=0.0, ram_gb=0.0,
+                                  platform="linux")
+        _GPU = HardwareProfile(
+            gpus=({"name": "RTX 4090", "vram_gb": 24.0},),
+            total_vram_gb=24.0, ram_gb=64.0, platform="linux")
+    return _NO_GPU, _GPU
+
+
+def test_status_invitation_when_no_gpu_and_no_targets(tmp_path, monkeypatch):
+    # hardware detection finds no GPU and no targets exist -> the tools
+    # return the pointing invitation naming the exact next steps
+    no_gpu, _ = _profiles()
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "probe_hardware", lambda: no_gpu)
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
+    out = json.loads(tools.model_forge_status())
+    inv = out["invitation"]
+    joined = " ".join(inv["next_steps"])
+    assert "model_forge_target_add" in joined
+    assert "cloud GPU" in joined and "another machine" in joined
+    assert "Declared engine endpoints" in joined and "engines_json" in joined
+    assert "no gpu" in inv["reason"].lower()
+    # browse carries the same honest invitation
+    out2 = json.loads(tools.model_forge_browse({"modality": "image",
+                                                "fresh": False}))
+    assert out2["invitation"]["next_steps"] == inv["next_steps"]
+
+
+def test_no_invitation_when_gpu_present(tmp_path, monkeypatch):
+    _, gpu = _profiles()
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "probe_hardware", lambda: gpu)
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
+    out = json.loads(tools.model_forge_status())
+    assert "invitation" not in out
+
+
+def test_no_invitation_when_targets_registered(tmp_path, monkeypatch):
+    no_gpu, _ = _profiles()
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "load_targets",
+                        lambda: load_targets(base_dir=tmp_path))
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "probe_hardware", lambda: no_gpu)
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
+    out = json.loads(tools.model_forge_status())
+    assert "invitation" not in out
+    out2 = json.loads(tools.model_forge_browse({"target": "gpu-box",
+                                                "modality": "image",
+                                                "fresh": False}))
+    assert "invitation" not in out2
+
+
+def test_pointing_invitation_notes_declared_engines():
+    from model_forge.registry import HardwareProfile
+    from model_forge.tools import pointing_invitation
+    no_gpu = HardwareProfile(gpus=(), total_vram_gb=0.0, ram_gb=0.0,
+                             platform="linux")
+    inv = pointing_invitation([_LOCAL], no_gpu,
+                              declared=[{"label": "X",
+                                         "base_url": "http://x:1"}])
+    assert inv is not None
+    assert "already declared" in inv["next_steps"][1]
+    # a GPU or a user target suppresses the invitation entirely
+    assert pointing_invitation([_LOCAL, _REMOTE], no_gpu) is None
+    gpu = HardwareProfile(gpus=({"name": "GPU", "vram_gb": 8.0},),
+                          total_vram_gb=8.0, ram_gb=16.0, platform="linux")
+    assert pointing_invitation([_LOCAL], gpu) is None
+
+
+# --- cockpit data path (the /model-forge command and the Desktop pane) -------
+
+def test_cockpit_command_snapshot_shapes(tmp_path, monkeypatch):
+    no_gpu, _ = _profiles()
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    downloads = tmp_path / "model-forge" / "downloads"
+    model_dir = downloads / "model-a"
+    model_dir.mkdir(parents=True)
+    (model_dir / "w.bin").write_bytes(b"1" * 7)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "probe_hardware", lambda: no_gpu)
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
+    out = json.loads(tools.cockpit_command("cockpit"))
+    assert out["ok"] is True
+    assert isinstance(out["targets"], list) and out["targets"][0]["id"] == "local"
+    assert out["targets"][0]["engines"] == []
+    assert out["declared_engines"] == []
+    # the model section reuses the browse fit data
+    rows = out["models"]
+    assert rows
+    for r in rows:
+        assert "fit" in r and "verdict" in r["fit"] and "modality_label" in r
+    # the storage section is the model_forge_storage list shape
+    by_name = {e["name"]: e for e in out["storage"]["entries"]}
+    entry = by_name["model-a"]
+    assert {"id", "name", "path", "root", "type", "size_bytes",
+            "last_modified"} <= set(entry)
+    assert entry["size_bytes"] == 7
+    assert isinstance(entry["size_bytes"], int)
+    # deletion is named honestly (a tool verb behind the approval gate)
+    assert "model_forge_storage" in out["delete_note"]
+    assert "action=delete" in out["delete_note"]
+    assert "approval" in out["delete_note"]
+
+
+def test_cockpit_command_models_and_storage_subcommands(tmp_path, monkeypatch):
+    no_gpu, _ = _profiles()
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "probe_hardware", lambda: no_gpu)
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
+    models = json.loads(tools.cockpit_command("models image"))
+    assert models["models"]
+    assert all(m["modality"] == "image" for m in models["models"])
+    assert all("fit" in m for m in models["models"])
+    # curated catalog only: the pane read never triggers live discovery
+    bad = json.loads(tools.cockpit_command("models nope"))
+    assert "error" in bad
+    storage = json.loads(tools.cockpit_command("storage"))
+    assert storage["ok"] is True
+    assert isinstance(storage["entries"], list)
+    assert "delete_note" in storage
+    # the cockpit has no delete verb — it names the tool verb instead
+    refused = json.loads(tools.cockpit_command("delete model-a"))
+    assert "error" in refused and "usage" in refused
+    help_text = tools.cockpit_command("help")
+    assert "model_forge_storage" in help_text
+    default = json.loads(tools.cockpit_command(""))
+    assert default["ok"] is True
+
+
+# --- manifest config_schema shapes (Desktop Settings rows) --------------------
+
+def _config_schema_fields(text: str) -> dict:
+    """Stdlib parse of plugin.yaml's config_schema block -> {key: block}."""
+    fields, current = {}, None
+    in_schema = False
+    for line in text.splitlines():
+        if line.startswith("config_schema:"):
+            in_schema = True
+            continue
+        if not in_schema:
+            continue
+        if line and not line.startswith(" "):
+            break
+        if line.startswith("  ") and not line.startswith("   ") \
+                and line.strip().endswith(":"):
+            current = line.strip()[:-1]
+            fields[current] = []
+        elif current is not None:
+            fields[current].append(line)
+    return {k: "\n".join(v) for k, v in fields.items()}
+
+
+def test_config_schema_settings_shapes():
+    manifest = (Path(__file__).resolve().parent.parent
+                / "model-forge" / "plugin.yaml").read_text(encoding="utf-8")
+    fields = _config_schema_fields(manifest)
+    # declared engine endpoints: the bring-your-own-engine list field
+    engines = fields["engines_json"]
+    assert "type: list" in engines
+    assert "default: []" in engines
+    assert "label: \"Declared engine endpoints\"" in engines
+    assert "base_url" in engines and "label" in engines
+    # compute targets stay, and point at the engine field for engine URLs
+    assert "type: list" in fields["targets_json"]
+    assert "Declared engine endpoints" in fields["targets_json"]
+    # optional tokens: secret fields with required: false and env key names;
+    # labels/descriptions say plainly that a token can be pasted or provided
+    # through the Hermes secret store
+    for key, env in (("hf_token", "HF_TOKEN"),
+                     ("modelscope_token", "MODELSCOPE_API_TOKEN")):
+        block = fields[key]
+        assert "type: secret" in block
+        assert "required: false" in block
+        assert f"env: {env}" in block
+        assert "secret store" in block
+        assert "(optional)" in block

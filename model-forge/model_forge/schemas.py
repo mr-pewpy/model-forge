@@ -6,8 +6,14 @@ STATUS = {
         "Report every compute target (this machine, a remote host, a cloud GPU) "
         "with its GPUs, VRAM, RAM, and which local inference engines are "
         "running there (llama.cpp, Ollama, Strata, Maya, ...) and what models "
-        "they have loaded. Use when the user asks what runs locally, what "
-        "their hardware can handle, or where their GPUs are."
+        "they have loaded — plus the user-declared engine endpoints (Settings "
+        "-> Plugins -> Model Forge) and the installed model-storage listing "
+        "(names, sizes, modification times). When hardware detection finds no "
+        "GPU and no compute targets exist, the response carries an invitation "
+        "naming the exact next steps (model_forge_target_add, or declare an "
+        "engine endpoint in settings) instead of a bare empty state. Use when "
+        "the user asks what runs locally, what their hardware can handle, or "
+        "where their GPUs are."
     ),
     "parameters": {
         "type": "object",
@@ -20,9 +26,12 @@ BROWSE = {
     "description": (
         "Browse local AI models by modality (chat, vision, ocr, image, "
         "image_edit, video, 3d, music, sfx, voice_clone, world_model) with an "
-        "advisory hardware fit verdict for a compute target. Use when the "
-        "user wants to run something locally and asks what model to use, "
-        "what fits their GPU, or what a modality needs."
+        "advisory hardware fit verdict for a compute target. When hardware "
+        "detection finds no GPU and no compute targets exist, the response "
+        "carries an invitation naming the exact next steps "
+        "(model_forge_target_add, or declare an engine endpoint in settings). "
+        "Use when the user wants to run something locally and asks what model "
+        "to use, what fits their GPU, or what a modality needs."
     ),
     "parameters": {
         "type": "object",

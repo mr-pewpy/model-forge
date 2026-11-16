@@ -59,6 +59,19 @@ def register(ctx):
         schema=schemas.BROKER,
         handler=tools.model_forge_broker,
     )
+    # Read-only cockpit data command: the Desktop cockpit pane renders this
+    # JSON (through the documented slash.exec door), and it doubles as a
+    # chat/CLI diagnostic (/model-forge [cockpit|models [modality]|storage]).
+    # Read-only by design — mutating verbs are the tools above, which ride
+    # the human-approval gate through policy_hook.
+    ctx.register_command(
+        "model-forge",
+        tools.cockpit_command,
+        description=("Model Forge cockpit: compute targets, GPU hardware, "
+                     "declared + detected engines, model fit data, and model "
+                     "storage (read-only)."),
+        args_hint="[cockpit|models [modality]|storage]",
+    )
     # Policy gate: registering a compute target, rewriting the default model
     # config, deleting a model-storage entry, and running a vendor engine
     # installer (model_forge_install action=engine_install, execute=true) are

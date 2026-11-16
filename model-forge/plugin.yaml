@@ -15,11 +15,27 @@ config_schema:
     default: []
     label: "Compute targets"
     description: >-
-      Extra compute targets as JSON, e.g. [{"id": "remote-1", "label": "Remote
-      target", "base_url": "http://<host>:<port>", "kind": "lan", "vram_gb":
-      <VRAM>, "ram_gb": <RAM>}]. The model_forge_target_add tool stores targets too (it
-      asks for your approval first); entries here win on id conflicts.
-      'local' is always present.
+      Machines with GPUs where models run, as JSON, e.g. [{"id": "remote-1",
+      "label": "Remote target", "base_url": "http://<host>:<port>", "kind":
+      "lan", "vram_gb": <VRAM>, "ram_gb": <RAM>}]. The
+      model_forge_target_add tool stores targets too (it asks for your
+      approval first); entries here win on id conflicts. 'local' is always
+      present. To just point at an engine's HTTP API (no GPU budget to
+      declare), use Declared engine endpoints below instead.
+  engines_json:
+    type: list
+    default: []
+    label: "Declared engine endpoints"
+    description: >-
+      Point Model Forge at any inference engine HTTP API that automatic
+      detection may not find — the bring-your-own-engine path. JSON list of
+      {"label": "...", "base_url": "http://<host>:<port>"} entries, e.g.
+      [{"label": "Workstation vLLM", "base_url": "http://gpu-box.example.com:8000"}].
+      Every declared endpoint is probed wherever engines are detected
+      (status, browse, install, activate) and reported as user-declared
+      alongside auto-detected engines. Use Compute targets above when the
+      machine's GPU/VRAM should price model fit; use this field when you
+      only have an engine URL.
   download_roots:
     type: list
     default: []
@@ -32,17 +48,25 @@ config_schema:
   hf_token:
     type: secret
     env: HF_TOKEN
-    label: "Hugging Face token"
+    required: false
+    label: "Hugging Face token (optional)"
     description: >-
-      Optional. Authenticated pulls from huggingface.co — unlocks gated repos
-      and full-speed downloads. Sent only to huggingface.co hosts.
+      Optional. Paste a token here or provide it through Hermes' secret store
+      — either way it is kept in the Hermes secret store under HF_TOKEN (never
+      in config files) and read only through the secret scope. Unlocks gated
+      Hugging Face repos and full-speed pulls. Sent only to huggingface.co
+      hosts. Leave empty to pull anonymously.
   modelscope_token:
     type: secret
     env: MODELSCOPE_API_TOKEN
-    label: "ModelScope token"
+    required: false
+    label: "ModelScope token (optional)"
     description: >-
-      Optional. Authenticated pulls from ModelScope mirrors. Sent only to
-      modelscope.cn hosts.
+      Optional. Paste a token here or provide it through Hermes' secret store
+      — either way it is kept in the Hermes secret store under
+      MODELSCOPE_API_TOKEN (never in config files) and read only through the
+      secret scope. Authenticated pulls from ModelScope mirrors. Sent only to
+      modelscope.cn hosts. Leave empty to pull anonymously.
 provides_tools:
   - model_forge_status
   - model_forge_browse

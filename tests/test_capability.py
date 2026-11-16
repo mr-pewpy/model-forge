@@ -46,6 +46,10 @@ def _stub_hermes_modules(monkeypatch, data_dir: Path):
     monkeypatch.setitem(sys.modules, "plugins", plugins)
     monkeypatch.setitem(sys.modules, "plugins.plugin_storage", storage)
 
+    cfg_mod = types.ModuleType("hermes_cli.config")
+    cfg_mod.load_config_readonly = lambda: {}
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", cfg_mod)
+
 
 def _detected(monkeypatch, ids):
     """Make tools.detect_engines report exactly these available engine ids."""
@@ -53,7 +57,7 @@ def _detected(monkeypatch, ids):
                         endpoint="http://gpu-box.example.com:8080/v1")
            for i in ids]
     monkeypatch.setattr("model_forge.tools.detect_engines",
-                        lambda base_url="": sts)
+                        lambda base_url="", **kw: sts)
 
 
 # --- engine-aware fit verdicts ----------------------------------------------
@@ -642,3 +646,33 @@ def test_install_plan_fallback_names_engine_install_for_provisionable_engines():
     assert "engine_install" in plan["engine_note"]
     assert "never installs llama.cpp binaries" in plan["engine_note"]
     assert "Local Models" in plan["engine_note"]
+
+
+# --- cockpit models reuse the browse fit data --------------------------------
+
+def test_cockpit_models_reuses_browse_fit_data(tmp_path, monkeypatch):
+    # the Desktop pane's model section renders the model_forge_browse fit
+    # data: cockpit rows must be exactly the browse rows (same fit blocks),
+    # priced against the same target and detected engines.
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+    from model_forge.targets import load_targets as load_targets_store
+    monkeypatch.setattr(tools, "load_targets",
+                        lambda: load_targets_store(base_dir=tmp_path))
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "probe_hardware", lambda: _BIG)
+    _detected(monkeypatch, ["comfyui"])
+    # both priced against the local target with the same hardware + engines
+    browse = json.loads(tools.model_forge_browse(
+        {"modality": "3d", "fresh": False}))
+    cockpit = tools.cockpit_models("3d")
+    assert [m["id"] for m in cockpit["models"]] == \
+        [m["id"] for m in browse["models"]]
+    for a, b in zip(cockpit["models"], browse["models"]):
+        assert a["fit"] == b["fit"]
+        assert a["engines"] == b["engines"]
+    # fit blocks carry the verdict + advisory the pane renders
+    fit = cockpit["models"][0]["fit"]
+    assert fit["verdict"] and "advisory" in fit

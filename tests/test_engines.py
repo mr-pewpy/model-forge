@@ -1,5 +1,6 @@
 """Engine-adapter tests (llama.cpp/Ollama, Strata, Maya, ComfyUI, vLLM, SGLang,
-openai-compatible, plus the base helpers and the detect_engines aggregator).
+Exo, openai-compatible, plus the base helpers, the detect_engines aggregator
+and its user-declared extra_roots seam).
 
 Every adapter probes local engines over stdlib urllib (no auth assumed), so a
 single fake ``urllib.request.urlopen`` that dispatches on the requested path
@@ -20,6 +21,7 @@ import pytest
 
 from model_forge.engines import (
     comfyui,
+    exo,
     llamacpp,
     maya,
     openai_compat,
@@ -168,9 +170,9 @@ def test_detect_engines_catches_probe_errors(monkeypatch):
 
 # --- detect_engines parallelism: dead targets must not stall ------------------
 def test_detect_engines_probes_detectors_in_parallel(monkeypatch):
-    # every call burns a stand-in for a dead-connection timeout; seven
-    # sequential detectors would sum to >= 2.1 s here, while the concurrent
-    # aggregator must finish near the slowest single detector chain (~0.6 s)
+    # every call burns a stand-in for a dead-connection timeout; eight
+    # sequential detectors would sum to >= 3.0 s here, while the concurrent
+    # aggregator must finish near the slowest single detector chain (~0.9 s)
     delay = 0.3
     lock = threading.Lock()
     calls = []
@@ -185,9 +187,9 @@ def test_detect_engines_probes_detectors_in_parallel(monkeypatch):
     start = time.monotonic()
     out = detect_engines("http://x:1")
     elapsed = time.monotonic() - start
-    assert len(calls) == 7          # every adapter probed exactly once-chain
-    assert len(out) == 7            # and every detector still yields a row
-    assert elapsed < 1.5            # sequential would be >= 2.1 s
+    assert len(calls) == 10         # every adapter probed exactly once-chain
+    assert len(out) == 8            # and every detector still yields a row
+    assert elapsed < 1.5            # sequential would be >= 3.0 s
 
 
 def test_detect_engines_order_stable_when_probes_finish_out_of_order(monkeypatch):
@@ -206,7 +208,7 @@ def test_detect_engines_order_stable_when_probes_finish_out_of_order(monkeypatch
     out = detect_engines("http://x:1")
     ids = [e.id for e in out]
     assert ids == ["llamacpp", "strata", "maya", "comfyui", "vllm", "sglang",
-                   "openai-compatible"]
+                   "exo", "openai-compatible"]
     assert ids.index("llamacpp") < ids.index("sglang")
 
 
@@ -540,3 +542,194 @@ def test_maya_api_dead_returns_none(monkeypatch):
     assert maya.catalog("http://x:1") is None
     assert maya.loaded("http://x:1") == []
     assert maya.pull("glm", "http://x:1") is None
+
+
+# --- exo ---------------------------------------------------------------------
+def test_exo_detect_fingerprint_node_id(monkeypatch):
+    # the documented exo meta endpoint (docs/api.md §1): GET /node_id answers
+    # the node identity as a bare JSON string — with it, "exo" is claimed
+    _install_urlopen(monkeypatch, {
+        "/node_id": json.dumps("3f9c2a7e1b5d4c8e9a0f6b2d7c4e1a3b").encode(),
+        "/v1/models": json.dumps({"object": "list", "data": [
+            {"id": "mlx-community/Llama-3.2-1B-Instruct-4bit"}]}).encode(),
+        "/openapi.json": json.dumps(
+            {"paths": {"/v1/images/generations": {}}}).encode(),
+    })
+    st = exo.detect("http://x:1")
+    assert st.id == "exo" and st.available is True
+    assert st.endpoint == "http://x:1"
+    assert st.models_loaded == ("mlx-community/Llama-3.2-1B-Instruct-4bit",)
+    assert "image" in st.modalities and "image_edit" in st.modalities
+
+
+def test_exo_detect_fingerprint_state_fallback(monkeypatch):
+    # /node_id gone (404): the cluster state object is the fallback fingerprint
+    _install_urlopen(monkeypatch, {
+        "/node_id": 404,
+        "/state": json.dumps({"topology": {"nodes": []}, "instances": {},
+                              "deployments": {}}).encode(),
+        "/v1/models": json.dumps({"object": "list", "data": []}).encode(),
+    })
+    st = exo.detect("http://x:1")
+    assert st.id == "exo" and st.available is True
+
+
+def test_exo_fingerprint_never_from_models_or_healthcheck(monkeypatch):
+    # a generic /v1/models list — and a generic /healthcheck — are NOT proof
+    _install_urlopen(monkeypatch, {
+        "/v1/models": json.dumps({"object": "list",
+                                  "data": [{"id": "m1"}]}).encode(),
+        "/healthcheck": json.dumps({"status": "ok"}).encode(),
+    })
+    assert exo.exo_fingerprint("http://x:1") is False
+
+
+def test_exo_detect_generic_models_not_mislabeled(monkeypatch):
+    # /v1/models alone: never an 'exo' row — the honest generic row instead
+    _install_urlopen(monkeypatch, {
+        "/v1/models": json.dumps({"object": "list",
+                                  "data": [{"id": "m1"}]}).encode(),
+    })
+    st = exo.detect("http://x:1")
+    assert not (st.id == "exo" and st.available)
+    assert st.id == "openai-compatible" and st.available is True
+    assert "identity unknown" in st.detail
+
+
+def test_exo_detect_dead(monkeypatch):
+    _install_urlopen(monkeypatch, {})
+    st = exo.detect("http://x:1")
+    assert st.id == "exo" and st.available is False
+    assert "no exo answering" in st.detail
+
+
+def test_exo_detect_local_default_root(monkeypatch):
+    # stock exo serves the dashboard and API on :52415 — the local probe
+    # covers that default endpoint
+    assert exo.DEFAULT_ROOT == "http://127.0.0.1:52415"
+    _install_urlopen(monkeypatch, {
+        "52415/node_id": json.dumps("abc123").encode(),
+        "52415/v1/models": json.dumps({"object": "list",
+                                       "data": [{"id": "m"}]}).encode(),
+    })
+    st = exo.detect()
+    assert st.id == "exo" and st.available is True
+    assert st.endpoint == "http://127.0.0.1:52415"
+
+
+def test_detect_engines_exo_named_suppresses_generic(monkeypatch):
+    # an exo fingerprint at the endpoint drops the generic openai-compatible
+    # row for that same endpoint (same server)
+    _install_urlopen(monkeypatch, {
+        "52415/node_id": json.dumps("abc123").encode(),
+        "52415/v1/models": json.dumps({"object": "list",
+                                       "data": [{"id": "m"}]}).encode(),
+    })
+    monkeypatch.setattr(strata.shutil, "which", lambda _: None)
+    out = detect_engines("")
+    exo_rows = [e for e in out if e.id == "exo" and e.available]
+    assert len(exo_rows) == 1
+    for e in out:
+        if e.id == "openai-compatible" and e.available:
+            assert e.endpoint != "http://127.0.0.1:52415"
+
+
+# --- detect_engines: user-declared roots (extra_roots) -----------------------
+def test_extra_roots_probes_declared_roots_and_labels_rows(monkeypatch):
+    seen = []
+    lock = threading.Lock()
+
+    def _fake(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        with lock:
+            seen.append(url)
+        raise urllib.error.URLError("no route in test")
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake)
+    out = detect_engines("http://auto:1", extra_roots=["http://decl:9000"])
+    # the declared root was actually probed, alongside the base endpoint
+    assert any(u.startswith("http://decl:9000/") for u in seen)
+    assert any(u.startswith("http://auto:1/") for u in seen)
+    # every declared-root row carries the provenance label; base rows do not
+    declared = [e for e in out if e.source == "user-declared"]
+    base = [e for e in out if e.source != "user-declared"]
+    assert len(declared) == 8 and len(base) == 8
+    assert not any(e.source == "user-declared" for e in base)
+
+
+def test_extra_roots_fingerprint_first_and_generic_dropped(monkeypatch):
+    # a declared root with an exo fingerprint: the named row is reported as
+    # user-declared, and the generic row for that endpoint is dropped
+    _install_urlopen(monkeypatch, {
+        "decl:9000/node_id": json.dumps("abc123").encode(),
+        "decl:9000/v1/models": json.dumps({"object": "list",
+                                           "data": [{"id": "m1"}]}).encode(),
+    })
+    out = detect_engines("http://auto:1", extra_roots=["http://decl:9000"])
+    declared = [e for e in out if e.source == "user-declared"]
+    named = [e for e in declared if e.id == "exo" and e.available]
+    assert len(named) == 1
+    assert named[0].endpoint == "http://decl:9000"
+    assert named[0].models_loaded == ("m1",)
+    assert not any(e.id == "openai-compatible" and e.available
+                   and e.endpoint == "http://decl:9000" for e in declared)
+
+
+def test_extra_roots_generic_never_mislabeled(monkeypatch):
+    # a declared root serving only generic /v1/models: one honest generic
+    # row labeled user-declared — never an 'exo' claim
+    _install_urlopen(monkeypatch, {
+        "decl:9000/v1/models": json.dumps({"object": "list",
+                                           "data": [{"id": "m1"}]}).encode(),
+    })
+    out = detect_engines("http://auto:1", extra_roots=["http://decl:9000"])
+    declared = [e for e in out if e.source == "user-declared"]
+    assert not any(e.id == "exo" and e.available for e in declared)
+    generic = [e for e in declared if e.id == "openai-compatible"
+               and e.available and e.endpoint == "http://decl:9000"]
+    assert len(generic) == 1
+    assert "identity unknown" in generic[0].detail
+
+
+def test_extra_roots_dedupes_repeated_and_skips_empty(monkeypatch):
+    seen = []
+
+    def _fake(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        seen.append(url)
+        raise urllib.error.URLError("no route in test")
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake)
+    out = detect_engines("http://auto:1",
+                         extra_roots=["http://decl:9000", "", "http://decl:9000/"])
+    declared = [e for e in out if e.source == "user-declared"]
+    # repeated and empty declarations probe the root once and yield one group
+    assert len(declared) == 8
+    assert sum(1 for u in seen if u.startswith("http://decl:9000/")) == 10
+
+
+def test_extra_roots_absent_behavior_is_unchanged(monkeypatch):
+    # with the parameter absent (or empty), no declared root is probed and
+    # the rows are exactly the base detection result
+    seen = []
+    lock = threading.Lock()
+
+    def _fake(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        with lock:
+            seen.append(url)
+        if url.endswith("/props"):
+            return _Resp(json.dumps(
+                {"build_info": "x", "model_path": "m.gguf"}).encode())
+        if url.endswith("/v1/models"):
+            return _Resp(json.dumps({"data": [{"id": "m1"}]}).encode())
+        raise urllib.error.URLError("no route in test")
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake)
+    plain = detect_engines("http://x:1")
+    explicit_none = detect_engines("http://x:1", extra_roots=None)
+    explicit_empty = detect_engines("http://x:1", extra_roots=[])
+    assert plain == explicit_none == explicit_empty
+    assert not any(e.source == "user-declared" for e in plain)
+    # no probe ever left the base endpoint
+    assert all(u.startswith("http://x:1/") for u in seen)

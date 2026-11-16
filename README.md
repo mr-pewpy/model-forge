@@ -48,7 +48,7 @@ run through a user-configured OpenAI-compatible media gateway.
 
 | Tool | What it does |
 |------|--------------|
-| `model_forge_status` | GPUs, VRAM, RAM, engines per compute target, pull credentials |
+| `model_forge_status` | GPUs, VRAM, RAM, engines per compute target, declared engine endpoints (settings), model-storage listing, pull credentials — plus the pointing invitation (exact next steps) when no GPU and no compute targets exist |
 | `model_forge_browse` | Models by modality with an advisory fit verdict per target, plus a live HuggingFace "fresh" section (`fresh=false` = curated only) |
 | `model_forge_target_add` | Register a compute target (a remote host, a cloud instance) — asks for your approval first |
 | `model_forge_install` | Pull a model: plugin-side HF download (sha256, resume, job polling), a running Maya's HTTP pull, or the exact engine CLI command to run yourself; provision an engine (`action=engine_install`) from its vendor's official installer after your approval |
@@ -59,8 +59,50 @@ run through a user-configured OpenAI-compatible media gateway.
 
 Plus `tts/model_forge_tts.py` — a config-driven TTS/voice-clone command
 provider for any OpenAI-style `/v1/audio/speech` endpoint (see `tts/`), and
-a **cockpit desktop pane** (`model-forge-desktop/`) showing every compute
-target with live engine probes and model counts.
+a **cockpit desktop pane** (`model-forge-desktop/`) — the product cockpit:
+GPU/compute targets (with the pointing invitation when nothing is detected),
+declared + detected engines, model rows reusing the `model_forge_browse` fit
+data, and installed model storage in the `model_forge_storage` list shape
+(names, sizes, modification times). The pane is read-only: deletion is a
+tool verb that rides the human-approval gate, so the pane names the delete
+verb (`model_forge_storage` `action=delete`) instead of deleting in-pane.
+Its data door is the read-only **`/model-forge`** command
+(`cockpit`, `models [modality]`, `storage`) — also handy in chat and the
+CLI, and always read-only.
+
+## Point Model Forge at your compute (guided pointing)
+
+When hardware detection finds no GPU and no compute targets are registered,
+`model_forge_status` and `model_forge_browse` do not return a bare empty
+state — they carry an honest **invitation** naming the exact next steps:
+
+1. **Add a cloud GPU or another machine as a compute target** with
+   `model_forge_target_add` (`id`, `base_url`, `vram_gb` / `ram_gb` for fit
+   estimates) — the human-approval gate confirms each target before it is
+   used. Use this when the machine's GPU/VRAM should price model fit.
+2. **Or declare an engine endpoint in settings** — the bring-your-own-engine
+   path below. Use this when you only have an engine URL.
+
+The Desktop cockpit pane shows the same invitation in its targets section.
+
+## Bring your own engine endpoint (declared engines)
+
+Already running an inference engine somewhere — a workstation vLLM, a
+headless llama.cpp box, anything with an HTTP API? Point Model Forge at it
+directly: **Settings → Plugins → Model Forge → "Declared engine endpoints"**
+(`engines_json`) is a JSON list of `{"label": "...", "base_url":
+"http://<host>:<port>"}` entries. Every declared endpoint is probed
+wherever engines are detected (`model_forge_status`, `model_forge_browse`,
+`model_forge_install`, `model_forge_activate`) and reported as
+**user-declared** alongside the auto-detected engines, so install plans,
+fit verdicts and activation see it as available.
+
+Declared engine endpoints are deliberately different from **compute
+targets** (`targets_json`, `model_forge_target_add`): a target is a machine
+with GPUs whose VRAM/RAM budget prices model fit and where media jobs may
+run; a declared endpoint is just an engine API to probe and use. Add a
+target when fit estimates should account for the hardware; declare an
+endpoint when you only have the URL.
 
 ## One GPU lane, many models (weight residency)
 
@@ -187,11 +229,13 @@ This repo also ships three provider packages:
 - **Hugging Face token** (`HF_TOKEN`) — unlocks gated repos, full-speed pulls
 - **ModelScope token** (`MODELSCOPE_API_TOKEN`) — authenticated mirror pulls
 
-Both are optional; without them everything public still works. Tokens are
-stored through Hermes' credential route (never in config files), read only
-via the secret scope, and sent **only** to their own host family
-(`huggingface.co` / `modelscope.cn` — enforced in code, unit-tested).
-`model_forge_status` reports which tokens are configured (booleans only).
+Both are optional; without them everything public still works. Paste a token
+into the masked field or provide it through Hermes' secret store — either
+way it lands in the same secret store entry (keyed by the field's env name,
+never in config files), is read only via the secret scope, and is sent
+**only** to its own host family (`huggingface.co` / `modelscope.cn` —
+enforced in code, unit-tested). `model_forge_status` reports which tokens
+are configured (booleans only).
 
 ## Known limits
 
@@ -270,7 +314,8 @@ Honest scoping — current limits, and what does not work yet:
   download job records, and discovery caches under its own plugin data dir;
   `download_roots` (**Settings → Plugins**) can widen where downloads land
   (symlinks refused). Reads: your Hermes config, read-only, for
-  `targets_json`, `download_roots`, and the plugin's settings; a local image
+  `targets_json`, `engines_json`, `download_roots`, and the plugin's
+  settings; a local image
   file only when you pass one to `model_forge_generate_media` — behind the
   Hermes read-block check, image magic bytes, and a 25 MB cap; and the TTS
   helper reads the `--in` text file and `--reference` audio file from
@@ -279,7 +324,10 @@ Honest scoping — current limits, and what does not work yet:
   directory and in your engine-managed model directories (the Ollama models
   dir and the HuggingFace hub cache under your home directory);
   `model_forge_storage` with `action=delete` removes the user-approved files
-  and folders from those roots.
+  and folders from those roots. The `/model-forge` cockpit command and the
+  Desktop cockpit pane are read-only: they return the same inventory data
+  (never delete or write) and the pane issues the same read-only engine
+  probes from the app.
 - **Approvals:** four actions escalate to Hermes' human-approval gate and
   fail closed on denial or timeout — registering a compute target, writing
   the default model config (`model_forge_activate` with `apply=true`),

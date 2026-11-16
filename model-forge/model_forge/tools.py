@@ -223,6 +223,105 @@ def _hw_for_target(target: ComputeTarget):
                            ram_gb=target.ram_gb, platform=target.kind)
 
 
+# --- user-declared engine endpoints (Desktop settings) -----------------------
+
+def _settings_engines() -> list[dict]:
+    """Engine endpoints the user declared in Desktop Settings -> Plugins ->
+    Model Forge (config_schema ``engines_json``): the bring-your-own-engine
+    path — point Model Forge at any engine HTTP API.
+
+    Returns normalized rows [{"label", "base_url", "source": "user-declared"}].
+    Rows without a usable http(s) base_url are skipped fail-soft (a malformed
+    settings row must never sink a tool call); anything unusual in the config
+    read degrades to "no declared engines", never an error. Stdlib-only."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        entries = (cfg.get("plugins") or {}).get("entries") or {}
+        settings = (entries.get("model-forge") or {}).get("settings") or {}
+        rows = settings.get("engines_json") or []
+    except Exception:  # noqa: BLE001 — outside a Hermes process, or unreadable
+        return []
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        base_url = str(row.get("base_url") or "").strip().rstrip("/")
+        if not (base_url.startswith("http://") or base_url.startswith("https://")):
+            continue
+        out.append({"label": str(row.get("label") or row.get("id") or base_url),
+                    "base_url": base_url, "source": "user-declared"})
+    return out
+
+
+def declared_engine_roots() -> list[str]:
+    """The extra_roots seam input: base URLs of user-declared engine endpoints
+    (deduplicated, order kept)."""
+    seen, out = set(), []
+    for row in _settings_engines():
+        if row["base_url"] not in seen:
+            seen.add(row["base_url"])
+            out.append(row["base_url"])
+    return out
+
+
+def _detect(base_url: str):
+    """Engine detection with the user-declared engine endpoints folded in.
+
+    ``engines.detect_engines`` takes ``extra_roots`` (user-declared engine
+    base URLs) and labels the rows it finds there ``source: user-declared``;
+    auto-detected rows are unchanged. ``extra_roots`` is passed only when the
+    user actually declared endpoints, so the zero-config path is exactly the
+    plain auto-detection call."""
+    extra = declared_engine_roots()
+    if extra:
+        return detect_engines(base_url, extra_roots=extra)
+    return detect_engines(base_url)
+
+
+# --- the pointing invitation (honest empty state) ----------------------------
+
+# What to tell a user who has no GPU and no compute targets yet. Product
+# copy: name the exact next steps (the tool/action, and the settings field).
+POINTING_INVITATION_STEPS = (
+    "Add a cloud GPU or another machine as a compute target with "
+    "model_forge_target_add (id, base_url, and vram_gb / ram_gb for fit "
+    "estimates) — the human-approval gate confirms each target before it "
+    "is used.",
+    "Or declare an engine endpoint in Settings -> Plugins -> Model Forge "
+    "('Declared engine endpoints', the engines_json field): each entry is "
+    "a label plus the engine's HTTP API base URL, and Model Forge probes "
+    "it everywhere engines are detected.",
+)
+
+def pointing_invitation(targets, hw, declared=None) -> dict | None:
+    """The guided pointing flow's invitation — or None when the setup already
+    has compute.
+
+    Emitted exactly when hardware detection finds no GPU on this machine and
+    no compute targets are registered (the built-in 'local' row does not
+    count): instead of a bare empty state, the caller gets an honest
+    invitation naming the exact next steps — register a compute target via
+    model_forge_target_add, or declare an engine endpoint in settings. When
+    engine endpoints are already declared, the invitation says so instead of
+    telling the user to redo it. Pure: no I/O."""
+    has_gpu = bool(getattr(hw, "gpus", ()) or getattr(hw, "total_vram_gb", 0.0) > 0)
+    user_targets = [t for t in targets
+                    if getattr(t, "id", None) not in ("", "local")]
+    if has_gpu or user_targets:
+        return None
+    steps: list[str] = list(POINTING_INVITATION_STEPS)
+    if declared:
+        steps[1] = (steps[1] + f" ({len(declared)} endpoint(s) already "
+                    f"declared — Model Forge probes them automatically.)")
+    return {
+        "reason": "No GPU was detected on this machine and no compute "
+                  "targets are registered, so there is nothing to price "
+                  "models against yet.",
+        "next_steps": steps,
+    }
+
+
 # --- pure planners -----------------------------------------------------------
 
 def _engine_listing(m: ModelEntry) -> list[str]:
@@ -512,7 +611,7 @@ def _confirm_engine(engine_id: str) -> dict:
     """Re-run engine detection after an installer exits — the install is
     confirmed by detection, never assumed from the installer's exit code."""
     try:
-        statuses = detect_engines("")
+        statuses = _detect("")
     except Exception as exc:  # noqa: BLE001 — honest, not fatal
         return {"detected": False,
                 "detail": f"engine detection failed after the install: "
@@ -617,43 +716,97 @@ def start_engine_install(engine_id: str, runner=None) -> dict:
 # --- tools -------------------------------------------------------------------
 
 def model_forge_status(args: dict | None = None, **kwargs) -> str:
-    """Hardware + engine inventory across all compute targets."""
+    """Cockpit inventory: hardware + engine inventory across all compute
+    targets, the user-declared engine endpoints (settings), the
+    model-storage listing (the model_forge_storage shape: sizes and
+    modification times), and — when hardware detection finds no GPU and no
+    compute targets exist — the pointing invitation naming the exact next
+    steps instead of a bare empty state."""
     try:
-        targets_out = []
-        for t in load_targets():
-            hw = _hw_for_target(t)
-            targets_out.append({
-                "id": t.id,
-                "label": t.label,
-                "kind": t.kind,
-                "base_url": t.base_url,
-                "hardware": {
-                    "platform": hw.platform,
-                    "gpus": list(hw.gpus),
-                    "total_vram_gb": hw.total_vram_gb,
-                    "ram_gb": hw.ram_gb,
-                },
-                "engines": [
-                    {
-                        "id": e.id,
-                        "name": e.display_name,
-                        "available": e.available,
-                        "endpoint": e.endpoint,
-                        "detail": e.detail,
-                        "modalities": list(e.modalities),
-                        "models_loaded": list(e.models_loaded),
-                    }
-                    for e in detect_engines("" if t.kind == "local" else t.base_url)
-                ],
-            })
-        return _dump({"targets": targets_out,
-                      "pull_credentials": credentials_status()})
+        declared = _settings_engines()
+        targets = load_targets()
+        out = {"targets": _target_rows(targets),
+               "declared_engines": [dict(row) for row in declared],
+               "storage": _storage_listing(),
+               "pull_credentials": credentials_status()}
+        local = next((t for t in targets if t.id == "local"), targets[0])
+        invitation = pointing_invitation(
+            targets, _hw_for_target(local), declared=declared)
+        if invitation is not None:
+            out["invitation"] = invitation
+        return _dump(out)
     except Exception as exc:
         return _err(exc)
 
 
+def _target_rows(targets) -> list[dict]:
+    """Per-target hardware + engine rows (the status/cockpit data path)."""
+    targets_out = []
+    for t in targets:
+        hw = _hw_for_target(t)
+        targets_out.append({
+            "id": t.id,
+            "label": t.label,
+            "kind": t.kind,
+            "base_url": t.base_url,
+            "hardware": {
+                "platform": hw.platform,
+                "gpus": list(hw.gpus),
+                "total_vram_gb": hw.total_vram_gb,
+                "ram_gb": hw.ram_gb,
+            },
+            "engines": [
+                {
+                    "id": e.id,
+                    "name": e.display_name,
+                    "available": e.available,
+                    "endpoint": e.endpoint,
+                    "detail": e.detail,
+                    "modalities": list(e.modalities),
+                    "models_loaded": list(e.models_loaded),
+                    "source": getattr(e, "source", "") or "auto-detected",
+                }
+                for e in _detect("" if t.kind == "local" else t.base_url)
+            ],
+        })
+    return targets_out
+
+
+def _storage_listing() -> dict:
+    """The model-storage inventory in the model_forge_storage list shape
+    (entries with sizes and modification times) — the one data path behind
+    model_forge_status, model_forge_storage, and the Desktop cockpit. Read-only."""
+    from . import storage
+    return storage.list_storage()
+
+
+def _browse_model_rows(entries, hw, available) -> list[dict]:
+    """Browse rows with fit data — shared by model_forge_browse and the
+    Desktop cockpit data (the pane reuses exactly this fit data)."""
+    return [
+        {
+            "id": m.id,
+            "name": m.name,
+            "modality": m.modality,
+            "modality_label": MODALITY_LABELS.get(m.modality, m.modality),
+            "engines": _engine_listing(m),
+            "source": m.source,
+            "engine_models": m.engine_models,
+            "size_gb": m.size_gb,
+            "vram_gb_min": m.vram_gb_min,
+            "fit": fit_report(m, hw, available),
+            "status": m.status,
+            "note": m.note,
+        }
+        for m in entries
+    ]
+
+
 def model_forge_browse(args: dict | None = None, **kwargs) -> str:
-    """Models for a modality, priced against a compute target (advisory)."""
+    """Models for a modality, priced against a compute target (advisory).
+    When hardware detection finds no GPU and no compute targets exist, the
+    response carries the pointing invitation (named next steps) instead of
+    leaving the caller at a bare empty state."""
     args = args or {}
     try:
         modality = args.get("modality") or None
@@ -665,35 +818,26 @@ def model_forge_browse(args: dict | None = None, **kwargs) -> str:
             return _dump({"error": f"unknown target: {args.get('target')}"})
         hw = _hw_for_target(target)
         base = "" if target.kind == "local" else target.base_url
-        available = [e.id for e in detect_engines(base) if e.available]
+        available = [e.id for e in _detect(base) if e.available]
         entries = models_for(modality=modality,
                              engine=args.get("engine") or None)
         out = {
             "target": target.id,
             "hardware_budget_gb": hw.budget_gb,
-            "models": [
-                {
-                    "id": m.id,
-                    "name": m.name,
-                    "modality": m.modality,
-                    "modality_label": MODALITY_LABELS.get(m.modality, m.modality),
-                    "engines": _engine_listing(m),
-                    "source": m.source,
-                    "engine_models": m.engine_models,
-                    "size_gb": m.size_gb,
-                    "vram_gb_min": m.vram_gb_min,
-                    "fit": fit_report(m, hw, available),
-                    "status": m.status,
-                    "note": m.note,
-                }
-                for m in entries
-            ],
+            "models": _browse_model_rows(entries, hw, available),
             "note": "Fit verdicts are advisory and cross-check the engines "
                     "detected on the target (see each row's fit block); "
                     "engines do authoritative memory sizing at launch. GGUF "
                     "chat models: use Hermes' built-in Local Models pane "
                     "(hardware-priced catalog).",
         }
+        invitation = pointing_invitation(
+            load_targets(),
+            _hw_for_target(next((t for t in load_targets()
+                                 if t.id == "local"), target)),
+            declared=_settings_engines())
+        if invitation is not None:
+            out["invitation"] = invitation
         out.update(_fresh_section(args, entries))
         return _dump(out)
     except Exception as exc:
@@ -841,7 +985,7 @@ def model_forge_install(args: dict | None = None, **kwargs) -> str:
         if target is None:
             return _dump({"error": f"unknown target: {args.get('target')}"})
         base = "" if target.kind == "local" else target.base_url
-        available = [e.id for e in detect_engines(base) if e.available]
+        available = [e.id for e in _detect(base) if e.available]
         engine_model = str(args.get("engine_model") or "")
         engine_arg = str(args.get("engine", ""))
         plan = install_plan(entry, target, engine_model=engine_model,
@@ -908,7 +1052,7 @@ def model_forge_activate(args: dict | None = None, **kwargs) -> str:
         if target is None:
             return _dump({"error": f"unknown target: {args.get('target')}"})
         base = "" if target.kind == "local" else target.base_url
-        statuses = detect_engines(base)
+        statuses = _detect(base)
         available = [e.id for e in statuses if e.available]
         plan = activation_plan(entry, target, available,
                                engine_model=str(args.get("engine_model", "")))
@@ -2054,3 +2198,105 @@ def _lane_block(claim: dict, released: dict | None = None,
     if note:
         block["note"] = note
     return block
+
+
+# --- cockpit data: the /model-forge command and the Desktop pane --------------
+
+# Deletion is deliberately NOT a cockpit verb. A cockpit data read cannot
+# ride the human-approval gate (it is not a tool call), so the cockpit and
+# the Desktop pane stay read-only and name the delete verb honestly instead.
+DELETE_VERB_NOTE = (
+    "Read-only listing. To delete an entry, run the model_forge_storage "
+    "tool with action=delete and the entry id (or exact path) from this "
+    "list — the human-approval gate shows the exact path and size before "
+    "anything is removed. This command and the Desktop pane never delete "
+    "files.")
+
+_COCKPIT_USAGE = (
+    "Model Forge cockpit (read-only). Usage: /model-forge [cockpit|models "
+    "[modality]|storage|help]\n"
+    "  cockpit           full snapshot: compute targets + hardware, "
+    "declared + detected engines, models with fit data, model storage\n"
+    "  models [modality] curated model rows with the model_forge_browse "
+    "fit data (advisory)\n"
+    "  storage           installed model weights in the "
+    "model_forge_storage list shape (sizes, modification times)\n"
+    "Mutating verbs are tool verbs that ride the human-approval gate "
+    "(model_forge_target_add, model_forge_install, model_forge_activate, "
+    "model_forge_storage action=delete).")
+
+
+def cockpit_models(modality: str | None = None) -> dict:
+    """Curated model rows with the browse fit data, priced against the local
+    target — the model section the Desktop pane reuses. Curated catalog only
+    (no live HuggingFace layer): a pane read must stay offline-safe."""
+    if modality is not None and modality not in MODALITIES:
+        return {"error": f"unknown modality: {modality!r}; valid "
+                         f"modalities: {list(MODALITIES)}"}
+    targets = load_targets()
+    local = next((t for t in targets if t.id == "local"), targets[0])
+    hw = _hw_for_target(local)
+    available = [e.id for e in _detect("") if e.available]
+    entries = models_for(modality=modality or None)
+    return {
+        "target": local.id,
+        "hardware_budget_gb": hw.budget_gb,
+        "models": _browse_model_rows(entries, hw, available),
+        "note": "Fit verdicts are advisory (the browse fit data, curated "
+                "catalog only); engines do authoritative memory sizing at "
+                "launch.",
+    }
+
+
+def cockpit_data() -> dict:
+    """The read-only cockpit snapshot behind the /model-forge command and
+    the Desktop pane: compute targets with hardware, declared + detected
+    engines, model rows reusing the browse fit data, and installed model
+    storage in the model_forge_storage list shape. Never raises."""
+    declared = _settings_engines()
+    targets = load_targets()
+    out = {
+        "ok": True,
+        "targets": _target_rows(targets),
+        "declared_engines": [dict(row) for row in declared],
+        "models": cockpit_models().get("models", []),
+        "storage": _storage_listing(),
+        "delete_note": DELETE_VERB_NOTE,
+    }
+    local = next((t for t in targets if t.id == "local"), targets[0])
+    invitation = pointing_invitation(targets, _hw_for_target(local),
+                                     declared=declared)
+    if invitation is not None:
+        out["invitation"] = invitation
+    return out
+
+
+def cockpit_storage() -> dict:
+    """The installed-models listing in the model_forge_storage list shape,
+    plus the honest delete-verb note (the cockpit never deletes)."""
+    out = dict(_storage_listing())
+    out["delete_note"] = DELETE_VERB_NOTE
+    return out
+
+
+def cockpit_command(raw_args: str = "") -> str:
+    """/model-forge — the read-only cockpit data command behind the Desktop
+    pane (also handy in chat and the CLI). Subcommands: cockpit (default),
+    models [modality], storage, help. Returns a JSON string (help returns
+    usage text) and never raises. Read-only by design: policy decisions and
+    deletions are tool verbs routed through the human-approval gate."""
+    parts = [p for p in str(raw_args or "").split() if p]
+    sub = parts[0].lower() if parts else "cockpit"
+    try:
+        if sub in ("help", "-h", "--help"):
+            return _COCKPIT_USAGE
+        if sub == "cockpit":
+            return _dump(cockpit_data())
+        if sub == "models":
+            return _dump(cockpit_models(parts[1] if len(parts) > 1 else None))
+        if sub == "storage":
+            return _dump(cockpit_storage())
+        return _dump({"error": f"unknown subcommand: {sub!r}",
+                      "usage": _COCKPIT_USAGE})
+    except Exception as exc:
+        return _err(exc)

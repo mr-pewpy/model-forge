@@ -17,6 +17,7 @@ from model_forge.broker import (
     ComfyUiLifecycle,
     EngineLifecycle,
     EvictionPlanner,
+    ExoLifecycle,
     LlamaCppServerLifecycle,
     LlamaSwapLifecycle,
     LoadPlan,
@@ -587,6 +588,126 @@ def test_maya_probe_reads_api_ps_and_fails_soft():
     down = MayaLifecycle(http=FakeHttp(
         responses={"/api/ps": Exception("down")}))
     assert down.probe()["state"] == "unknown"
+
+# --- adapter call shapes: Exo (instance placement; real unload primitive) ----
+
+def test_exo_ensure_loaded_places_instance_or_observes_resident():
+    http = FakeHttp(responses={
+        "/state": {"topology": {}, "instances": {}, "deployments": {}},
+        "/place_instance": {
+            "message": "Command received.", "command_id": "cmd-1",
+            "model_card": {"model_id": "mlx-community/Llama-3.2-1B"},
+            "deployment_id": "dpl-1"},
+    })
+    exo = ExoLifecycle(base_url="http://127.0.0.1:52415", http=http)
+    res = exo.ensure_loaded("mlx-community/Llama-3.2-1B")
+    assert res["ok"] is True
+    # honest state: placement requested, never claimed loaded — the engine
+    # downloads and loads asynchronously
+    assert res["state"] == "placement-requested"
+    assert res["deployment_id"] == "dpl-1"
+    assert "asynchronously" in res["reason"]
+    assert "instance/await" in res["reason"]
+    place = http.calls[-1]
+    assert place["method"] == "POST"
+    assert place["url"].endswith("/place_instance")
+    # server-side placement: only the model id is sent, nothing invented
+    assert place["body"] == {"model_id": "mlx-community/Llama-3.2-1B"}
+
+    # Already placed: observed from GET /state — never re-launched.
+    http2 = FakeHttp(responses={"/state": {"instances": {
+        "inst-9": {"instance_id": "inst-9", "deployment_id": "dpl-9",
+                   "shard_assignments": {"model_id": "glm"}}}}})
+    exo2 = ExoLifecycle(http=http2)
+    res = exo2.ensure_loaded("glm")
+    assert res["ok"] is True and res["state"] == "resident"
+    assert res["instance_id"] == "inst-9"
+    assert all(c["method"] == "GET" for c in http2.calls)  # nothing launched
+
+
+def test_exo_release_stops_by_deployment_id():
+    http = FakeHttp(responses={
+        "/place_instance": {"message": "Command received.",
+                            "command_id": "cmd-1", "deployment_id": "dpl-1"},
+        "/instance/dpl-1": {"message": "Command received.",
+                            "command_id": "cmd-2", "instance_id": "dpl-1"},
+    })
+    exo = ExoLifecycle(http=http)
+    exo.ensure_loaded("m")
+    http.calls.clear()
+    res = exo.release("m")
+    assert res["ok"] is True
+    # the real unload primitive: DELETE /instance/{deployment_id} —
+    # documented to stop the deployment even while it waits to be placed
+    assert res["unload_control"] == ExoLifecycle.UNLOAD_CONTROL
+    assert "unload primitive" in res["reason"]
+    assert len(http.calls) == 1
+    call = http.calls[0]
+    assert call["method"] == "DELETE"
+    assert call["url"].endswith("/instance/dpl-1")
+
+
+def test_exo_release_falls_back_to_state_lookup():
+    http = FakeHttp(responses={
+        "/state": {"instances": {
+            "inst-7": {"instance_id": "inst-7", "deployment_id": "dpl-7",
+                       "shard_assignments": {"model_id": "glm"}}}},
+        "/instance/inst-7": {"message": "Command received.",
+                             "command_id": "c", "instance_id": "inst-7"},
+    })
+    exo = ExoLifecycle(http=http)   # fresh adapter: no recorded deployment
+    res = exo.release("glm")
+    assert res["ok"] is True
+    assert http.calls[-1]["method"] == "DELETE"
+    assert http.calls[-1]["url"].endswith("/instance/inst-7")
+
+
+def test_exo_release_nothing_running_is_an_honest_noop():
+    http = FakeHttp(responses={"/state": {"instances": {}}})
+    exo = ExoLifecycle(http=http)
+    res = exo.release("glm")
+    assert res["ok"] is True
+    assert "nothing to stop" in res["reason"]
+    # nothing deleted, nothing faked — the only call was the /state check
+    assert [c["method"] for c in http.calls] == ["GET"]
+
+
+def test_exo_failures_are_honest_rows_not_raises():
+    down = ExoLifecycle(http=FakeHttp(
+        responses={"/state": Exception("connection refused")}))
+    res = down.ensure_loaded("m")
+    assert res["ok"] is False and "connection refused" in res["reason"]
+    # release cannot confirm what runs — refuse to guess (fail-closed)
+    res = down.release("m")
+    assert res["ok"] is False and "fail-closed" in res["reason"]
+
+    no_ack = ExoLifecycle(http=FakeHttp(
+        responses={"/state": {"instances": {}}, "/place_instance": None}))
+    res = no_ack.ensure_loaded("m")
+    assert res["ok"] is False and "acknowledgement" in res["reason"]
+
+    del_fail = ExoLifecycle(http=FakeHttp(responses={
+        "/place_instance": {"deployment_id": "dpl-1"},
+        "/instance/dpl-1": Exception("boom")}))
+    del_fail.ensure_loaded("m")
+    res = del_fail.release("m")
+    assert res["ok"] is False and "boom" in res["reason"]
+
+
+def test_exo_probe_reads_state_and_fails_soft():
+    http = FakeHttp(responses={"/state": {"instances": {
+        "a": {"instance_id": "a",
+              "shard_assignments": {"model_id": "m1"}},
+        "b": {"instance_id": "b",
+              "shard_assignments": {"model_id": "m2"}}}}})
+    exo = ExoLifecycle(http=http)
+    res = exo.probe()
+    assert res["ok"] is True and res["state"] == "observed"
+    assert res["resident"] == ["m1", "m2"]
+    assert http.calls[0]["url"].endswith("/state")
+    down = ExoLifecycle(http=FakeHttp(responses={"/state": Exception("down")}))
+    assert down.probe()["state"] == "unknown"
+
 
 
 # --- eviction planner: booked gating vs live-free ordering -----------------

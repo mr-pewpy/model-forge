@@ -66,3 +66,7 @@ class EngineStatus:
     detail: str = ""
     modalities: tuple[str, ...] = ()
     models_loaded: tuple[str, ...] = ()
+    # Provenance of the row: "" is the default automatic probe;
+    # "user-declared" means the endpoint came from a root the user
+    # explicitly declared (detect_engines' extra_roots).
+    source: str = ""

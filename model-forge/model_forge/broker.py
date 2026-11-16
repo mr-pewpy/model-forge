@@ -17,10 +17,14 @@ when a task needs a different model. Four pieces:
   readiness + cache-free contract, never a weights pin), vLLM (process
   start/stop of the server with the model as a launch argument — engine
   sleep/wake is deliberately not used; wake endpoints are unreliable
-  upstream and process restart is the reliable path), and Maya (engine-native
+  upstream and process restart is the reliable path), Maya (engine-native
   readiness over its model-management API — Maya exposes no unload
   primitive, so release is a ledger-side acknowledgment and never fakes an
-  unload).
+  unload), and Exo (engine-native instance placement — ``POST
+  /place_instance`` launches a model on the clustered devices and ``DELETE
+  /instance/{id}`` stops it by instance or deployment id, a real unload
+  primitive; placement is asynchronous, so a launch is reported honestly as
+  placement-requested, never as already loaded).
 - ``EvictionPlanner`` — the battle-tested serving policy (roadmap §3) as
   pure plan data: fit gates on NOMINAL booked ceilings (live free VRAM only
   orders candidates — booked-vs-live comparisons cause false evictions), a
@@ -70,6 +74,7 @@ __all__ = [
     "ComfyUiLifecycle",
     "EngineLifecycle",
     "EvictionPlanner",
+    "ExoLifecycle",
     "LlamaCppServerLifecycle",
     "LlamaSwapLifecycle",
     "LoadPlan",
@@ -1049,6 +1054,162 @@ class MayaLifecycle(EngineLifecycle):
         return {"ok": True, "engine": self.engine_id, "state": "observed",
                 "resident": [n for n in resident if n],
                 "reason": self.NO_UNLOAD}
+
+
+class ExoLifecycle(EngineLifecycle):
+    """Exo's instance API (github.com/exo-explore/exo, docs/api.md §2).
+
+    Exo places model instances across the devices it clusters. What
+    honestly exists over HTTP: ``POST /place_instance`` asks the cluster to
+    place and load a model (server-side placement; the answer is a command
+    acknowledgement and creation is ASYNCHRONOUS — the model downloads and
+    loads engine-natively, and clients wait for readiness through
+    ``GET /instance/await?model_id=…``), and ``DELETE /instance/{id}`` stops
+    a model by its instance id or its deployment id — a REAL unload
+    primitive (it stops a deployment even while it waits to be placed
+    again). ``release`` therefore drives that delete: an unload is never
+    faked, and nothing destructive (custom-model delete) is ever used as a
+    release.
+
+    ``ensure_loaded`` is launch-or-observe: an instance already running for
+    the model is reported ``resident`` and never re-launched; otherwise the
+    placement is requested and reported ``placement-requested`` — the model
+    is never claimed loaded before the engine says so. ``probe`` reads
+    ``GET /state`` (instances keyed by id, each carrying
+    ``shard_assignments.model_id``).
+
+    The HTTP function is injectable; the default is stdlib urllib."""
+
+    engine_id = "exo"
+    LOAD_CONTROL = ("engine-native instance placement — POST /place_instance "
+                    "asks the exo cluster to place and load the model; "
+                    "creation is asynchronous (wait via GET /instance/await "
+                    "before inference)")
+    UNLOAD_CONTROL = ("instance delete (DELETE /instance/{id}) — a real "
+                      "unload primitive: the cluster stops the deployment "
+                      "and frees its memory")
+
+    def __init__(self, base_url="http://127.0.0.1:52415", http=None):
+        self._root = (base_url or "").rstrip("/")
+        self._http = http or _http_json
+        # model_id -> deployment_id from the launch acknowledgement: the id
+        # DELETE /instance/{id} stops by, even before placement finishes.
+        self._deployments: dict[str, str] = {}
+
+    @staticmethod
+    def _instances(data) -> list[dict]:
+        raw = data.get("instances") or {} if isinstance(data, dict) else {}
+        items = raw.values() if isinstance(raw, dict) else (raw or [])
+        return [i for i in items if isinstance(i, dict)]
+
+    @staticmethod
+    def _instance_model(inst: dict) -> str:
+        shard = inst.get("shard_assignments")
+        if isinstance(shard, dict) and shard.get("model_id"):
+            return str(shard["model_id"])
+        return str(inst.get("model_id") or "")
+
+    @staticmethod
+    def _instance_stop_id(inst: dict) -> str:
+        # DELETE /instance/{id} accepts the instance id or the deployment id.
+        return str(inst.get("instance_id") or inst.get("deployment_id")
+                   or "")
+
+    def ensure_loaded(self, model_id, **_ignored) -> dict:
+        row = {"ok": False, "engine": self.engine_id, "action": "load",
+               "model_id": model_id, "load_control": self.LOAD_CONTROL}
+        try:
+            state = self._http("GET", f"{self._root}/state")
+        except Exception as exc:  # noqa: BLE001 — honest row, never a raise
+            return {**row, "reason": f"exo /state unreachable: "
+                                     f"{type(exc).__name__}: {exc}"}
+        for inst in self._instances(state):
+            if self._instance_model(inst) == model_id:
+                stop_id = (self._instance_stop_id(inst)
+                           or self._deployments.get(model_id, ""))
+                return {"ok": True, "engine": self.engine_id,
+                        "action": "load", "model_id": model_id,
+                        "state": "resident", "instance_id": stop_id,
+                        "load_control": self.LOAD_CONTROL,
+                        "reason": f"{model_id} already runs as an exo "
+                                  f"instance (GET /state) — nothing to "
+                                  f"launch"}
+        try:
+            ack = self._http("POST", f"{self._root}/place_instance",
+                             {"model_id": model_id})
+        except Exception as exc:  # noqa: BLE001 — honest row, never a raise
+            return {**row, "reason": f"exo POST /place_instance failed for "
+                                     f"{model_id}: {type(exc).__name__}: "
+                                     f"{exc}"}
+        if not isinstance(ack, dict) or not ack:
+            return {**row, "reason": f"exo POST /place_instance returned no "
+                                     f"command acknowledgement for "
+                                     f"{model_id} — not launched (fail-soft)"}
+        deployment_id = str(ack.get("deployment_id") or "")
+        if deployment_id:
+            self._deployments[model_id] = deployment_id
+        return {"ok": True, "engine": self.engine_id, "action": "load",
+                "model_id": model_id, "state": "placement-requested",
+                "deployment_id": deployment_id,
+                "load_control": self.LOAD_CONTROL,
+                "reason": f"placement requested for {model_id} (command "
+                          f"{ack.get('command_id') or 'accepted'}) — exo "
+                          f"downloads and loads the model engine-natively "
+                          f"and asynchronously; it is NOT loaded yet: wait "
+                          f"via GET /instance/await?model_id={model_id} "
+                          f"before inference"}
+
+    def release(self, model_id) -> dict:
+        base = {"engine": self.engine_id, "action": "release",
+                "model_id": model_id, "unload_control": self.UNLOAD_CONTROL}
+        stop_id = self._deployments.pop(model_id, "")
+        if not stop_id:
+            try:
+                state = self._http("GET", f"{self._root}/state")
+            except Exception as exc:  # noqa: BLE001 — honest row
+                return {**base, "ok": False,
+                        "reason": f"exo /state unreachable — cannot confirm "
+                                  f"what runs {model_id}, refusing to guess "
+                                  f"(fail-closed): {type(exc).__name__}: "
+                                  f"{exc}"}
+            for inst in self._instances(state):
+                if self._instance_model(inst) == model_id:
+                    stop_id = self._instance_stop_id(inst)
+                    break
+        if not stop_id:
+            return {**base, "ok": True,
+                    "reason": f"no exo instance runs {model_id} (GET "
+                              f"/state) — nothing to stop"}
+        try:
+            self._http("DELETE", f"{self._root}/instance/{stop_id}")
+        except Exception as exc:  # noqa: BLE001 — honest row, never a raise
+            return {**base, "ok": False, "instance_id": stop_id,
+                    "reason": f"exo DELETE /instance/{stop_id} failed: "
+                              f"{type(exc).__name__}: {exc}"}
+        return {**base, "ok": True, "instance_id": stop_id,
+                "reason": f"stopped exo instance {stop_id} (DELETE "
+                          f"/instance/{stop_id}) — a real unload primitive; "
+                          f"the cluster stops the model and frees its "
+                          f"memory"}
+
+    def probe(self) -> dict:
+        try:
+            state = self._http("GET", f"{self._root}/state")
+        except Exception as exc:  # noqa: BLE001 — probes fail soft
+            return {"ok": False, "engine": self.engine_id, "state": "unknown",
+                    "resident": [],
+                    "reason": f"exo /state unreachable: "
+                              f"{type(exc).__name__}: {exc}"}
+        if not isinstance(state, dict):
+            return {"ok": False, "engine": self.engine_id, "state": "unknown",
+                    "resident": [],
+                    "reason": "exo /state returned no cluster state — "
+                              "residency unknown"}
+        resident = [self._instance_model(i) for i in self._instances(state)]
+        return {"ok": True, "engine": self.engine_id, "state": "observed",
+                "resident": [m for m in resident if m],
+                "reason": "instances observed via GET /state; releases "
+                          "drive " + self.UNLOAD_CONTROL}
 
 
 # --- eviction planner -------------------------------------------------------

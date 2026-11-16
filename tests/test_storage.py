@@ -331,3 +331,45 @@ def test_handler_actions_surface_json(tmp_path, monkeypatch):
         {"action": "delete", "entry": "plugin-downloads:a.bin"}))
     assert out["ok"] is True and out["freed_bytes"] == 4
     assert not (downloads / "a.bin").exists()
+
+
+# --- storage list shape in the status/pane data path -------------------------
+
+def test_status_and_cockpit_carry_storage_list_shape(tmp_path, monkeypatch):
+    # The one storage data path serves model_forge_status, the /model-forge
+    # cockpit command (the Desktop pane's data door), and model_forge_storage
+    # — all in the same list shape (sizes and modification times).
+    _stub_plugins(monkeypatch, tmp_path)
+    _fake_home(monkeypatch, tmp_path)
+    downloads = tmp_path / "model-forge" / "downloads"
+    model_dir = downloads / "model-a"
+    model_dir.mkdir(parents=True)
+    (model_dir / "w.bin").write_bytes(b"1" * 5)
+
+    from model_forge import tools
+    from model_forge.registry import HardwareProfile
+    monkeypatch.setattr(tools, "probe_hardware",
+                        lambda: HardwareProfile(gpus=(), total_vram_gb=0.0,
+                                                ram_gb=0.0, platform="linux"))
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
+
+    ref = list_storage()
+    out = json.loads(tools.model_forge_status())
+    assert out["storage"]["entries"] == ref["entries"]
+    required = {"id", "name", "path", "root", "type", "size_bytes",
+                "last_modified"}
+    for entry in out["storage"]["entries"]:
+        assert required <= set(entry)
+        assert isinstance(entry["size_bytes"], int)
+        datetime.fromisoformat(entry["last_modified"])  # parses
+    assert {e["name"] for e in out["storage"]["entries"]} == {"model-a"}
+
+    # the pane's cockpit command serves the same shape plus the honest
+    # delete-verb note (the pane renders it read-only)
+    cmd = json.loads(tools.cockpit_command("storage"))
+    assert cmd["entries"] == ref["entries"]
+    assert "model_forge_storage" in cmd["delete_note"]
+    assert "action=delete" in cmd["delete_note"]
+    # and the full cockpit snapshot carries the storage block too
+    snap = json.loads(tools.cockpit_command("cockpit"))
+    assert snap["storage"]["entries"] == ref["entries"]
