@@ -296,6 +296,10 @@ Honest scoping — current limits, and what does not work yet:
   only after you approve it at the human-approval gate. llama.cpp is never
   installed — Hermes core's managed runtime covers it.
 
+The complete **known limits and deferred work** register — the reason, today's
+alternative, and what would unblock each item — is in
+[docs/deferred-work.md](docs/deferred-work.md).
+
 ## Disclosure (what this plugin does on your machine)
 
 - **Network:** probes engine endpoints you configured — compute targets and
