@@ -81,9 +81,8 @@ states, fail-closed policy, approval gates, disclosures).
 
 ### Gaps
 
-- **Exo is not supported anywhere in the tree** — no detector, adapter, lifecycle class, or registry
-  mapping exists (verified across model-forge/; contrast the supported set in
-  model_forge/engines/__init__.py).
+- **Exo is now supported** — the shipped `model_forge/engines/exo.py` detector and `ExoLifecycle`
+  (instance/deployment lifecycle) supersede the earlier "not supported anywhere in the tree" claim.
 - Pointed endpoints are not first-class settings: there is no user-editable engines list in the config
   schema, so "connect my existing engine" is implicit probing rather than a product surface
   (model-forge/plugin.yaml).
@@ -270,3 +269,26 @@ states, fail-closed policy, approval gates, disclosures).
 - **Single-GPU contention is physics.** One accelerator cannot hold a large chat model and an image
   model at once; the orchestrator's promise is predictable eviction and honest timing, not coexistence
   (docs/broker-roadmap.md).
+
+## 9. Phase D status addendum (2026-11)
+
+Short status notes only — the plan above is unchanged.
+
+- **W4.1 Custom-provider registration — done.** An approved activation (`model_forge_activate`
+  `apply=true`) writes the matching `custom_providers` entry (slug `custom` / `custom:<target-id>`,
+  declaring the served model) so `/model` lists it with no manual configuration; the approval prompt
+  names the entry before anything is written (model_forge/tools.py `write_custom_provider_entry`;
+  shape parity-tested in model-forge-providers).
+- **W4.3 Mobile readiness — done.** The gateway-side audit and the future-lane note are recorded in
+  docs/surface-parity.md ("Mobile readiness (W4.3)"): every capability is gateway-side, no capability
+  requires a specific desktop client, and on-device mobile inference is recorded as a named future
+  lane without over-promising.
+- **W5.2 Approval coverage audit — checklist delivered.** The write-action → rule-key /
+  documented-reason map is now in docs/surface-parity.md ("Approval coverage (W5.2)"), verified
+  against the tool handlers and `policy_hook`.
+- **W5.3 Disclosure upkeep — current at this gate.** Both README disclosure sections and the five
+  package descriptions were brought up to the shipped surface (dashboard API route, `/model-forge`
+  command, user-declared endpoint probing, config reads and writes); it remains a standing obligation
+  at every later phase gate.
+- **Engine-bundle follow-through** (provisioning through a platform API instead of per-vendor
+  installers) remains open (docs/engine-bundle-proposal.md).

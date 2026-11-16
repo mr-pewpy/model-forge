@@ -26,6 +26,11 @@ from pathlib import Path
 
 _DOWNLOAD_SUBDIR = "downloads"
 
+# Cache bookkeeping that lives inside model directories but is never a model
+# artifact (Hugging Face hub cache): filtered out of every entry list at the
+# inventory source so counts and pulled lists contain only model artifacts.
+_NON_MODEL_ARTIFACTS = frozenset({".locks", "CACHEDIR.TAG"})
+
 
 @dataclass(frozen=True)
 class StorageRoot:
@@ -75,12 +80,16 @@ def _tree_size(path: Path) -> int:
 
 
 def list_storage(roots=None, home: Path | None = None) -> dict:
-    """Inventory every root: one entry per file/folder directly inside it.
+    """Inventory every root: one entry per model artifact (file/folder)
+    directly inside it.
 
     Entries carry name, absolute path, size in bytes (folders add up every
     file inside), last_modified (the filesystem modification time — usage is
-    not tracked), and the root they came from. Absent or unreadable roots are
-    skipped fail-soft and reported in roots_skipped."""
+    not tracked), and the root they came from. Non-model cache bookkeeping
+    (``_NON_MODEL_ARTIFACTS``) is never listed; a root containing only such
+    artifacts is reported as carrying no model artifacts rather than listing
+    them. Absent or unreadable roots are skipped fail-soft and reported in
+    roots_skipped."""
     roots = list(roots) if roots is not None else storage_roots(home=home)
     entries = []
     scanned = []
@@ -99,9 +108,14 @@ def list_storage(roots=None, home: Path | None = None) -> dict:
             skipped.append({"root": root.key, "label": root.label,
                             "path": str(base), "reason": reason})
             continue
-        scanned.append({"root": root.key, "label": root.label,
-                        "path": str(base)})
+        root_row = {"root": root.key, "label": root.label,
+                    "path": str(base)}
+        kept = 0
+        artifacts = 0
         for child in children:
+            if child.name in _NON_MODEL_ARTIFACTS:
+                artifacts += 1
+                continue  # cache bookkeeping, never a model artifact
             try:
                 st = child.lstat()
             except OSError:
@@ -122,6 +136,10 @@ def list_storage(roots=None, home: Path | None = None) -> dict:
                 "size_bytes": size,
                 "last_modified": _iso(st.st_mtime),
             })
+            kept += 1
+        if not kept and artifacts == len(children):
+            root_row["note"] = "no model artifacts"
+        scanned.append(root_row)
     return {
         "ok": True,
         "entries": entries,

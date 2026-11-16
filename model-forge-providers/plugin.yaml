@@ -2,6 +2,12 @@ name: model-forge-providers
 kind: model-provider
 version: 1.0.0
 requires_hermes: ">=0.23.0"
-description: Local engine providers for Model Forge (Strata, Project Maya) — run Hermes on local MoE engines
+description: >-
+  Local engine providers for Model Forge (Strata, Project Maya) — run Hermes
+  on local MoE engines. Registers keyless provider profiles; lists served
+  models by probing the /v1/models listing of engine endpoints you configure
+  (environment override, Model Forge settings, custom_providers entries);
+  its hermes model setup step writes the model config and a custom_providers
+  entry only after your interactive pick. No telemetry.
 author: anai (Pewpy)
 license: MIT

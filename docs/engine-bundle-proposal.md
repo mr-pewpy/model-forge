@@ -95,7 +95,7 @@ One interface already covers six engines with genuinely different lifecycle shap
 | vLLM | process start/stop; engine sleep/wake is not used — wake endpoints are unreliable upstream |
 | Maya | engine-native readiness over its model-management API; no unload primitive, so release is an honest ledger-side acknowledgment that never fakes an unload |
 
-These adapters sit on a battle-tested residency and eviction policy distilled from production
+These adapters sit on a residency and eviction policy proven under production load, distilled from
 multi-GPU serving: fit gates on nominal booked ceilings while live free VRAM only orders candidates,
 a lane wake stops resident side models first, a recency window (~600 s) keeps recently used models
 warm ahead of pure LRU, image-generation entry evicts GPU residents deterministically every time, and

@@ -1715,7 +1715,9 @@ def _as_data_url(value: str) -> str:
 # as the nominal ceiling until a measured peak replaces it (a measured booking
 # is never downgraded by a published one).
 BOOKING_SOURCE = "catalog-vram-floor"
-BOOKING_SOURCE_NONE = "catalog-vram-floor (none declared)"
+# Unbooked rows label themselves against the booked-ceiling concept — never
+# with the booking source token, so no word means two things in one report.
+BOOKING_SOURCE_NONE = "no booked ceiling (no VRAM floor declared)"
 BOOKING_SOURCE_NOTE = (
     "booked ceilings are the curated catalog's published VRAM floors used as "
     "nominal ceilings — advisory published minimums, not measured peaks; a "

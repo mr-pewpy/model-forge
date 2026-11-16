@@ -2,6 +2,6 @@ name: model-forge-desktop
 kind: desktop
 version: 1.0.0
 requires_hermes: ">=0.23.0"
-description: "Model Forge cockpit pane — GPU/compute targets with the pointing invitation, declared + detected engines, model fit data, and installed model storage at a glance."
+description: "Model Forge cockpit pane — GPU/compute targets with the pointing invitation, declared + detected engines, model fit data, and installed model storage at a glance. Read-only: runs the same read-only engine probes and config reads as the Model Forge tools when the pane loads; never writes or deletes (deletion is the approval-gated model_forge_storage verb). No telemetry."
 author: anai (Pewpy)
 license: MIT

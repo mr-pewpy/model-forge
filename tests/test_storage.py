@@ -110,6 +110,37 @@ def test_list_default_roots_use_plugin_dir_and_home(tmp_path, monkeypatch):
     assert len(out["entries"]) == 3
 
 
+def test_non_model_artifacts_are_never_listed(tmp_path):
+    # .locks (HF hub cache) and CACHEDIR.TAG are cache bookkeeping, never
+    # model weights: filtered at the inventory source so counts and pulled
+    # lists contain only model artifacts
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    (hub / "CACHEDIR.TAG").write_bytes(b"x" * 191)
+    (hub / ".locks").mkdir()
+    model = hub / "models--org--m"
+    model.mkdir()
+    (model / "w.bin").write_bytes(b"123")
+    only = tmp_path / "only-artifacts"
+    only.mkdir()
+    (only / "CACHEDIR.TAG").write_bytes(b"x")
+    (only / ".locks").mkdir()
+
+    out = list_storage(roots=[StorageRoot("huggingface-hub", "hub", hub),
+                              StorageRoot("artifacts-only", "only", only)])
+    # only the model artifact is listed and counted
+    assert [e["name"] for e in out["entries"]] == ["models--org--m"]
+    by_root = {r["root"]: r for r in out["roots"]}
+    assert "note" not in by_root["huggingface-hub"]
+    # a root holding ONLY such artifacts says so instead of listing them
+    assert by_root["artifacts-only"]["note"] == "no model artifacts"
+    # and they are not deletable through the tool either (delete accepts
+    # only entries the inventory returned)
+    got = delete_entry(str(hub / "CACHEDIR.TAG"),
+                       roots=[StorageRoot("huggingface-hub", "hub", hub)])
+    assert got["ok"] is False and "not an entry" in got["error"]
+
+
 def test_missing_and_unreadable_roots_fail_soft(tmp_path, monkeypatch):
     good = tmp_path / "good"
     good.mkdir()

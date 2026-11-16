@@ -298,24 +298,42 @@ Honest scoping — current limits, and what does not work yet:
 
 ## Disclosure (what this plugin does on your machine)
 
-- **Network:** probes compute-target engine endpoints (llama-server `/props`,
+- **Network:** probes engine endpoints you configured — compute targets and
+  the user-declared engine endpoints from settings (`engines_json`) —
+  with engine-specific reads: llama-server `/props`,
   Ollama `/api/tags`, Maya `/api/catalog`, ComfyUI `/system_stats`, vLLM
-  `/version`, SGLang `/get_model_info`, OpenAI-compatible `/v1/models` +
-  image-route existence). Model discovery queries the public HuggingFace API
+  `/version`, SGLang `/get_model_info`, and OpenAI-compatible
+  `/v1/models` + image-route existence. Model discovery queries the public HuggingFace API
   (`huggingface.co/api/models`, newest-first per modality; disabled with
   `fresh=false`) and caches answers for one hour. Model downloads stream
   from the URL the engine or registry names (HuggingFace / ModelScope
-  resolve links). Media jobs (`model_forge_generate_media`) POST prompts and
+  resolve links); install plans may also query the HuggingFace API for a
+  repository's file list when no file is named. Media jobs (`model_forge_generate_media`) POST prompts and
   image bytes to user-configured compute targets, and Maya pulls POST to the
-  target's `/api/pull`. Weight residency claims and releases
+  target's `/api/pull`; 3D media jobs poll the gateway's `/jobs/<id>` route
+  until the job settles. Weight residency claims and releases
   (`model_forge_broker`, and the automatic scope around
   `model_forge_generate_media` jobs) drive engine load and unload calls on
   your user-configured compute-target endpoints — for example an Ollama
-  warm/evict call carrying `keep_alive`, or llama-server process starts and
+  warm/evict call carrying `keep_alive`, a ComfyUI cache free
+  (`POST /free`), or llama-server and vLLM server process starts and
   stops. The TTS helper (`tts/model_forge_tts.py`) POSTs the
   text to speak plus base64-encoded voice-clone reference audio to a
   user-configured `/v1/audio/speech` endpoint. If pull credentials are
   configured, they are sent only to `huggingface.co` / `modelscope.cn` hosts.
+  The bundled `model-forge-image` / `model-forge-video` backends
+  send prompts (and image bytes or URLs for edits) to the single endpoint
+  you configure and read that endpoint's `/models` listing to resolve a
+  default model; the `model-forge-providers` package probes the
+  `/v1/models` listing of engine endpoints it knows (an environment
+  override, the `engines_json` / `targets_json` settings, and
+  `custom_providers` entries) when a model picker asks it for served
+  models. Every read named in this section can be triggered by the
+  read-only `/model-forge` command (Desktop chat, Telegram, CLI/TUI), the
+  cockpit panes, and the dashboard tab — the tab fetches one route on the
+  local dashboard server, `GET /api/plugins/model-forge/cockpit`, which
+  returns the cockpit snapshot with the same reads, bounded at 25 seconds
+  and failing soft to a stated reason.
 - **Shell:** runs `nvidia-smi` and `rocm-smi` (read-only GPU queries,
   including the `bench` action's VRAM measurement window) and
   checks `PATH` for the `strata` CLI. Hardware probes also read system state
@@ -328,14 +346,17 @@ Honest scoping — current limits, and what does not work yet:
   and Project Maya (`git clone https://github.com/mw00/project-maya && cd project-maya && ./setup.sh`).
   llama.cpp is never installed — it defers to Hermes core's managed llama.cpp
   runtime (the built-in Local Models catalog and downloads). Outside of
-  weight residency claims and releases (which may start and stop a
-  `llama-server` process on this machine), no engine launcher is run by the
-  plugin.
+  weight residency claims and releases (which may start and stop
+  `llama-server` and vLLM server processes on this machine as part of the
+  swap), no engine launcher is run by the plugin.
 - **Background:** long model downloads and approved engine installs run on
   a daemon background thread (job records are pollable with
   `model_forge_install` `job_id`); installer jobs carry a hard timeout (900
   seconds) that kills the installer's process group, so nothing hangs
-  unattended. These are the plugin's only background processes.
+  unattended. These are the plugin's only background jobs; the
+  weight-residency swaps named under Shell may additionally start and stop
+  an engine server process (`llama-server`, vLLM) on a target as part of
+  the swap.
 - **Files:** writes downloaded model files (with `.part` resume files),
   download job records, and discovery caches under its own plugin data dir;
   `download_roots` (**Settings → Plugins**) can widen where downloads land
@@ -350,10 +371,14 @@ Honest scoping — current limits, and what does not work yet:
   directory and in your engine-managed model directories (the Ollama models
   dir and the HuggingFace hub cache under your home directory);
   `model_forge_storage` with `action=delete` removes the user-approved files
-  and folders from those roots. The `/model-forge` cockpit command and the
-  Desktop cockpit pane are read-only: they return the same inventory data
-  (never delete or write) and the pane issues the same read-only engine
-  probes from the app.
+  and folders from those roots. The `/model-forge` cockpit command, the
+  Desktop cockpit pane, and the dashboard tab are read-only: they return the
+  same inventory data (never delete or write) and issue the same read-only
+  engine probes. Your Hermes config is the one exception to "never write":
+  an approved activation writes the `model:` section plus a
+  `custom_providers` entry (see Approvals), and the `model-forge-providers`
+  package's `hermes model` setup step writes those same two sections after
+  you pick a model interactively.
 - **Approvals:** four actions escalate to Hermes' human-approval gate and
   fail closed on denial or timeout — registering a compute target, writing
   the default model config plus a `custom_providers` entry (so the
@@ -362,8 +387,15 @@ Honest scoping — current limits, and what does not work yet:
   deleting a model-storage entry (`model_forge_storage` with `action=delete`;
   the prompt names the exact path and size), and running a vendor engine
   installer (`model_forge_install` with `action=engine_install`,
-  `execute=true`; the prompt shows the exact command, and denial or timeout
-  runs nothing).
+  `execute=true`; the prompt shows the exact command, and denial or
+  timeout runs nothing).
+  Model pulls, media jobs, and broker `claim`/`release` are deliberately
+  not approval-gated: they write nothing outside the plugin's data
+  directories and talk only to compute targets and endpoints you
+  registered (each registration passed the gate) or configured in
+  settings yourself. The full write-action coverage map — every write
+  action mapped to its rule key or its documented reason for needing
+  none — is in [docs/surface-parity.md](../docs/surface-parity.md).
 - **Credentials:** none required. HF/ModelScope tokens are optional, stored
   through Hermes' credential route (`Settings → Plugins`), read only via the
   secret scope.

@@ -25,7 +25,8 @@ when a task needs a different model. Four pieces:
   /instance/{id}`` stops it by instance or deployment id, a real unload
   primitive; placement is asynchronous, so a launch is reported honestly as
   placement-requested, never as already loaded).
-- ``EvictionPlanner`` — the battle-tested serving policy (roadmap §3) as
+- ``EvictionPlanner`` — the serving policy proven under production load
+  (roadmap §3) as
   pure plan data: fit gates on NOMINAL booked ceilings (live free VRAM only
   orders candidates — booked-vs-live comparisons cause false evictions), a
   lane wake stops resident side models first, a ~600 s recency window keeps
@@ -93,7 +94,7 @@ __all__ = [
     "loading_state",
 ]
 
-# Battle-tested policy: models used within roughly the last ten minutes stay
+# Policy proven under production load: models used within roughly the last ten minutes stay
 # warm; recency outranks pure LRU near the top of the stack.
 RECENCY_WINDOW_S = 600.0
 
@@ -1215,7 +1216,8 @@ class ExoLifecycle(EngineLifecycle):
 # --- eviction planner -------------------------------------------------------
 
 class EvictionPlanner:
-    """The battle-tested serving policy (roadmap §3) as plan data.
+    """The serving policy proven under production load (roadmap §3) as
+    plan data.
 
     - Fit gates on NOMINAL booked ceilings. Live free VRAM only orders the
       load steps (which to load first); it never gates them — booked-vs-live

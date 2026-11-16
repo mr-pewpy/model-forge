@@ -66,7 +66,7 @@ Missing (the v2 work):
   resolution (prefer full weights, quant variants only on request) continues
   as v2 work.
 
-## 3. Battle-tested serving policy
+## 3. Serving policy proven under production load
 
 These rules are distilled from production multi-GPU model serving. They
 generalize to any machine; v2 applies them directly against raw engine APIs:

@@ -5,7 +5,10 @@ One read-only endpoint: the cockpit snapshot — exactly the data behind the
 /model-forge command and the Desktop cockpit pane (compute targets with
 hardware and engines, model fit rows, installed model storage). Read-only by
 design: mutating verbs are the plugin's tools, which ride the human-approval
-gate. Every read is bounded and fails soft to a stated reason.
+gate. Every read is bounded and fails soft to a stated reason. Each request
+performs reads only — the plugin's config/settings reads and the read-only
+engine probes behind the cockpit snapshot (the same probes
+``model_forge_status`` runs) — and starts no background jobs.
 """
 
 from __future__ import annotations

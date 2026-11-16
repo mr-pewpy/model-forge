@@ -43,6 +43,9 @@ _CHAT_OUTPUT_LIMIT = 3800
 # Model rows rendered per browse listing before the honest truncation row.
 _BROWSE_ROW_LIMIT = 25
 
+# Live "fresh" rows rendered per browse listing before the remainder row.
+_FRESH_ROW_LIMIT = 8
+
 
 # --- bounded, fail-soft data reads -------------------------------------------
 
@@ -187,15 +190,24 @@ def _render_status(data: dict) -> str:
     total = sum(int(e.get("size_bytes") or 0) for e in entries)
     roots = storage.get("roots") or []
     skipped = storage.get("roots_skipped") or []
-    lines.append(f"storage: {len(entries)} entries · {_fmt_bytes(total)} · "
+    count_row = (f"{len(entries)} entries · {_fmt_bytes(total)}"
+                 if entries else "no model artifacts")
+    lines.append(f"storage: {count_row} · "
                  f"roots scanned {len(roots)} · skipped {len(skipped)} "
                  "(model_forge_storage list shape; the 'storage' subcommand "
                  "lists every entry)")
     creds = data.get("pull_credentials") or {}
     if creds:
+        # Words only, never KEY=true/false: an env-assignment shape can be
+        # masked downstream, which would make an unset token display as if
+        # set-and-hidden. Values are never read into this render and never
+        # shown.
+        names = {"HF_TOKEN": "HF token",
+                 "MODELSCOPE_API_TOKEN": "ModelScope API token"}
         lines.append("pull credentials: " + ", ".join(
-            f"{k}={str(bool(v)).lower()}" for k, v in sorted(creds.items()))
-            + " (values are never shown)")
+            f"{names.get(k, k.replace('_', ' ').lower())}: "
+            + ("set (value never shown)" if v else "not set")
+            for k, v in sorted(creds.items())))
     lines.extend(_render_invitation(data.get("invitation")))
     return "\n".join(lines)
 
@@ -231,8 +243,41 @@ def _render_browse(data: dict) -> str:
                      "model_forge_browse for the full JSON)")
     if data.get("note"):
         lines.append(f"note: {data['note']}")
+    lines.extend(_render_fresh(data))
     lines.extend(_render_invitation(data.get("invitation")))
     return "\n".join(lines)
+
+
+def _render_fresh(data: dict) -> list[str]:
+    """The model_forge_browse live freshness block: compact newest-first rows
+    plus the honest 'fresh = live results, unvetted' note. Never silently
+    dropped — a payload whose fresh rows are empty states why (disabled /
+    unavailable), and a payload carrying no live-discovery block at all says
+    so explicitly."""
+    if "live_discovery" not in data and "fresh" not in data:
+        return ["fresh: omitted — this payload carries no live-discovery "
+                "block (model_forge_browse returns one; fresh=false skips "
+                "the live layer)"]
+    rows = sorted(data.get("fresh") or [],
+                  key=lambda r: str(r.get("last_modified") or ""),
+                  reverse=True)
+    live = data.get("live_discovery") or "unknown"
+    lines = [f"fresh ({len(rows)}) · live discovery: {live} — fresh = live "
+             "results, unvetted (newest first):"]
+    shown = rows[:_FRESH_ROW_LIMIT]
+    for r in shown:
+        parts = [f"  {r.get('id')} · {r.get('last_modified') or 'unknown date'}"]
+        if r.get("downloads") is not None:
+            parts.append(f"{r.get('downloads')} downloads")
+        if r.get("pipeline_tag"):
+            parts.append(str(r["pipeline_tag"]))
+        lines.append(" · ".join(parts))
+    if len(rows) > len(shown):
+        lines.append(f"  … and {len(rows) - len(shown)} more fresh rows (run "
+                     "model_forge_browse for the full JSON)")
+    if data.get("fresh_note"):
+        lines.append(f"fresh note: {data['fresh_note']}")
+    return lines
 
 
 def _render_broker(data: dict) -> str:
@@ -249,9 +294,9 @@ def _render_broker(data: dict) -> str:
         f"{r.get('model_id')} (engine={r.get('engine')}, lane={r.get('lane')})"
         for r in resident) or "none"))
     booked = data.get("booked") or []
-    lines.append(f"booked ({len(booked)}):")
+    lines.append(f"booked ceilings ({len(booked)}):")
     if not booked:
-        lines.append("  none booked yet")
+        lines.append("  no booked ceilings yet")
     for row in booked:
         lines.append(f"  {row.get('model_id')} = "
                      f"{_num(row.get('vram_gb'), ' GB')} · "

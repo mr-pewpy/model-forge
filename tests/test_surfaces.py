@@ -155,6 +155,21 @@ def _browse_json() -> str:
         ],
         "note": "Fit verdicts are advisory and cross-check the engines "
                 "detected on the target.",
+        "live_discovery": "ok",
+        "fresh": [
+            {"id": "org/fresh-new", "last_modified": "2026-03-01",
+             "downloads": 1200, "pipeline_tag": "image-classification",
+             "url": "https://huggingface.co/org/fresh-new",
+             "status": "fresh"},
+            {"id": "org/fresh-old", "last_modified": "2026-02-01",
+             "downloads": 5, "pipeline_tag": "",
+             "url": "https://huggingface.co/org/fresh-old",
+             "status": "fresh"},
+        ],
+        "fresh_note": "Fresh = live HuggingFace results, newest first "
+                      "(unvetted: no fit estimate, no engine mapping). "
+                      "Curated entries above are hand-maintained and "
+                      "fit-priced.",
     })
 
 
@@ -168,7 +183,8 @@ def _broker_json() -> str:
         "booked": [{"model_id": "qwen", "vram_gb": 16.0, "source": "bench",
                     "label": "measured peak"}],
         "unbooked": [{"model_id": "hunyuan-video", "modality": "video",
-                      "vram_gb": None, "label": "no booked ceiling",
+                      "vram_gb": None,
+                      "label": "no booked ceiling (no VRAM floor declared)",
                       "hint": "run bench after first load"}],
         "budget": {"nominal_gb": 24.0, "booked_now_gb": 16.0,
                    "headroom_gb": 8.0},
@@ -245,11 +261,26 @@ def test_status_renders_plain_text_rows(plugin, monkeypatch):
     assert ("Workstation vLLM — http://gpu-box.example.com:8000 · "
             "source=user-declared") in out
     assert "storage: 1 entries · 5.0 GB · roots scanned 1 · skipped 0" in out
-    assert "HF_TOKEN=false" in out
-    assert "MODELSCOPE_API_TOKEN=true" in out
-    assert "values are never shown" in out
+    assert "HF token: not set" in out
+    assert "ModelScope API token: set (value never shown)" in out
+    # never KEY=true/false: that shape collides with env-assignment redaction
+    # and can make an unset token display as if set-and-hidden
+    assert "TOKEN=" not in out
     assert "pointing invitation: No GPU was detected" in out
     assert "1. Add a cloud GPU" in out
+
+
+def test_status_credentials_use_words_when_both_unset(plugin, monkeypatch):
+    payload = json.loads(_status_json())
+    payload["pull_credentials"] = {"HF_TOKEN": False,
+                                   "MODELSCOPE_API_TOKEN": False}
+    monkeypatch.setattr(plugin, "_status_payload", lambda: json.dumps(payload))
+    out = plugin.cockpit_command("status")
+    assert ("pull credentials: HF token: not set, "
+            "ModelScope API token: not set") in out
+    assert "TOKEN=" not in out
+    # nothing renders as set-and-hidden when nothing is set
+    assert "value never shown" not in out
 
 
 def test_status_error_json_renders_error_row(plugin, monkeypatch):
@@ -257,6 +288,20 @@ def test_status_error_json_renders_error_row(plugin, monkeypatch):
         plugin, "_status_payload",
         lambda: json.dumps({"error": "unknown target: 'nope'"}))
     assert plugin.cockpit_command("status") == "error: unknown target: 'nope'"
+
+
+def test_status_storage_says_no_model_artifacts_when_empty(plugin, monkeypatch):
+    # a root holding only cache bookkeeping says 'no model artifacts' rather
+    # than listing it as model weights
+    payload = json.loads(_status_json())
+    payload["storage"]["entries"] = []
+    payload["storage"]["roots"] = [{
+        "root": "huggingface-hub", "label": "Hugging Face hub cache",
+        "path": "/x/hub", "note": "no model artifacts"}]
+    monkeypatch.setattr(plugin, "_status_payload", lambda: json.dumps(payload))
+    out = plugin.cockpit_command("status")
+    assert "storage: no model artifacts" in out
+    assert "0 entries" not in out
 
 
 def test_browse_renders_fit_verdict_rows(plugin, monkeypatch):
@@ -271,6 +316,39 @@ def test_browse_renders_fit_verdict_rows(plugin, monkeypatch):
             "target (needs: comfyui)") in out
     assert "note: text-to-video" in out
     assert "Fit verdicts are advisory and cross-check the engines" in out
+    # the live freshness block renders: compact newest-first rows plus the
+    # honest 'fresh = live results, unvetted' note — never silently dropped
+    assert "fresh (2) · live discovery: ok" in out
+    assert "fresh = live results, unvetted" in out
+    assert ("org/fresh-new · 2026-03-01 · 1200 downloads · "
+            "image-classification") in out
+    assert out.index("org/fresh-new") < out.index("org/fresh-old")
+    assert "fresh note: Fresh = live HuggingFace results" in out
+
+
+def test_browse_fresh_block_states_why_when_rows_are_empty(plugin, monkeypatch):
+    # fresh=false / offline: zero rows with the honest reason attached
+    payload = json.loads(_browse_json())
+    payload["live_discovery"] = "disabled"
+    payload["fresh"] = []
+    payload["fresh_note"] = ("Live discovery skipped (fresh=false); "
+                             "curated catalog only.")
+    monkeypatch.setattr(plugin, "_browse_payload",
+                        lambda modality: json.dumps(payload))
+    out = plugin.cockpit_command("browse")
+    assert "fresh (0) · live discovery: disabled" in out
+    assert "Live discovery skipped (fresh=false); curated catalog only." in out
+
+
+def test_browse_says_so_when_fresh_block_is_absent(plugin, monkeypatch):
+    # a payload carrying no live-discovery block is never silently dropped
+    bare = json.loads(_browse_json())
+    del bare["live_discovery"], bare["fresh"], bare["fresh_note"]
+    monkeypatch.setattr(plugin, "_browse_payload",
+                        lambda modality: json.dumps(bare))
+    out = plugin.cockpit_command("browse")
+    assert "fresh: omitted" in out
+    assert "no live-discovery block" in out
 
 
 def test_browse_modality_reaches_payload_and_caps_rows(plugin, monkeypatch):
@@ -312,8 +390,13 @@ def test_broker_renders_residency_rows_and_guidance(plugin, monkeypatch):
     assert "pulled (1): qwen (5.0 GB)" in out
     assert "resident (1): qwen (engine=llamacpp, lane=chat)" in out
     assert "qwen = 16.0 GB · measured peak · source=bench" in out
+    # 'booked ceilings' = catalog nominal ceilings; the budget line's
+    # 'booked_now' = live claims — one meaning per word
+    assert "booked ceilings (1):" in out
+    assert "\nbooked (1):\n" not in out  # bare old header, line-anchored
     assert "unbooked (1):" in out
-    assert "hunyuan-video — no booked ceiling · run bench after first load" in out
+    assert ("hunyuan-video — no booked ceiling (no VRAM floor declared) · "
+            "run bench after first load") in out
     assert ("budget: nominal=24.0 GB · booked_now=16.0 GB · "
             "headroom=8.0 GB") in out
     assert "active scopes (1): scope-1 qwen (chat, claim)" in out
@@ -385,10 +468,10 @@ def test_command_times_out_cleanly(plugin, monkeypatch):
 
 
 def test_command_never_raises_on_payload_failure(plugin, monkeypatch):
-    def boom():
+    def failing_probe():
         raise RuntimeError("engine probe exploded")
 
-    monkeypatch.setattr(plugin, "_status_payload", boom)
+    monkeypatch.setattr(plugin, "_status_payload", failing_probe)
     monkeypatch.setattr(plugin, "_browse_payload", lambda modality: "not json{")
     monkeypatch.setattr(plugin, "_broker_payload",
                         lambda: json.dumps(["not", "an", "object"]))
@@ -496,3 +579,20 @@ def test_readme_surface_parity_sections():
         for surface in ("Desktop", "Telegram", "CLI / TUI", "dashboard"):
             assert surface in text
         assert "/model-forge" in text
+
+
+def test_readme_disclosure_names_every_network_surface():
+    # Disclosure completeness: every network/config surface the plugin gained
+    # (dashboard API route, /model-forge command reads, user-declared endpoint
+    # probing, the approved config + custom_providers write) is named in the
+    # Disclosure section of both READMEs.
+    for path in (REPO / "README.md", PLUGIN_DIR / "README.md"):
+        text = path.read_text()
+        start = text.index("## Disclosure")
+        section = text[start:text.index("## Requirements")]
+        assert "/api/plugins/model-forge/cockpit" in section
+        assert "engines_json" in section
+        assert "/model-forge" in section
+        assert "custom_providers" in section
+        assert "human-approval gate" in section
+        assert "**Telemetry:** none" in section

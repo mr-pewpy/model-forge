@@ -1640,6 +1640,10 @@ def test_broker_status_marks_unbooked_engine_managed_rows(tmp_path,
     for row in rows.values():
         assert row["vram_gb"] is None
         assert row["hint"] == "unbooked — run bench after first load"
+        # the label names the missing booked ceiling — it never reuses the
+        # booking source token to mean its absence
+        assert row["label"] == "no booked ceiling (no VRAM floor declared)"
+        assert "catalog-vram-floor" not in row["label"]
     # never presented as booked ceilings (and stubs/markers stay out)
     booked_ids = {row["model_id"] for row in out["booked"]}
     assert not set(rows) & booked_ids

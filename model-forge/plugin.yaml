@@ -6,7 +6,14 @@ description: >-
   image, image edit, video, 3D, music, SFX, voice, OCR — and Model Forge finds
   the right inference engine, pulls the model (or hands you the exact run
   command), and wires it into
-  Hermes.
+  Hermes. Disclosure: probes only the engine endpoints you configure
+  (compute targets and declared engine endpoints) and the public HuggingFace
+  API; downloads model files into the plugin data dir (optional extra
+  download roots in settings); writes your Hermes config (default model and
+  a custom_providers entry) only after human approval — the same gate covers
+  target registration, storage deletion, and vendor engine installers.
+  Optional Hugging Face / ModelScope tokens are sent to their own hosts
+  only. No telemetry.
 author: anai (Pewpy)
 license: MIT
 config_schema:

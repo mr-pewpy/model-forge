@@ -76,6 +76,25 @@ instead of hanging.
   tool verb that rides the human-approval gate — the same on every surface,
   fail closed on denial or timeout.
 
+## Approval coverage (W5.2)
+
+Every write, destructive, or policy-relevant action in the tool surface,
+mapped to its rule key or its explicit, documented reason for needing no
+gate (verified against the handlers in `model_forge/tools.py` and the
+`policy_hook`):
+
+| Action | Coverage |
+|---|---|
+| `model_forge_target_add` (registers where engine calls, media jobs and downloads may go) | Human-approval gate, rule key `model-forge:target_add`; the prompt shows the exact address; fail closed on denial or timeout |
+| `model_forge_activate` with `apply=true` (writes `model.default` / `model.provider` / `base_url` **and** a `custom_providers` entry) | Gate, rule key `model-forge:activate`; the prompt names the model, target and the `custom_providers` slug |
+| `model_forge_storage` with `action=delete` (destroys model weights on disk) | Gate, rule key `model-forge:storage_delete`; the prompt names the exact path and size; only inventory-returned entries are deletable |
+| `model_forge_install` with `action=engine_install`, `execute=true` (runs a vendor installer in a background job) | Gate, rule key `model-forge:engine_install`; the prompt shows the exact command; commands come only from the fixed vendor catalog, never from a model-supplied string |
+| `model_forge_install` model pulls (file writes) | No gate — documented reason: destinations are confined to the plugin downloads dir plus user-configured `download_roots` (symlinks refused); nothing existing is destroyed |
+| `model_forge_broker` `claim` / `release` (engine load/unload; may start and stop `llama-server` or vLLM server processes on a target) | No gate — documented reason: they move only model weights on compute targets the user registered (each registration passed the gate) or configured in settings; no data is destroyed |
+| `model_forge_generate_media` (jobs to a media gateway; results saved under the plugin data dir) | No gate — documented reason: the endpoint is user-configured; generated files land only under the plugin data dir |
+| `model-forge-providers` `hermes model` setup step (writes `model:` + `custom_providers`) | No gate — documented reason: it runs only from the interactive `hermes model` flow where the user's own pick is the decision; it is not reachable from a model-driven tool call |
+| Everything else (`model_forge_status`, `model_forge_browse`, `model_forge_storage list`, `model_forge_broker status/plan/bench`, `/model-forge`, the cockpit panes, the dashboard tab) | Read-only |
+
 ## Mobile readiness (W4.3)
 
 Every capability in this matrix is **gateway-side**: the `/model-forge`
