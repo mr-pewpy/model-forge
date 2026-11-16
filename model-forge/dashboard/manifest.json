@@ -1,0 +1,13 @@
+{
+  "name": "model-forge",
+  "label": "Model Forge",
+  "description": "Model Forge cockpit: compute targets and GPU hardware, engines, model fit data, and installed model storage — the same read-only data the /model-forge command and the Desktop cockpit pane render.",
+  "icon": "Zap",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/model-forge",
+    "position": "after:skills"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

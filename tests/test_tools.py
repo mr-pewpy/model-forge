@@ -591,7 +591,7 @@ def test_activate_apply_writes(tmp_path, monkeypatch):
     _ok_engine(monkeypatch, ("chat",))
     setup = types.ModuleType("hermes_cli.model_setup")
     setup.persist_model_selection = (
-        lambda model, provider, base_url="": {"model": model})
+        lambda model, provider, base_url="", api_mode=None: {"model": model})
     monkeypatch.setitem(sys.modules, "hermes_cli.model_setup", setup)
     out = json.loads(tools.model_forge_activate(
         {"model_id": "glm-5.3-flash", "target": "gpu-box", "apply": True}))
@@ -2314,3 +2314,251 @@ def test_config_schema_settings_shapes():
         assert f"env: {env}" in block
         assert "secret store" in block
         assert "(optional)" in block
+
+
+# --- /model integration: custom_providers registration ----------------------
+
+def _config_stub(monkeypatch, cfg=None, save_error=None):
+    """hermes_cli.config fake whose load/save round-trip a real dict — the
+    exact surface write_custom_provider_entry exercises."""
+    mod = types.ModuleType("hermes_cli.config")
+    state = json.loads(json.dumps(cfg or {}))
+
+    def _load():
+        return json.loads(json.dumps(state))
+
+    def _save(new_cfg):
+        if save_error is not None:
+            raise save_error
+        mod.saved.append(json.loads(json.dumps(new_cfg)))
+        state.clear()
+        state.update(json.loads(json.dumps(new_cfg)))
+
+    mod.load_config_readonly = _load
+    mod.load_config = _load
+    mod.save_config = _save
+    mod.saved = []
+    mod.state = state
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", mod)
+    return mod
+
+
+def _persist_stub(monkeypatch):
+    """hermes_cli.model_setup fake matching the documented helper signature
+    (persist_model_selection(model, provider, *, base_url, api_mode))."""
+    mod = types.ModuleType("hermes_cli.model_setup")
+
+    def persist_model_selection(model, provider, *, base_url=None,
+                                api_mode=None):
+        mod.calls.append({"model": model, "provider": provider,
+                          "base_url": base_url, "api_mode": api_mode})
+        return {"default": model, "provider": provider,
+                "base_url": base_url, "api_mode": api_mode}
+
+    mod.persist_model_selection = persist_model_selection
+    mod.calls = []
+    monkeypatch.setitem(sys.modules, "hermes_cli.model_setup", mod)
+    return mod
+
+
+def _resolvable(slug, providers=()):
+    """The model-selection-integration.md identity rule for persisted
+    provider slugs: custom, custom:<name>, registered provider slugs, and
+    the llamacpp aliases. Engine codenames are never resolvable."""
+    s = str(slug)
+    if s == "custom":
+        return True
+    if s.startswith("custom:"):
+        names = {"custom:" + str(e.get("name") or "").strip().lower()
+                       .replace(" ", "-")
+                 for e in providers if isinstance(e, dict)}
+        return s in names
+    return s in {"strata", "maya", "model-forge",
+                 "llamacpp", "llama.cpp", "llama-cpp"}
+
+
+def test_activate_plan_shows_custom_provider_entry(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _ok_engine(monkeypatch, ("chat",))
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box"}))
+    assert out["ok"] is True
+    cp = out["custom_provider"]
+    assert cp["slug"] == "custom:gpu-box"
+    assert cp["applied"] is False          # plan-only: nothing written yet
+    entry = cp["entry"]
+    assert entry["name"] == "gpu-box"
+    assert entry["base_url"] == "http://gpu-box.example.com:8080/v1"
+    assert entry["api_mode"] == "chat_completions"
+    assert entry["models"] == {"glm-5.3-flash": {}}
+    assert "/model" in cp["write"]
+    # plan detail names the same slug and the shared state vocabulary
+    assert cp["slug"] in out["detail"]
+    assert tools._NEXT_SESSION_NOTE in out["detail"]
+
+
+def test_activate_apply_registers_custom_provider_roundtrip(tmp_path,
+                                                            monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _ok_engine(monkeypatch, ("chat",))
+    cfg_mod = _config_stub(monkeypatch)
+    setup = _persist_stub(monkeypatch)
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box", "apply": True}))
+    assert out["applied"] is True
+    assert out["custom_provider"]["applied"] is True
+    # persist_model_selection per the reference: model + resolvable slug
+    # provider + the endpoint; api_mode set explicitly
+    call = setup.calls[0]
+    assert call["model"] == "glm-5.3-flash"
+    assert call["provider"] == "custom"       # generic engine -> custom class
+    assert call["base_url"] == "http://gpu-box.example.com:8080/v1"
+    assert call["api_mode"] == "chat_completions"
+    # the custom_providers entry round-trips through the reference's identity
+    # rule: legacy entries key their slug on the normalized display name
+    rows = cfg_mod.state["custom_providers"]
+    assert len(rows) == 1
+    saved = rows[0]
+    slug = "custom:" + saved["name"].lower().replace(" ", "-")
+    assert slug == out["custom_provider"]["slug"] == "custom:gpu-box"
+    assert "glm-5.3-flash" in saved["models"]
+    assert _resolvable(slug, rows)
+
+
+def test_activate_custom_provider_merge_declares_models(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _ok_engine(monkeypatch, ("chat",))
+    cfg_mod = _config_stub(monkeypatch, {
+        "custom_providers": [{
+            "name": "gpu-box",
+            "base_url": "http://old-endpoint.example.com:9000/v1",
+            "api_key": "kept-secret",
+            "models": {"older-model": {"context_length": 4096}},
+        }]})
+    _persist_stub(monkeypatch)
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box", "apply": True}))
+    rows = cfg_mod.state["custom_providers"]
+    assert len(rows) == 1                    # merged, never duplicated
+    saved = rows[0]
+    # declared models merge: a later activation never drops an earlier id
+    assert set(saved["models"]) == {"older-model", "glm-5.3-flash"}
+    assert saved["models"]["older-model"] == {"context_length": 4096}
+    # the slug identity moved with its target; other keys survive
+    assert saved["base_url"] == "http://gpu-box.example.com:8080/v1"
+    assert saved["api_key"] == "kept-secret"
+    assert out["custom_provider"]["applied"] is True
+
+
+def test_activate_apply_custom_provider_failure_is_honest(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _ok_engine(monkeypatch, ("chat",))
+    _config_stub(monkeypatch, save_error=OSError("config is read-only"))
+    _persist_stub(monkeypatch)
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box", "apply": True}))
+    # per-write honest state: the model section persisted, the registration
+    # failed — and the failure is reported, never folded into the other state
+    assert out["applied"] is True
+    assert out["custom_provider"]["applied"] is False
+    assert "OSError" in out["custom_provider"]["error"]
+
+
+def test_activate_persisted_slugs_are_resolvable():
+    from model_forge.registry import ModelEntry
+    from model_forge.tools import activation_plan
+
+    cases = [
+        ("glm-5.3-flash", ["maya"], "maya"),
+        ("qwen3.8-flash-next", ["strata"], "strata"),
+        ("minicpm-v-4.6", ["vllm"], "custom"),
+        ("qwen3.8-flash-next", ["openai-compatible"], "custom"),
+    ]
+    for mid, available, want_provider in cases:
+        entry = next(m for m in models_for() if m.id == mid)
+        plan = activation_plan(entry, _REMOTE, available)
+        assert plan["ok"] is True and plan["provider"] == want_provider, mid
+        assert _resolvable(plan["provider"]), plan["provider"]
+        slug = plan["custom_provider"]["slug"]
+        assert _resolvable(slug, [plan["custom_provider"]["entry"]]), slug
+        # round-trip: the slug resolves to an entry declaring the model that
+        # would be persisted as model.default
+        assert plan["model"] in plan["custom_provider"]["entry"]["models"]
+    # an unregistered engine codename maps to the custom class, never its own
+    # invented slug
+    ollama = ModelEntry(id="ollama-chat", name="Ollama chat", modality="chat",
+                        engines=("ollama",), source="a/b")
+    plan = activation_plan(ollama, _REMOTE, ["ollama"])
+    assert plan["provider"] == "custom"
+    assert plan["custom_provider"]["slug"] == "custom:gpu-box"
+    # the local target keeps its own resolvable identity
+    plan = activation_plan(
+        next(m for m in models_for() if m.id == "glm-5.3-flash"),
+        _LOCAL, ["openai-compatible"])
+    assert plan["custom_provider"]["slug"] == "custom:local"
+    assert _resolvable(plan["custom_provider"]["slug"],
+                       [plan["custom_provider"]["entry"]])
+
+
+def test_policy_hook_activate_approval_shows_custom_provider_write():
+    from model_forge import tools
+
+    d = tools.policy_hook("model_forge_activate",
+                          {"model_id": "m1", "target": "gpu-box",
+                           "apply": True})
+    assert d["action"] == "approve"
+    assert d["rule_key"] == "model-forge:activate"
+    # the approval prompt shows the custom_providers write and its slug —
+    # the same slug the plan and the write use
+    assert "custom_providers" in d["message"]
+    assert "custom:gpu-box" in d["message"]
+    assert "custom:gpu-box" == tools.custom_provider_slug_for("gpu-box")
+    # gating unchanged: plan-only still needs no approval
+    assert tools.policy_hook("model_forge_activate",
+                             {"model_id": "m1"}) is None
+
+
+def test_activate_media_setup_provider_strings_use_shared_vocabulary(
+        tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _ok_engine(monkeypatch, ("chat", "image", "video"))
+    monkeypatch.setattr(tools, "route_exists",
+                        lambda root, path, timeout=2.0: True)
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box"}))
+    media = out["media_setup"]
+    # the provider token and settings paths are the exact strings the media
+    # providers register and read (cross-checked in test_capability)
+    assert media["image_gen"] == (
+        "hermes config set plugins.entries.model-forge-image.settings"
+        ".base_url http://gpu-box.example.com:8080/v1 && hermes config set "
+        "image_gen.provider " + tools._MEDIA_PROVIDER_NAME)
+    assert media["video_gen"] == (
+        "hermes config set plugins.entries.model-forge-video.settings"
+        ".base_url http://gpu-box.example.com:8080/v1 && hermes config set "
+        "video_gen.provider " + tools._MEDIA_PROVIDER_NAME)

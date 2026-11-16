@@ -67,8 +67,34 @@ data, and installed model storage in the `model_forge_storage` list shape
 tool verb that rides the human-approval gate, so the pane names the delete
 verb (`model_forge_storage` `action=delete`) instead of deleting in-pane.
 Its data door is the read-only **`/model-forge`** command
-(`cockpit`, `models [modality]`, `storage`) — also handy in chat and the
-CLI, and always read-only.
+(`cockpit`, `models [modality]`, `storage` — the JSON rows) — also handy in
+chat and the CLI, and always read-only. The same command renders plain-text
+rows for chat on every surface commands work on (Desktop chat, Telegram,
+CLI/TUI): `status`, `browse [modality]`, `broker`, `claim`, `release`, and
+`help`. A **dashboard tab** (`model-forge/dashboard/`) renders the same
+cockpit data in the Hermes web dashboard.
+
+## Surface parity
+
+One Model Forge experience on every Hermes surface:
+
+| Surface | What you get |
+|---|---|
+| **Desktop app** | The cockpit pane (GPU & compute targets with the pointing invitation, declared + detected engines, model fit rows, installed model storage) plus the same tools in chat. |
+| **Telegram** (and other gateway chats) | The `/model-forge` command — `cockpit`, `models [modality]`, `storage` (JSON rows) and `status`, `browse [modality]`, `broker`, `claim`, `release`, `help` (plain-text rows built for chat) — plus every tool through the agent. |
+| **CLI / TUI** | The same `/model-forge` command and tools; model switching is core (`/model`, `hermes model`). |
+| **Web dashboard** | The Model Forge tab (`model-forge/dashboard/`): the same cockpit data — targets, engines, models, storage — as a read-only snapshot. |
+| **Mobile (future)** | Everything here is gateway-side, so a future mobile chat client inherits it; on-device mobile inference is a named future lane. |
+
+Every surface renders the same honest state vocabulary (advisory fit
+verdicts, engine availability with stated reasons, residency states
+`queued` → `loading` → `ready`), and every mutating verb (target
+registration, install, activation writes, storage deletion, installer
+execution) rides the human-approval gate as a tool verb — the command and
+the panes are read-only and name those verbs instead of duplicating them.
+The full capability matrix, including the honest gaps (in-pane storage
+delete rides the approval-gate verb; live desktop rendering is untested in
+CI), is in [docs/surface-parity.md](../docs/surface-parity.md).
 
 ## Point Model Forge at your compute (guided pointing)
 
@@ -330,7 +356,9 @@ Honest scoping — current limits, and what does not work yet:
   probes from the app.
 - **Approvals:** four actions escalate to Hermes' human-approval gate and
   fail closed on denial or timeout — registering a compute target, writing
-  the default model config (`model_forge_activate` with `apply=true`),
+  the default model config plus a `custom_providers` entry (so the
+  activated model is switchable with `/model`) via
+  `model_forge_activate` with `apply=true`,
   deleting a model-storage entry (`model_forge_storage` with `action=delete`;
   the prompt names the exact path and size), and running a vendor engine
   installer (`model_forge_install` with `action=engine_install`,

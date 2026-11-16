@@ -270,8 +270,11 @@ ACTIVATE = {
     "description": (
         "Connect a running chat/vision model as THIS Hermes' default model "
         "on the next session. Safe by default: without apply=true it only "
-        "shows what would change. Use when the user says 'use this model', "
-        "'run hermes on it', or 'make it my model'."
+        "shows what would change. apply=true (behind the human-approval "
+        "gate) writes the model config AND registers the matching "
+        "custom_providers entry so the model is selectable via /model "
+        "afterwards. Use when the user says 'use this model', 'run hermes "
+        "on it', or 'make it my model'."
     ),
     "parameters": {
         "type": "object",
@@ -294,8 +297,9 @@ ACTIVATE = {
             "apply": {
                 "type": "boolean",
                 "description": (
-                    "true = actually write model.* config (confirm with the "
-                    "user first). false/omitted = plan only."
+                    "true = actually write model.* config and the "
+                    "custom_providers entry (confirm with the user first). "
+                    "false/omitted = plan only."
                 ),
             },
         },

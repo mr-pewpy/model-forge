@@ -75,6 +75,110 @@ _PROVIDER_FOR_ENGINE = {
     "vllm": "custom",
     "openai-compatible": "custom",
 }
+# --- /model integration (model-selection-integration.md) --------------------
+# Persisted provider slugs are resolvable identities only: registered slugs
+# ("strata" / "maya" — registered by the model-forge-providers package), the
+# llamacpp aliases, or the custom class (custom / custom:<name>). Engine
+# codenames are never slugs.
+_CUSTOM_PROVIDER_API_MODE = "chat_completions"
+# One state vocabulary everywhere: the activation plan, the approval prompt
+# and the apply output all describe the persist with the same sentence.
+_NEXT_SESSION_NOTE = "takes effect on your next session"
+# The media providers (model-forge-image / model-forge-video) register under
+# this provider name; the media_setup hints must say exactly this.
+_MEDIA_PROVIDER_NAME = "model-forge"
+
+
+def custom_provider_name(target_id: str) -> str:
+    """Entry name whose custom:<name> identity is ``custom:<target-id>``:
+    legacy ``custom_providers`` entries key their slug on the normalized
+    display name (hermes_cli.providers.custom_provider_slug)."""
+    return (target_id or "").strip().lower().replace(" ", "-")
+
+
+def custom_provider_slug_for(target_id: str) -> str:
+    """The resolvable ``custom:<target-id>`` identity for a compute target
+    (slug rules: custom / custom:<name> / registered slugs / llamacpp
+    aliases — never invented engine codenames)."""
+    return "custom:" + custom_provider_name(target_id)
+
+
+def custom_provider_entry(model_id: str, *, name: str, base_url: str) -> dict:
+    """The ``custom_providers`` entry declaring a Model Forge-served model —
+    the documented discovery surface that makes it selectable via ``/model``
+    (a typed model id a custom_providers entry DECLARES routes to that entry
+    automatically). Declared models merge on update; per-model metadata is
+    written only where it is actually known."""
+    return {
+        "name": name,
+        "base_url": base_url,
+        "api_mode": _CUSTOM_PROVIDER_API_MODE,
+        "models": {model_id: {}},
+    }
+
+
+def merge_custom_provider_entry(entry: dict, providers) -> tuple[list, dict]:
+    """Merge *entry* into a ``custom_providers`` list and return
+    ``(rows, merged)``. Identity: the entry's ``custom:<name>`` slug (its
+    name), else slash-normalized base_url + api_mode — the reference's match
+    rule. Declared models merge: a later activation or /v1/models probe never
+    drops an already-declared model id."""
+    rows = [r for r in (providers or []) if isinstance(r, dict)]
+    name = str(entry.get("name") or "").strip()
+    base = str(entry.get("base_url") or "").strip()
+    mode = str(entry.get("api_mode") or "").strip()
+
+    def _declared(models) -> dict:
+        if isinstance(models, dict):
+            return {str(k): (dict(v) if isinstance(v, dict) else {})
+                    for k, v in models.items()}
+        if isinstance(models, list):
+            return {str(m): {} for m in models if isinstance(m, str)}
+        return {}
+
+    merged = None
+    out = []
+    for row in rows:
+        row_name = str(row.get("name") or "").strip()
+        row_base = str(row.get("base_url") or row.get("url") or "").strip()
+        same_name = bool(name) and row_name == name
+        same_route = (bool(base) and bool(row_base)
+                      and row_base.rstrip("/").lower() == base.rstrip("/").lower()
+                      and str(row.get("api_mode") or "").strip() == mode)
+        if merged is None and (same_name or same_route):
+            row = dict(row)
+            declared = _declared(row.get("models"))
+            for mid, meta in (entry.get("models") or {}).items():
+                declared.setdefault(mid, dict(meta) if isinstance(meta, dict) else {})
+            row["models"] = declared
+            if same_name:
+                # The slug identity moved with its target: point it at the
+                # endpoint the activation just proved out.
+                row["name"] = name
+                row["base_url"] = base
+                row["api_mode"] = mode
+            merged = row
+            out.append(row)
+        else:
+            out.append(row)
+    if merged is None:
+        merged = dict(entry)
+        out.append(merged)
+    return out, merged
+
+
+def write_custom_provider_entry(entry: dict) -> dict:
+    """Register the entry in config.yaml's ``custom_providers`` list (the
+    /model discovery surface) and save. Raises on config failure — callers
+    report the failure honestly instead of hiding it."""
+    from hermes_cli.config import load_config, save_config
+    cfg = load_config()
+    rows, merged = merge_custom_provider_entry(entry, cfg.get("custom_providers"))
+    cfg["custom_providers"] = rows
+    save_config(cfg)
+    return merged
+
+
 # Engine provisioning: the vendor-official install commands Model Forge's
 # engine_install action may plan and run. The command is never model-supplied
 # — only these fixed strings can execute, and only after the human-approval
@@ -175,16 +279,21 @@ def policy_hook(tool_name: str, args: dict | None = None, task_id: str = "",
             "rule_key": "model-forge:target_add",
         }
     if tool_name == "model_forge_activate" and args.get("apply") is True:
+        slug = custom_provider_slug_for(str(args.get("target") or "local"))
+        shown_engine_model = args.get("engine_model") or "(registry default)"
         return {
             "action": "approve",
             "message": (
                 "Model Forge wants to rewrite your default model config "
-                "(model.default, model.provider, base_url) so future "
-                "sessions chat through this endpoint:\n"
+                "(model.default, model.provider, base_url) and register the "
+                "custom_providers entry " + slug + " (declaring the served "
+                "model) so future sessions chat through this endpoint and "
+                "/model can switch to it:\n"
                 f"  model_id: {args.get('model_id')}\n"
                 f"  target: {args.get('target') or 'local'}\n"
-                f"  engine_model: {args.get('engine_model') or '(registry '
-                f'default)'}"),
+                f"  engine_model: {shown_engine_model}\n"
+                f"  custom_providers: {slug} (declares the served model "
+                f"id)"),
             "rule_key": "model-forge:activate",
         }
     if tool_name == "model_forge_install" \
@@ -501,15 +610,29 @@ def activation_plan(entry: ModelEntry, target: ComputeTarget,
                           f"{target.base_url} — install/serve first"}
     provider = _PROVIDER_FOR_ENGINE.get(engine, "custom")
     model_id = engine_model or entry.engine_models.get(engine) or entry.id
+    base_v1 = root_url(target.base_url) + "/v1"
+    slug = custom_provider_slug_for(target.id)
+    cp_entry = custom_provider_entry(model_id, name=custom_provider_name(target.id),
+                                     base_url=base_v1)
     return {
         "ok": True,
         "action": "persist_model_selection",
         "provider": provider,
         "model": model_id,
-        "base_url": root_url(target.base_url) + "/v1",
-        "detail": "writes model.default + model.provider (+ base_url) via "
-                  "the documented hermes_cli.model_setup helper; takes "
-                  "effect on your next session",
+        "base_url": base_v1,
+        "custom_provider": {
+            "slug": slug,
+            "entry": cp_entry,
+            "applied": False,
+            "write": ("registers the custom_providers entry " + slug
+                      + " declaring '" + model_id + "' so /model can "
+                      "select it"),
+        },
+        "detail": ("writes model.default + model.provider (+ base_url) via "
+                  "the documented hermes_cli.model_setup helper and "
+                  "registers the custom_providers entry " + slug + " "
+                  "(declaring '" + model_id + "') so /model can switch to "
+                  "it; " + _NEXT_SESSION_NOTE),
     }
 
 
@@ -1080,7 +1203,7 @@ def model_forge_activate(args: dict | None = None, **kwargs) -> str:
                 media[key] = (
                     f"hermes config set plugins.entries.{plugin}"
                     f".settings.base_url {base_v1} && hermes config set "
-                    f"{key}.provider model-forge")
+                    f"{key}.provider {_MEDIA_PROVIDER_NAME}")
             if media:
                 plan["media_setup"] = media
             if withheld:
@@ -1095,12 +1218,25 @@ def model_forge_activate(args: dict | None = None, **kwargs) -> str:
                     from hermes_cli.model_setup import persist_model_selection
                     saved = persist_model_selection(
                         plan["model"], plan["provider"],
-                        base_url=plan["base_url"])
+                        base_url=plan["base_url"],
+                        api_mode=_CUSTOM_PROVIDER_API_MODE)
                     plan["applied"] = True
                     plan["saved_model_section"] = saved
                 except Exception as exc:
                     plan["applied"] = False
                     plan["error"] = f"{type(exc).__name__}: {exc}"
+                # The custom_providers registration is its own honest write:
+                # a failure here is reported beside the model-section state,
+                # never folded into it.
+                try:
+                    plan["custom_provider"]["saved"] = \
+                        write_custom_provider_entry(
+                            plan["custom_provider"]["entry"])
+                    plan["custom_provider"]["applied"] = True
+                except Exception as exc:
+                    plan["custom_provider"]["applied"] = False
+                    plan["custom_provider"]["error"] = \
+                        f"{type(exc).__name__}: {exc}"
             else:
                 plan["applied"] = False
                 plan["hint"] = "re-run with apply=true to write the config"

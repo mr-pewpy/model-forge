@@ -9,6 +9,7 @@ nothing touches the network or the live config.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import sys
 import types
@@ -676,3 +677,401 @@ def test_cockpit_models_reuses_browse_fit_data(tmp_path, monkeypatch):
     # fit blocks carry the verdict + advisory the pane renders
     fit = cockpit["models"][0]["fit"]
     assert fit["verdict"] and "advisory" in fit
+
+
+# --- model-forge-providers: native /model provider registration -------------
+
+_REPO = Path(__file__).resolve().parent.parent
+
+
+def _load_providers_pkg(monkeypatch):
+    """Load model-forge-providers/__init__.py by file path against fakes for
+    the provider registry (the test venv has no Hermes runtime)."""
+    registered = []
+    providers_mod = types.ModuleType("providers")
+    base_mod = types.ModuleType("providers.base")
+
+    class ProviderProfile:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+            for attr, default in (
+                    ("aliases", ()), ("display_name", ""), ("description", ""),
+                    ("env_vars", ()), ("base_url", ""),
+                    ("api_mode", "chat_completions"),
+                    ("supports_model_listing", True),
+                    ("supports_health_check", True),
+                    ("fallback_models", ()), ("model_aliases", {}),
+                    ("model_capabilities", {}), ("model_setup_flow", None)):
+                self.__dict__.setdefault(attr, default)
+
+    base_mod.ProviderProfile = ProviderProfile
+    providers_mod.base = base_mod
+    providers_mod.register_provider = registered.append
+    monkeypatch.setitem(sys.modules, "providers", providers_mod)
+    monkeypatch.setitem(sys.modules, "providers.base", base_mod)
+    path = _REPO / "model-forge-providers" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("mf_providers", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "mf_providers", mod)
+    spec.loader.exec_module(mod)
+    return mod, registered
+
+
+def _fake_model_setup(monkeypatch):
+    mod = types.ModuleType("hermes_cli.model_setup")
+
+    def persist_model_selection(model, provider, *, base_url=None,
+                                api_mode=None):
+        mod.calls.append({"model": model, "provider": provider,
+                          "base_url": base_url, "api_mode": api_mode})
+        return {"default": model, "provider": provider}
+
+    mod.persist_model_selection = persist_model_selection
+    mod.calls = []
+    monkeypatch.setitem(sys.modules, "hermes_cli.model_setup", mod)
+    return mod
+
+
+def _fake_config_store(monkeypatch, cfg=None):
+    mod = types.ModuleType("hermes_cli.config")
+    state = json.loads(json.dumps(cfg or {}))
+
+    def _load():
+        return json.loads(json.dumps(state))
+
+    def _save(new_cfg):
+        state.clear()
+        state.update(json.loads(json.dumps(new_cfg)))
+
+    mod.load_config_readonly = _load
+    mod.load_config = _load
+    mod.save_config = _save
+    mod.state = state
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", mod)
+    return mod
+
+
+def test_providers_package_registration_shape(monkeypatch):
+    mod, registered = _load_providers_pkg(monkeypatch)
+    by_name = {p.name: p for p in registered}
+    assert set(by_name) == {"model-forge", "strata", "maya"}
+    assert set(by_name) == set(mod.REGISTERED_SLUGS)
+    for p in registered:
+        # loopback rule: a base_url here would map every localhost endpoint
+        # to this provider and disable local-server detection
+        assert p.base_url == ""
+        # the final *_BASE_URL env var is the user base-URL override
+        assert p.env_vars[-1].endswith("_BASE_URL")
+        assert p.fallback_models       # pickers always have a list
+        assert p.model_capabilities    # declared per model id
+        assert callable(p.model_setup_flow)
+    assert callable(by_name["model-forge"].fetch_models)
+    # engines that may be off keep the documented honest flags
+    for name in ("strata", "maya"):
+        assert by_name[name].supports_model_listing is False
+        assert by_name[name].supports_health_check is False
+
+
+def test_providers_capabilities_honest_against_registry(monkeypatch):
+    mod, registered = _load_providers_pkg(monkeypatch)
+    from model_forge.registry import MODELS
+    from model_forge.tools import _CATALOG_MARKER_IDS
+
+    def entry_for(mid):
+        # "deepseek-v4.1-flash-1017" is the registry entry's name spelling,
+        # kept verbatim as the maya row's existing fallback id
+        if mid == "deepseek-v4.1-flash-1017":
+            mid = "deepseek-v4.1-flash"
+        for m in MODELS:
+            if m.id == mid or mid in (m.engine_models or {}).values():
+                return m
+        return None
+
+    for mid, caps in mod.MODEL_CAPABILITIES.items():
+        entry = entry_for(mid)
+        assert entry is not None, mid       # only real registry ids declared
+        if caps.get("supports_vision") is True:
+            # vision flags only where the registry knows them
+            assert entry.modality in ("vision", "ocr") or "vision" in entry.note, mid
+        if "supports_reasoning" in caps:
+            assert "thinking" in entry.note, mid
+        if "context_window" in caps:
+            # context windows only where the registry states one
+            assert str(caps["context_window"]) in entry.note, mid
+        # unknown stays unknown: no False fillers anywhere
+        for key, value in caps.items():
+            assert value is not False, (mid, key)
+    # unknown-but-honest: models the registry states nothing about carry no
+    # invented fields at all
+    for mid in ("qwen3.8-flash-next", "deepseek-v4.1-flash", "deepseek-maya-s"):
+        assert mod.MODEL_CAPABILITIES[mid] == {}
+    # per-model completeness: every id the package offers or persists is
+    # declared
+    ids = set(mod.MODEL_CAPABILITIES)
+    for row in mod.CURATED_CHAT_VISION:
+        ids.update(row["served_ids"])
+    for p in registered:
+        ids.update(p.fallback_models)
+    assert ids <= set(mod.MODEL_CAPABILITIES)
+    # the curated set is exactly the registry's activatable chat/vision ids
+    # (catalog markers and stubs are not served model ids)
+    registry_chatvision = {m.id for m in MODELS
+                           if m.modality in ("chat", "vision")
+                           and m.status != "stub"
+                           and m.id not in _CATALOG_MARKER_IDS}
+    assert set(mod.CURATED_IDS) == registry_chatvision
+    # the served-id map matches the registry's engine_models exactly
+    for row in mod.CURATED_CHAT_VISION:
+        entry = entry_for(row["id"])
+        assert set(row["served_ids"]) == \
+            {row["id"]} | set((entry.engine_models or {}).values()), row["id"]
+
+
+def test_providers_fetch_models_curated_plus_live(monkeypatch):
+    mod, registered = _load_providers_pkg(monkeypatch)
+    profile = next(p for p in registered if p.name == "model-forge")
+    cfg_mod = _fake_config_store(monkeypatch, {
+        "plugins": {"entries": {"model-forge": {"settings": {
+            "engines_json": [{"label": "Workstation vLLM",
+                              "base_url": "http://gpu-box.example.com:8000"}],
+        }}}}})
+    monkeypatch.delenv("MODEL_FORGE_BASE_URL", raising=False)
+    # fake engines: the declared endpoint serves two extra model ids
+    served = {"http://gpu-box.example.com:8000":
+              ["minicpm-v-4.6", "extra-live-model"]}
+    monkeypatch.setattr(mod, "_probe_served_models",
+                        lambda root, timeout=8.0: served.get(root))
+    got = profile.fetch_models()
+    # curated chat/vision first, then live engine-served listings, deduped
+    assert got[:len(mod.CURATED_IDS)] == list(mod.CURATED_IDS)
+    assert "extra-live-model" in got
+    assert got.count("minicpm-v-4.6") == 1
+    # a caller-passed endpoint joins the probe set (the /model picker's
+    # current custom endpoint)
+    monkeypatch.setattr(mod, "_probe_served_models",
+                        lambda root, timeout=8.0:
+                        ["served-here"] if "8080" in root else served.get(root))
+    before = json.loads(json.dumps(cfg_mod.state))
+    got = profile.fetch_models(base_url="http://gpu-box.example.com:8080/v1")
+    assert "served-here" in got and "extra-live-model" in got
+    # a fetch never mutates config
+    assert cfg_mod.state == before
+
+
+def test_providers_fetch_models_falls_back_when_fetch_fails(monkeypatch):
+    mod, registered = _load_providers_pkg(monkeypatch)
+    profile = next(p for p in registered if p.name == "model-forge")
+    cfg_mod = _fake_config_store(monkeypatch, {})
+    monkeypatch.delenv("MODEL_FORGE_BASE_URL", raising=False)
+    # nothing detectable: no listing at all, so pickers use fallback_models
+    assert profile.fetch_models() is None
+    # endpoints detectable but every engine is off (fake engine answers nothing)
+    cfg_mod.load_config_readonly = lambda: {
+        "plugins": {"entries": {"model-forge": {"settings": {
+            "targets_json": [{"id": "gpu-box",
+                              "base_url": "http://gpu-box.example.com:8080"}],
+        }}}}}
+    monkeypatch.setattr(mod, "_probe_served_models",
+                        lambda root, timeout=8.0: None)
+    assert profile.fetch_models() is None
+    assert profile.fallback_models == mod.CURATED_IDS
+    for p in registered:
+        assert len(p.fallback_models) >= 1
+
+
+def test_providers_setup_flow_persists_and_registers(monkeypatch, capsys):
+    mod, registered = _load_providers_pkg(monkeypatch)
+    cfg = {"custom_providers": [
+        {"name": "gpu-box",
+         "base_url": "http://gpu-box.example.com:8080/v1",
+         "models": {"glm-maya-s": {}}}]}
+    setup = _fake_model_setup(monkeypatch)
+    cfg_mod = _fake_config_store(monkeypatch, cfg)
+    # typed catalog id resolves to the served id the entry declares
+    monkeypatch.setattr(mod, "_read_line", lambda prompt: "glm-5.3-flash")
+    saved = mod.model_forge_setup_flow(cfg)
+    assert saved == {"default": "glm-maya-s", "provider": "custom:gpu-box"}
+    call = setup.calls[0]
+    assert call["model"] == "glm-maya-s"
+    assert call["provider"] == "custom:gpu-box"
+    assert call["base_url"] == "http://gpu-box.example.com:8080/v1"
+    assert call["api_mode"] == "chat_completions"
+    # the custom_providers registration is re-merged (idempotent, declared)
+    assert "glm-maya-s" in cfg_mod.state["custom_providers"][0]["models"]
+    out = capsys.readouterr().out
+    # reuses Model Forge's own browse/install/activate verbs
+    for verb in ("model_forge_browse", "model_forge_install",
+                 "model_forge_activate"):
+        assert verb in out
+    assert mod.NEXT_SESSION_NOTE in out
+    assert "/model" in out
+    # engine-bound flows (strata/maya rows) filter the catalog to their
+    # engines' models
+    flow = next(p for p in registered if p.name == "maya").model_setup_flow
+    monkeypatch.setattr(mod, "_read_line", lambda prompt: "")
+    flow(cfg, "current-model", None)
+    out = capsys.readouterr().out
+    assert "glm-5.3-flash" in out and "minicpm-v-4.6" not in out
+    assert "current-model" in out and "No change." in out
+
+
+def test_providers_setup_flow_refuses_unserved_model(monkeypatch, capsys):
+    mod, _ = _load_providers_pkg(monkeypatch)
+    setup = _fake_model_setup(monkeypatch)
+    _fake_config_store(monkeypatch, {})
+    monkeypatch.setattr(mod, "_read_line", lambda prompt: "glm-5.3-flash")
+    cfg = {"custom_providers": []}
+    assert mod.model_forge_setup_flow(cfg) is None
+    assert setup.calls == []      # nothing persisted: fail closed, honestly
+    out = capsys.readouterr().out
+    assert "No change." in out
+    for verb in ("model_forge_install", "model_forge_activate"):
+        assert verb in out
+
+
+def test_providers_setup_flow_number_pick(monkeypatch, capsys):
+    mod, _ = _load_providers_pkg(monkeypatch)
+    setup = _fake_model_setup(monkeypatch)
+    _fake_config_store(monkeypatch, {})
+    cfg = {"custom_providers": [
+        {"name": "local", "base_url": "http://127.0.0.1:8080/v1",
+         "models": {"qwen3.8-flash-next": {}}}]}
+    monkeypatch.setattr(mod, "_read_line", lambda prompt: "1")
+    mod.model_forge_setup_flow(cfg)
+    assert setup.calls[0]["model"] == "qwen3.8-flash-next"
+    assert setup.calls[0]["provider"] == "custom:local"
+    assert "Saved model qwen3.8-flash-next on custom:local." \
+        in capsys.readouterr().out
+
+
+def test_persisted_slugs_round_trip_and_resolve(monkeypatch):
+    mod, _ = _load_providers_pkg(monkeypatch)
+    from model_forge.registry import ModelEntry
+    from model_forge.tools import activation_plan
+
+    # the reference's identity set — engine codenames are never resolvable
+    for ok in ("custom", "custom:gpu-box", "custom:local", "strata", "maya",
+               "model-forge", "llamacpp", "llama.cpp", "llama-cpp"):
+        assert mod.is_resolvable_slug(ok), ok
+    for bad in ("vllm", "ollama", "sglang", "comfyui", "exo", "custom:",
+                "llamacppx"):
+        assert not mod.is_resolvable_slug(bad), bad
+    # legacy-entry identity: the slug keys on the normalized display name
+    assert mod.custom_provider_slug("GPU Box") == "custom:gpu-box"
+    assert mod.custom_provider_slug("gpu-box") == "custom:gpu-box"
+    # every slug an activation persists round-trips: resolvable identity, and
+    # the custom slug resolves to the entry declaring the persisted model
+    cases = [("glm-5.3-flash", ["maya"]), ("qwen3.8-flash-next", ["strata"]),
+             ("minicpm-v-4.6", ["vllm"]),
+             ("qwen3.8-flash-next", ["openai-compatible"])]
+    for mid, available in cases:
+        entry = next(m for m in models_for() if m.id == mid)
+        plan = activation_plan(entry, _REMOTE, available)
+        assert mod.is_resolvable_slug(plan["provider"]), plan["provider"]
+        cp = plan["custom_provider"]
+        assert mod.is_resolvable_slug(cp["slug"]), cp["slug"]
+        entry_names = {"custom:" + str(e.get("name") or "").lower()
+                       .replace(" ", "-") for e in [cp["entry"]]}
+        assert cp["slug"] in entry_names
+        assert plan["model"] in cp["entry"]["models"]
+    ollama = ModelEntry(id="ollama-chat", name="Ollama chat", modality="chat",
+                        engines=("ollama",), source="a/b")
+    plan = activation_plan(ollama, _REMOTE, ["ollama"])
+    assert plan["provider"] == "custom"
+    assert mod.is_resolvable_slug(plan["custom_provider"]["slug"])
+
+
+def test_custom_provider_shape_parity_across_packages(monkeypatch):
+    mod, _ = _load_providers_pkg(monkeypatch)
+    from model_forge import tools
+
+    entry_a = tools.custom_provider_entry(
+        "glm-maya-s", name="gpu-box",
+        base_url="http://gpu-box.example.com:8080/v1")
+    entry_b = mod.custom_provider_entry(
+        "glm-maya-s", name="gpu-box",
+        base_url="http://gpu-box.example.com:8080/v1")
+    assert entry_a == entry_b
+    providers = [{"name": "gpu-box",
+                  "base_url": "http://old-endpoint.example.com:9000/v1",
+                  "models": {"x": {}}}]
+    rows_a, merged_a = tools.merge_custom_provider_entry(entry_a, providers)
+    rows_b, merged_b = mod.merge_custom_provider_entry(entry_b, providers)
+    assert rows_a == rows_b and merged_a == merged_b
+    assert tools._CUSTOM_PROVIDER_API_MODE == mod.API_MODE
+    assert tools._NEXT_SESSION_NOTE == mod.NEXT_SESSION_NOTE
+
+
+def _media_provider_fakes(monkeypatch):
+    secret = types.ModuleType("agent.secret_scope")
+    secret.get_secret_str = lambda name, default="": ""
+    img = types.ModuleType("agent.image_gen_provider")
+    img.DEFAULT_ASPECT_RATIO = "landscape"
+    img.resolve_aspect_ratio = lambda v: "landscape"
+    img.error_response = lambda **kw: {"success": False}
+    img.success_response = lambda **kw: {"success": True}
+    img.save_b64_image = lambda *a, **k: None
+
+    class _ImageProvider:
+        def name(self):
+            raise NotImplementedError
+
+    img.ImageGenProvider = _ImageProvider
+    vid = types.ModuleType("agent.video_gen_provider")
+
+    class _VideoBase:
+        def __init__(self):
+            self.calls = []
+
+        def generate(self, prompt, **kwargs):
+            self.calls.append(kwargs)
+            return {"success": True}
+
+    vid.OpenAICompatibleVideoGenProvider = _VideoBase
+    vid.error_response = lambda **kw: {"success": False}
+    vid.success_response = lambda **kw: {"success": True}
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.image_gen_provider = img
+    agent_pkg.video_gen_provider = vid
+    agent_pkg.secret_scope = secret
+    fs_mod = types.ModuleType("agent.file_safety")
+    fs_mod.raise_if_read_blocked = lambda path: None
+    agent_pkg.file_safety = fs_mod
+    openai_fake = types.ModuleType("openai")
+    openai_fake.OpenAI = object
+    httpx_fake = types.ModuleType("httpx")
+    httpx_fake.get = lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("httpx.get not stubbed in this test"))
+    for name, m in (("agent", agent_pkg), ("agent.secret_scope", secret),
+                    ("agent.image_gen_provider", img),
+                    ("agent.video_gen_provider", vid),
+                    ("agent.file_safety", fs_mod), ("openai", openai_fake),
+                    ("httpx", httpx_fake)):
+        monkeypatch.setitem(sys.modules, name, m)
+    cfg_mod = types.ModuleType("hermes_cli.config")
+    cfg_mod.load_config_readonly = lambda: {}
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", cfg_mod)
+
+
+def test_media_provider_vocabulary_matches_activate_hints(monkeypatch):
+    # surface parity of state: the provider strings in the activate
+    # media_setup hints are exactly the names the media providers register
+    # and the model-forge provider row uses — one vocabulary everywhere.
+    _media_provider_fakes(monkeypatch)
+    from model_forge import tools
+
+    def _load(pkg_dir, name):
+        path = _REPO / pkg_dir / "__init__.py"
+        spec = importlib.util.spec_from_file_location(name, str(path))
+        mod = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, name, mod)
+        spec.loader.exec_module(mod)
+        return mod
+
+    img = _load("model-forge-image", "provider_image")
+    vid = _load("model-forge-video", "provider_video")
+    assert img.ModelForgeImageGenProvider().name == tools._MEDIA_PROVIDER_NAME
+    assert vid.ModelForgeVideoGenProvider().name == tools._MEDIA_PROVIDER_NAME
+    mod, registered = _load_providers_pkg(monkeypatch)
+    row = next(p for p in registered if p.name == "model-forge")
+    assert row.name == tools._MEDIA_PROVIDER_NAME
