@@ -7,6 +7,7 @@ logic is unit-tested without touching the network or the Hermes config.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -1249,17 +1250,22 @@ def model_forge_activate(args: dict | None = None, **kwargs) -> str:
 
 def model_forge_storage(args: dict | None = None, **kwargs) -> str:
     """List model-storage entries (downloads dir + engine-managed model
-    dirs), or delete one listed entry (routed through the human-approval
-    gate; see policy_hook)."""
+    dirs), delete one listed entry (routed through the human-approval gate;
+    see policy_hook), or take the on-demand resource snapshot
+    (action=resources: a read-only memory view per compute target — VRAM and
+    RAM as used / booked_now / free, resident model blocks, queued loads,
+    measured swap stats; runs only when asked)."""
     args = args or {}
     try:
         from . import storage
         action = str(args.get("action") or "list").strip() or "list"
-        if action not in ("list", "delete"):
+        if action not in ("list", "delete", "resources"):
             return _dump({"error": f"unknown action: {action!r}; valid "
-                                   f"actions: ['list', 'delete']"})
+                                   f"actions: ['list', 'delete', 'resources']"})
         if action == "list":
             return _dump(storage.list_storage())
+        if action == "resources":
+            return _dump(storage_resources(args))
         ref = str(args.get("entry") or "").strip()
         if not ref:
             return _dump({"error": "entry required for action=delete: pass "
@@ -2432,6 +2438,277 @@ def _lane_block(claim: dict, released: dict | None = None,
         block["note"] = note
     return block
 
+# --- resource view: the on-demand memory snapshot -----------------------------
+
+# Design intent (the product owner's): resource visibility for weights and
+# memory belongs INSIDE the weight-storage management experience, on demand
+# and quiet — never an intrusive always-visible display. Nothing here polls,
+# animates, or auto-refreshes; the snapshot is taken only when the user asks
+# for it (model_forge_storage action=resources, /model-forge storage
+# resources, the pane's collapsed Resource view, the dashboard's collapsed
+# Resource view).
+RESOURCE_VIEW_NOTE = (
+    "On-demand read-only snapshot — shown only when asked for; nothing here "
+    "polls or updates on its own (run the action again for a fresh one). "
+    "used_gb is live observed usage from the hardware-probe family; "
+    "booked_now_gb is the live claims — the booked ceilings of the models "
+    "resident right now (nominal catalog ceilings, never a measured usage "
+    "figure); free_gb is total minus used. A probe that fails or is not "
+    "observable is an honest 'unavailable' row, never a guessed number.")
+# One guidance line on the default storage listing, naming the on-demand
+# subcommand — the listing itself stays lean (no resource data rides along).
+RESOURCES_HINT = (
+    "Resource view (on-demand): run /model-forge storage resources — a "
+    "quiet memory snapshot (VRAM/RAM usage bars, resident model blocks) "
+    "shown only when you ask; nothing polls in the background.")
+
+def _gb_number(value) -> float | None:
+    """A finite, non-negative GB number — or None (never a guessed 0)."""
+    try:
+        gb = float(value)
+    except (TypeError, ValueError):
+        return None
+    return gb if math.isfinite(gb) and gb >= 0.0 else None
+
+
+def _pct(part, total) -> float | None:
+    """part/total as a one-decimal percentage — or None when either side is
+    unknown (never a fake 0%)."""
+    part = _gb_number(part)
+    total = _gb_number(total)
+    if part is None or total is None or total <= 0.0:
+        return None
+    return round(100.0 * part / total, 1)
+
+
+def _memory_row(kind: str, label: str, total_gb, used_gb, booked_now_gb,
+                detail: str = "") -> dict:
+    """One memory-kind row for the resource snapshot (pure).
+
+    ``total_gb`` comes from the hardware probe, ``used_gb`` is live observed
+    usage (the hardware-probe family), ``booked_now_gb`` is the live claims
+    (the booked ceilings of the models resident right now) from the
+    residency ledger, and ``free_gb`` is total minus used. A missing or
+    failed probe is an honest ``unavailable`` row with a stated reason —
+    never a guessed number."""
+    total = _gb_number(total_gb)
+    used = _gb_number(used_gb)
+    booked = _gb_number(booked_now_gb)
+    row = {
+        "kind": kind,
+        "label": label,
+        "status": "unavailable",
+        "detail": "",
+        "total_gb": (round(total, 3)
+                     if total is not None and total > 0.0 else None),
+        "used_gb": None,
+        "booked_now_gb": round(booked, 3) if booked is not None else None,
+        "free_gb": None,
+        "used_pct": None,
+        "booked_now_pct": None,
+        "free_pct": None,
+    }
+    if total is None or total <= 0.0:
+        # No total to place usage against: the whole usage picture is
+        # unavailable (a used fragment without its total is uninterpretable).
+        row["detail"] = (detail or f"no {label} total was reported by the "
+                                   "hardware probe")
+        return row
+    row["booked_now_pct"] = _pct(booked, total)
+    if used is None:
+        row["detail"] = detail or f"live {label} usage was not observable"
+        return row
+    row["used_gb"] = round(used, 3)
+    free = max(total - used, 0.0)
+    row["free_gb"] = round(free, 3)
+    row["used_pct"] = _pct(used, total)
+    row["free_pct"] = _pct(free, total)
+    row["status"] = "ok"
+    row["detail"] = detail or ""
+    return row
+
+
+def _meminfo_available_bytes() -> float:
+    """Available RAM from /proc/meminfo's MemAvailable (the kernel's own
+    estimate of what new allocations can use). Raises when unreadable."""
+    with open("/proc/meminfo") as fh:
+        for line in fh:
+            if line.startswith("MemAvailable:"):
+                return float(line.split()[1]) * 1024.0
+    raise ValueError("no MemAvailable reading in /proc/meminfo")
+
+
+def _ram_used_gb() -> float:
+    """Live RAM usage on this machine, in GB (physical RAM minus what is
+    available to new allocations). Probe order: /proc/meminfo MemAvailable,
+    then the os.sysconf page counts (SC_AVAIL_PAGES where that name exists,
+    else SC_AVPHYS_PAGES free pages). Raises when nothing answers; the
+    snapshot turns a failing probe into an honest 'unavailable' row, never a
+    guessed number."""
+    total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    readers = [_meminfo_available_bytes]
+    if "SC_AVAIL_PAGES" in getattr(os, "sysconf_names", {}):
+        readers.append(lambda: os.sysconf("SC_AVAIL_PAGES")
+                       * os.sysconf("SC_PAGE_SIZE"))
+    if "SC_AVPHYS_PAGES" in getattr(os, "sysconf_names", {}):
+        readers.append(lambda: os.sysconf("SC_AVPHYS_PAGES")
+                       * os.sysconf("SC_PAGE_SIZE"))
+    for read_avail in readers:
+        try:
+            used = total - read_avail()
+        except Exception:  # noqa: BLE001 — try the next reader
+            continue
+        if used >= 0.0:
+            return used / (1024 ** 3)
+    raise ValueError("no available-RAM reading (tried /proc/meminfo "
+                     "MemAvailable and the os.sysconf page counts)")
+
+
+def _sample_usage(target, kind: str, seam) -> tuple[float | None, str]:
+    """(used_gb, "") from a usage probe — or (None, honest reason). Live: the
+    hardware-probe family (nvidia-smi GPU memory for VRAM, sysconf pages for
+    RAM) and only on the machine running Model Forge — a remote target
+    reports its declared totals and the live claims only, never a guessed
+    usage number. ``seam`` is the injectable test seam."""
+    if seam is None:
+        if target.kind != "local":
+            return None, (
+                "live memory usage is observable only where the hardware "
+                "probe runs (this machine); this target reports its declared "
+                "totals and the live claims only")
+        seam = gpu_vram_used_gb if kind == "vram" else _ram_used_gb
+    try:
+        used = _gb_number(seam())
+    except Exception as exc:  # noqa: BLE001 — an honest unavailable row
+        return None, (f"live {kind} usage probe failed: "
+                      f"{type(exc).__name__}: {exc}")
+    if used is None:
+        return None, f"the live {kind} usage probe returned no reading"
+    return used, ""
+
+
+def _queued_load_rows(stack: dict, target_id: str) -> list[dict]:
+    """Loads the orchestrator reports as queued or loading right now (the
+    open workflow scopes on the target) — rows only while a load is in
+    flight, an empty list otherwise."""
+    out = []
+    orchestrator = (stack or {}).get("orchestrator")
+    progress = getattr(orchestrator, "progress", None)
+    if not callable(progress):
+        return out
+    for scope_id, rec in sorted(_ACTIVE_SCOPES.items()):
+        if rec.get("target_id") != target_id:
+            continue
+        row = progress(scope_id)
+        if not isinstance(row, dict):
+            row = {}
+        state = str(row.get("state") or "")
+        if state == "queued" or state.startswith("loading"):
+            out.append({"scope_id": scope_id,
+                        "model_id": rec.get("model_id"),
+                        "state": state})
+    return out
+
+
+def resource_snapshot(target, hw=None, stack=None, vram_used=None,
+                      ram_used=None) -> dict:
+    """One compute target's on-demand resource snapshot (read-only data rows).
+
+    Per memory kind (VRAM, RAM): total from the hardware probe, live
+    observed usage from the usage probe, booked_now = the live claims (the
+    booked ceilings of the models resident right now) from the residency
+    ledger, and free = total minus used — plus the resident model blocks
+    (model id, size, engine, lane), any queued loads, and the measured swap
+    stats where present. Every seam (hw / stack / vram_used / ram_used) is
+    injectable; every failure is an honest 'unavailable' row with a stated
+    reason, never a guessed number. Never raises."""
+    row = {"target": target.id, "label": target.label, "kind": target.kind}
+    hw_detail = ""
+    if hw is None:
+        try:
+            hw = _hw_for_target(target)
+        except Exception as exc:  # noqa: BLE001 — honest unavailable rows
+            hw = None
+            hw_detail = f"hardware probe failed: {type(exc).__name__}: {exc}"
+    totals = {"vram": getattr(hw, "total_vram_gb", None) if hw is not None
+                     else None,
+              "ram": getattr(hw, "ram_gb", None) if hw is not None else None}
+    booked_now = None
+    resident_rows: list[dict] = []
+    try:
+        stack = stack if stack is not None else broker_stack(target)
+        ledger = stack["ledger"]
+        sizes = {p.model_id: p.size_bytes for p in ledger.pulled(target.id)}
+        for rec in ledger.residents(target.id):
+            booking = ledger.booking(rec.model_id)
+            resident_rows.append({
+                "model_id": rec.model_id,
+                "size_gb": (round(booking.vram_gb, 3)
+                            if booking is not None else None),
+                "size_label": (booking.label if booking is not None
+                               else BOOKING_SOURCE_NONE),
+                "size_bytes": sizes.get(rec.model_id),
+                "engine": rec.engine,
+                "lane": rec.lane,
+            })
+        booked_now = _gb_number(ledger.booked_total_gb(target.id))
+        stats = ledger.swap_stats() or {}
+        if stats.get("count"):
+            row["swap_stats"] = dict(stats)
+    except Exception as exc:  # noqa: BLE001 — the ledger degrades, never crashes
+        row["detail"] = (f"residency ledger unavailable: "
+                         f"{type(exc).__name__}: {exc}")
+    row["residents"] = resident_rows
+    row["queued_loads"] = _queued_load_rows(stack if stack is not None else {},
+                                           target.id)
+    memory = []
+    for kind, label, seam in (("vram", "VRAM", vram_used),
+                              ("ram", "RAM", ram_used)):
+        used, used_detail = _sample_usage(target, kind, seam)
+        total = _gb_number(totals.get(kind))
+        if hw_detail:
+            detail = hw_detail
+        elif total is None or total <= 0.0:
+            detail = ""   # _memory_row's own honest "no total" reason
+        else:
+            detail = used_detail
+        memory.append(_memory_row(
+            kind, label, totals.get(kind), used, booked_now, detail=detail))
+    row["memory"] = memory
+    return row
+
+
+def storage_resources(args: dict | None = None) -> dict:
+    """The action=resources payload: one on-demand resource snapshot per
+    compute target (or one target when ``target`` is passed). Read-only and
+    fail-soft; never raises."""
+    args = args or {}
+    tid = str(args.get("target") or "").strip()
+    try:
+        if tid:
+            one = get_target(tid)
+            if one is None:
+                return {"error": f"unknown target: {tid}"}
+            targets = [one]
+        else:
+            targets = load_targets()
+    except Exception as exc:  # noqa: BLE001 — honest, not fatal
+        return {"error": f"compute targets unavailable: "
+                         f"{type(exc).__name__}: {exc}"}
+    return {
+        "ok": True,
+        "action": "resources",
+        "targets": [resource_snapshot(t) for t in targets],
+        "note": RESOURCE_VIEW_NOTE,
+    }
+
+
+def cockpit_resources() -> dict:
+    """The resource snapshot in the cockpit JSON data-door shape (the
+    Desktop pane's and the dashboard's collapsed Resource views read this on
+    expand). Read-only — nothing here runs unless the view is opened."""
+    return storage_resources()
+
 
 # --- cockpit data: the /model-forge command and the Desktop pane --------------
 
@@ -2447,13 +2724,17 @@ DELETE_VERB_NOTE = (
 
 _COCKPIT_USAGE = (
     "Model Forge cockpit (read-only). Usage: /model-forge [cockpit|models "
-    "[modality]|storage|help]\n"
+    "[modality]|storage [resources]|resources|help]\n"
     "  cockpit           full snapshot: compute targets + hardware, "
     "declared + detected engines, models with fit data, model storage\n"
     "  models [modality] curated model rows with the model_forge_browse "
     "fit data (advisory)\n"
     "  storage           installed model weights in the "
     "model_forge_storage list shape (sizes, modification times)\n"
+    "  storage resources the on-demand resource snapshot as JSON — the "
+    "same data the quiet text bars render\n"
+    "  resources         the on-demand resource snapshot as JSON (the "
+    "pane's Resource-view data door; nothing runs until it is opened)\n"
     "Mutating verbs are tool verbs that ride the human-approval gate "
     "(model_forge_target_add, model_forge_install, model_forge_activate, "
     "model_forge_storage action=delete).")
@@ -2506,18 +2787,22 @@ def cockpit_data() -> dict:
 
 def cockpit_storage() -> dict:
     """The installed-models listing in the model_forge_storage list shape,
-    plus the honest delete-verb note (the cockpit never deletes)."""
+    plus the honest delete-verb note (the cockpit never deletes) and one
+    guidance line naming the on-demand resources subcommand."""
     out = dict(_storage_listing())
     out["delete_note"] = DELETE_VERB_NOTE
+    out["resources_hint"] = RESOURCES_HINT
     return out
 
 
 def cockpit_command(raw_args: str = "") -> str:
     """/model-forge — the read-only cockpit data command behind the Desktop
     pane (also handy in chat and the CLI). Subcommands: cockpit (default),
-    models [modality], storage, help. Returns a JSON string (help returns
-    usage text) and never raises. Read-only by design: policy decisions and
-    deletions are tool verbs routed through the human-approval gate."""
+    models [modality], storage, resources (the on-demand memory snapshot —
+    also reachable as `storage resources`), help. Returns a JSON string
+    (help returns usage text) and never raises. Read-only by design: policy
+    decisions and deletions are tool verbs routed through the human-approval
+    gate."""
     parts = [p for p in str(raw_args or "").split() if p]
     sub = parts[0].lower() if parts else "cockpit"
     try:
@@ -2528,7 +2813,13 @@ def cockpit_command(raw_args: str = "") -> str:
         if sub == "models":
             return _dump(cockpit_models(parts[1] if len(parts) > 1 else None))
         if sub == "storage":
+            if len(parts) > 1 and parts[1].lower() == "resources":
+                # The on-demand resource snapshot's JSON data door (the same
+                # rows the quiet text bars render; nothing runs unless asked).
+                return _dump(cockpit_resources())
             return _dump(cockpit_storage())
+        if sub == "resources":
+            return _dump(cockpit_resources())
         return _dump({"error": f"unknown subcommand: {sub!r}",
                       "usage": _COCKPIT_USAGE})
     except Exception as exc:

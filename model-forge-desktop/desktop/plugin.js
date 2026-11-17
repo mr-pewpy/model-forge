@@ -8,9 +8,11 @@
 //      detected (live probes of every target's HTTP API).
 //   3. Models — curated rows reusing the model_forge_browse fit data.
 //   4. Installed model storage — the model_forge_storage list shape (names,
-//      sizes, modification times). Read-only: deletion is a tool verb that
-//      rides the human-approval gate, so the pane names the delete verb
-//      honestly instead of offering an in-pane delete.
+//      sizes, modification times), plus the collapsed 'Resource view'
+//      (on-demand memory snapshot: loads once on expand, manual refresh,
+//      no timers or polling — quiet by design). Read-only: deletion is a
+//      tool verb that rides the human-approval gate, so the pane names the
+//      delete verb honestly instead of offering an in-pane delete.
 //
 // Data doors (documented desktop SDK only):
 //   - plugins.manage list  — the plugin's settings (targets_json, engines_json)
@@ -192,6 +194,41 @@ async function readCockpitBridge() {
     return { data, hint: "" };
   } catch (err) {
     return { data: null, hint: "the /model-forge cockpit bridge is unavailable: " + ((err && err.message) || err) };
+  }
+}
+
+// --- the on-demand resource view (quiet by design) ---------------------------
+// Resource visibility for weights and memory belongs inside the weight
+// management experience: a collapsed 'Resource view' detail inside the
+// storage section. The snapshot loads ONCE when the user expands it (and
+// again only on its manual Refresh click) through the same read-only
+// slash.exec command bridge as the cockpit — never on a timer. Collapsed by
+// default; no animation, no polling, no auto-refresh while open or closed.
+
+async function readResourcesBridge() {
+  let sid = null;
+  try {
+    sid = host.state.activeSessionId.get();
+  } catch (err) {
+    sid = null;
+  }
+  if (!sid) {
+    return { data: null, hint: "The resource view needs an open chat session (the /model-forge command bridge); open a chat and expand again." };
+  }
+  try {
+    const res = await host.request("slash.exec", { session_id: sid, command: "/model-forge resources" });
+    if (res && res.error) {
+      return { data: null, hint: "the /model-forge resource bridge answered with an error: " + (res.error.message || res.error) };
+    }
+    const raw = String((res && res.output) || "").trim();
+    if (!raw) return { data: null, hint: "the /model-forge resource bridge returned no output" };
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== "object") {
+      return { data: null, hint: "the /model-forge resource bridge returned an unexpected payload" };
+    }
+    return { data, hint: "" };
+  } catch (err) {
+    return { data: null, hint: "the /model-forge resource bridge is unavailable: " + ((err && err.message) || err) };
   }
 }
 
@@ -541,6 +578,149 @@ function ModelsSection(props) {
   return children;
 }
 
+function MemoryBar(props) {
+  const row = props.row;
+  const label = String(row.kind || "");
+  if (row.status !== "ok" || row.used_gb == null || row.total_gb == null) {
+    return jsx("div", {
+      style: { display: "flex", gap: "8px", padding: "2px 0",
+               color: "var(--ui-text-quaternary)", fontSize: "11px" },
+      children: [
+        jsx("span", { key: "k", style: { minWidth: "42px" }, children: label }),
+        jsx("span", { key: "d",
+          children: "unavailable — " + (row.detail || "no reading") }),
+      ],
+    });
+  }
+  const pct = Math.max(0, Math.min(100, Number(row.used_pct) || 0));
+  return jsx("div", {
+    style: { display: "flex", alignItems: "center", gap: "8px", padding: "2px 0" },
+    children: [
+      jsx("span", {
+        key: "k",
+        style: { minWidth: "42px", color: "var(--ui-text-secondary)", fontSize: "11px" },
+        children: label,
+      }),
+      jsx("div", {
+        key: "track",
+        style: {
+          width: "110px", height: "8px", borderRadius: "4px",
+          border: "1px solid var(--ui-stroke-secondary)", overflow: "hidden",
+        },
+        children: jsx("div", {
+          style: { width: pct + "%", height: "100%", background: "var(--ui-accent)" },
+        }),
+      }),
+      jsx("span", {
+        key: "d",
+        style: { color: "var(--ui-text-secondary)", fontSize: "11px" },
+        children: row.used_gb + "/" + row.total_gb + " GB (" + Math.round(pct) + "%)" +
+          (row.booked_now_gb != null ? " · booked_now " + row.booked_now_gb + " GB" : "") +
+          (row.free_gb != null ? " · free " + row.free_gb + " GB" : ""),
+      }),
+    ],
+  });
+}
+
+function ResourceView() {
+  // Collapsed by default; the snapshot loads once on expand (and on the
+  // manual Refresh click) — no timers, no polling, no animation.
+  const [open, setOpen] = useState(false);
+  const [state, setState] = useState({ phase: "idle", data: null, hint: "" });
+  const load = () => {
+    setState({ phase: "loading", data: null, hint: "" });
+    readResourcesBridge().then((res) => {
+      setState(res.data
+        ? { phase: "ready", data: res.data, hint: "" }
+        : { phase: "error", data: null, hint: res.hint });
+    });
+  };
+  const toggle = () => {
+    if (!open && state.phase === "idle") load();
+    setOpen(!open);
+  };
+  const children = [
+    jsx("div", {
+      key: "toggle",
+      onClick: toggle,
+      style: {
+        cursor: "pointer", padding: "4px 0 2px", fontWeight: 600,
+        fontSize: "12px", color: "var(--ui-text-secondary)",
+      },
+      children: (open ? "▾ " : "▸ ") + "Resource view (on-demand)",
+    }),
+  ];
+  if (!open) {
+    children.push(jsx(Hint, {
+      key: "closed",
+      children: "Memory use (VRAM/RAM) and the resident model blocks — loaded once when you open it, never a persistent display. In chat: /model-forge storage resources.",
+    }));
+    return jsx("div", { children });
+  }
+  if (state.phase === "loading") {
+    children.push(jsx(Hint, { key: "l", children: "Loading the resource snapshot…" }));
+  } else if (state.phase === "error") {
+    children.push(jsx(Hint, {
+      key: "e",
+      children: "Resource snapshot unavailable: " + (state.hint || "no data") + " Nothing was changed — Refresh to retry.",
+    }));
+  } else if (state.data) {
+    (state.data.targets || []).forEach((t) => {
+      children.push(jsx("div", {
+        key: "t-" + t.target,
+        style: { margin: "6px 0 2px", fontWeight: 600, fontSize: "11px" },
+        children: (t.label || t.target) + " · " + (t.kind || ""),
+      }));
+      (t.memory || []).forEach((row, i) => {
+        children.push(jsx(MemoryBar, { key: "m-" + t.target + "-" + i, row }));
+      });
+      const residents = t.residents || [];
+      children.push(jsx(Hint, {
+        key: "rh-" + t.target,
+        children: "resident (" + residents.length + "):",
+      }));
+      residents.forEach((r, i) => {
+        const size = r.size_gb != null
+          ? r.size_gb + " GB (" + r.size_label + ")"
+          : String(r.size_label || "size unknown");
+        children.push(jsx("div", {
+          key: "r-" + t.target + "-" + i,
+          style: { color: "var(--ui-text-secondary)", fontSize: "11px", padding: "1px 0 1px 10px" },
+          children: r.model_id + " · size " + size + " · engine=" + r.engine + " · lane=" + r.lane,
+        }));
+      });
+      (t.queued_loads || []).forEach((q, i) => {
+        children.push(jsx("div", {
+          key: "q-" + t.target + "-" + i,
+          style: { color: "var(--ui-text-secondary)", fontSize: "11px", padding: "1px 0 1px 10px" },
+          children: "queued load: " + q.model_id + " · " + q.state,
+        }));
+      });
+      if (t.swap_stats) {
+        children.push(jsx(Hint, {
+          key: "ss-" + t.target,
+          children: "swap stats (measured): count=" + t.swap_stats.count +
+            " · last=" + t.swap_stats.last_total_seconds + "s" +
+            " · average=" + t.swap_stats.average_total_seconds + "s",
+        }));
+      }
+    });
+    if (state.data.note) {
+      children.push(jsx(Hint, { key: "n", children: state.data.note }));
+    }
+  }
+  children.push(jsx("div", {
+    key: "refresh",
+    onClick: load,
+    style: {
+      cursor: "pointer", padding: "3px 0", fontSize: "11px",
+      color: "var(--ui-accent)", width: "max-content",
+    },
+    children: "Refresh (manual — nothing polls)",
+  }));
+  return jsx("div", { children });
+}
+
 function StorageSection(props) {
   const { bridge, bridgeHint } = props;
   const children = [jsx(SectionTitle, { key: "t", children: "Installed model storage" })];
@@ -552,6 +732,7 @@ function StorageSection(props) {
       children: "The installed-models list (names, sizes, modification times) comes from model_forge_storage. " +
         (bridgeHint || "Ask for model_forge_storage, or open a chat session so this pane can load it."),
     }));
+    children.push(jsx(ResourceView, { key: "resource-view" }));
     return children;
   }
   children.push(jsx(Hint, {
@@ -592,6 +773,9 @@ function StorageSection(props) {
     children: bridge.delete_note ||
       "Read-only listing. To delete an entry, run the model_forge_storage tool with action=delete and the entry id — the human-approval gate shows the exact path and size first. This pane never deletes files.",
   }));
+  // The on-demand resource view: collapsed by default, loads its snapshot
+  // only when opened (and on its manual Refresh) — quiet by design.
+  children.push(jsx(ResourceView, { key: "resource-view" }));
   return children;
 }
 

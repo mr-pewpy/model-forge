@@ -30,6 +30,7 @@ why not — no capability silently differs in behavior between two surfaces.
 | **Claim / release (GPU lane)** | `model_forge_broker action=claim\|release\|swap` tool in chat (`swap` is the one-call exchange with measured phase timings) | `/model-forge claim\|release\|swap` render guidance; the verbs are tool calls | same as Telegram | Not on the tab (read-only) |
 | **Storage inventory** | Pane "Installed model storage" section (read-only) | `/model-forge storage` JSON + `model_forge_storage` tool | same as Telegram | Tab "Installed model storage" section (read-only) |
 | **Storage delete** | Tool verb `model_forge_storage action=delete` only — rides the human-approval gate | same | same | Not offered (read-only); the tab names the delete verb honestly |
+| **Storage resources** (on-demand resource view: memory usage + resident weights) | Pane "Installed model storage" → collapsed **Resource view** (loads one snapshot on expand; manual refresh; no polling or animation) + `/model-forge storage resources` text bars in chat | `/model-forge storage resources` text bars (JSON rows: `/model-forge resources`) | same as Telegram | Tab "Installed model storage" → collapsed **Resource view** (loads on expand; manual refresh; no polling or animation) |
 | **Settings** (targets, engine endpoints, download roots, pull tokens) | Settings → Plugins → Model Forge (`config_schema` form; secret fields are masked and never display stored values) | Guided through the agent (`hermes config` / plugin settings) | `hermes config` / plugin settings | The tab is read-only; settings live in the Desktop/config surfaces |
 | **Guided GPU pointing** (target registration) | Pointing invitation in the pane; `model_forge_target_add` (approval-gated) in chat | Invitation in `/model-forge cockpit\|status` rows; `model_forge_target_add` tool | same as Telegram | Invitation rendered on the tab; registration is the approval-gated tool verb |
 
@@ -44,6 +45,15 @@ why not — no capability silently differs in behavior between two surfaces.
   on failure; `unbooked` rows where no measured or published peak exists.
 - **Storage**: `size_bytes` (on-disk size) and `last_modified` (filesystem
   time) in the `model_forge_storage` list shape.
+- **Resource view (on-demand)**: `used_gb` (live observed usage from the
+  hardware probe), `booked_now_gb` (the live claims — the booked ceilings of
+  the models resident right now), `free_gb` (total minus used), each with a
+  percentage of the total, plus honest `unavailable` rows with a stated
+  reason when a probe fails. "Booked ceilings" (nominal catalog ceilings)
+  and `booked_now` (live claims) are different quantities and never share a
+  word. Design intent: resource visibility for weights and memory belongs
+  with weight management — the view is opened when needed and is never a
+  persistent display (no polling, no animation, no auto-refresh).
 
 A forced failure (unreachable target, denied approval, expired download)
 shows a stated reason on every surface; a command-side read that overruns its

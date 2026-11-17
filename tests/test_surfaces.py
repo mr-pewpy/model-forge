@@ -24,14 +24,15 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 PLUGIN_DIR = REPO / "model-forge"
+DESKTOP_PLUGIN_PATH = REPO / "model-forge-desktop" / "desktop" / "plugin.js"
 DASH_DIR = PLUGIN_DIR / "dashboard"
 MANIFEST_PATH = DASH_DIR / "manifest.json"
 BUNDLE_PATH = DASH_DIR / "dist" / "index.js"
 API_PATH = DASH_DIR / "plugin_api.py"
 MATRIX_PATH = REPO / "docs" / "surface-parity.md"
 
-_ALL_VERBS = ("cockpit", "models", "storage", "status", "browse", "broker",
-              "claim", "release", "swap", "help")
+_ALL_VERBS = ("cockpit", "models", "storage", "resources", "status", "browse",
+              "broker", "claim", "release", "swap", "help")
 
 
 def _load_plugin_module():
@@ -194,6 +195,37 @@ def _broker_json() -> str:
         "active_scopes": [{"scope_id": "scope-1", "model_id": "qwen",
                            "modality": "chat", "kind": "claim"}],
         "note": "Read-only report. Booked ceilings carry provenance labels.",
+    })
+
+
+def _resources_json() -> str:
+    return json.dumps({
+        "ok": True, "action": "resources",
+        "targets": [{
+            "target": "local", "label": "This machine", "kind": "local",
+            "memory": [
+                {"kind": "vram", "label": "VRAM", "status": "ok", "detail": "",
+                 "total_gb": 12.0, "used_gb": 6.2, "booked_now_gb": 6.0,
+                 "free_gb": 5.8, "used_pct": 51.7, "booked_now_pct": 50.0,
+                 "free_pct": 48.3},
+                {"kind": "ram", "label": "RAM", "status": "unavailable",
+                 "detail": "live ram usage probe failed: OSError: no sysconf",
+                 "total_gb": 64.0, "used_gb": None, "booked_now_gb": 6.0,
+                 "free_gb": None, "used_pct": None, "booked_now_pct": 9.4,
+                 "free_pct": None},
+            ],
+            "residents": [{"model_id": "chat-a", "size_gb": 6.0,
+                           "size_label": "published footprint (advisory)",
+                           "size_bytes": 5_000_000_000, "engine": "ollama",
+                           "lane": "chat"}],
+            "queued_loads": [{"scope_id": "shot-1",
+                              "model_id": "krea-2-turbo",
+                              "state": "loading"}],
+            "swap_stats": {"count": 2, "last_total_seconds": 12.5,
+                           "average_total_seconds": 11.0},
+        }],
+        "note": ("On-demand read-only snapshot — shown only when asked for; "
+                 "nothing here polls or updates on its own."),
     })
 
 
@@ -670,3 +702,140 @@ def test_readme_disclosure_names_every_network_surface():
         assert "custom_providers" in section
         assert "human-approval gate" in section
         assert "**Telemetry:** none" in section
+
+
+# --- the on-demand resource view (quiet by design) ----------------------------
+
+def test_storage_resources_renders_quiet_text_bars(plugin, monkeypatch):
+    monkeypatch.setattr(plugin, "_resources_payload", _resources_json)
+    out = plugin.cockpit_command("storage resources")
+    assert not out.lstrip().startswith("{")  # plain-text rows, not JSON
+    assert out.startswith("Model Forge resource view (on-demand, read-only)")
+    # one quiet bar line per memory kind: used/total GB and the percentage
+    # (6.2/12.0 -> 51.7% -> '52%'; ceil(0.517 * 14) = 8 filled cells)
+    assert "vram  [████████░░░░░░] 6.2/12.0 GB (52%)" in out
+    assert "· booked_now 6.0 GB (50%)" in out
+    assert "· free 5.8 GB" in out
+    # an unobservable kind says 'unavailable' with its reason, never a bar
+    assert "ram   unavailable — live ram usage probe failed: OSError: no sysconf" in out
+    assert "64.0 GB (" not in out  # no percentage bar for an unavailable row
+    # then the resident model blocks
+    assert "residents (1):" in out
+    assert ("chat-a · size 6.0 GB (published footprint (advisory)) · "
+            "engine=ollama · lane=chat · on disk 5.0 GB") in out
+    # queued loads (only when any) and swap stats (only where present)
+    assert "queued loads (1):" in out
+    assert "shot-1 · krea-2-turbo · loading" in out
+    assert ("swap stats (measured): count=2 · last=12.5s · average=11.0s"
+            in out)
+    # the quiet note: on-demand, nothing polls
+    assert "shown only when asked" in out
+    assert "nothing here" in out and "polls" in out
+
+
+def test_storage_resources_render_says_nothing_when_lean(plugin, monkeypatch):
+    # no queued loads / no measured swaps -> those lines stay away entirely
+    payload = json.loads(_resources_json())
+    del payload["targets"][0]["swap_stats"]
+    payload["targets"][0]["queued_loads"] = []
+    monkeypatch.setattr(plugin, "_resources_payload",
+                        lambda: json.dumps(payload))
+    out = plugin.cockpit_command("storage resources")
+    assert "queued loads" not in out
+    assert "swap stats" not in out
+    assert "vram  [" in out
+
+
+def test_resource_view_reads_run_only_when_typed(plugin, monkeypatch):
+    # non-intrusion at the command layer: no other subcommand touches the
+    # resource snapshot — it runs only when the user asks for it
+    def explode():
+        raise AssertionError("the resource snapshot must not run unasked")
+
+    monkeypatch.setattr(plugin, "_resources_payload", explode)
+    monkeypatch.setattr(plugin, "_status_payload", _status_json)
+    monkeypatch.setattr(plugin, "_browse_payload", lambda modality: _browse_json())
+    monkeypatch.setattr(plugin, "_broker_payload", _broker_json)
+    monkeypatch.setattr(plugin, "_json_cockpit_command",
+                        lambda raw: '{"delegated": true}')
+    for args in ("", "cockpit", "models image", "storage", "status",
+                 "browse", "broker", "claim", "release", "swap", "help"):
+        plugin.cockpit_command(args)
+    # the JSON data door delegates to the historical implementation ...
+    seen = []
+    monkeypatch.setattr(plugin, "_json_cockpit_command",
+                        lambda raw: seen.append(raw) or '{"delegated": true}')
+    assert plugin.cockpit_command("resources") == '{"delegated": true}'
+    assert seen == ["resources"]
+    # ... while the typed chat subcommand renders text from its own read
+    monkeypatch.setattr(plugin, "_resources_payload", _resources_json)
+    assert plugin.cockpit_command("storage resources").startswith(
+        "Model Forge resource view")
+
+
+def test_pane_resource_view_is_quiet_collapsed_and_manual(plugin):
+    src = DESKTOP_PLUGIN_PATH.read_text()
+    # collapsed by default; the toggle is the only door to the data
+    assert "Resource view (on-demand)" in src
+    assert "useState(false)" in src
+    assert 'if (!open && state.phase === "idle") load();' in src
+    # one snapshot through the existing read-only command bridge ...
+    assert "slash.exec" in src
+    assert "/model-forge resources" in src
+    # ... and a small manual refresh control (the only other load trigger)
+    assert "Refresh (manual" in src
+    # quiet by design: no timers, no polling, no animation machinery at all
+    for token in ("setInterval", "setTimeout", "requestAnimationFrame",
+                  "WebGL", "canvas"):
+        assert token not in src, token
+    # honest failure state instead of silent defaults
+    assert "Resource snapshot unavailable" in src
+    assert "Nothing was changed" in src
+
+
+def test_dashboard_resource_view_is_quiet_collapsed_and_manual():
+    src = BUNDLE_PATH.read_text()
+    assert "Resource view (on-demand)" in src
+    assert "useState(false)" in src
+    assert '/api/plugins/model-forge/resources' in src
+    assert "Refresh (manual" in src
+    for token in ("setInterval", "setTimeout", "requestAnimationFrame"):
+        assert token not in src, token
+    # the backend route is read-only, bounded, and only serves the view
+    api = API_PATH.read_text()
+    assert '@router.get("/resources")' in api
+    assert "cockpit_resources" in api
+    assert "nothing polls this route" in api
+
+
+def test_desktop_plugin_bundle_syntax():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed on this host")
+    assert node is not None
+    result = subprocess.run([node, "--check", str(DESKTOP_PLUGIN_PATH)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_docs_state_resource_view_design_intent():
+    # both READMEs carry the owner's design intent in the owner's terms
+    for path in (REPO / "README.md", PLUGIN_DIR / "README.md"):
+        text = path.read_text()
+        assert "### Resource view (on-demand)" in text
+        assert "belongs with weight management" in text
+        assert "never a persistent display" in text
+        assert "/model-forge storage resources" in text
+        assert "no timers and no auto-refresh" in text
+        assert "stays lean" in text
+    # the capability matrix names the resource rows for command/pane/dashboard
+    doc = MATRIX_PATH.read_text()
+    row = next(line for line in doc.splitlines()
+               if "**Storage resources**" in line)
+    assert "/model-forge storage resources" in row
+    assert "Resource view" in row
+    assert "manual refresh" in row
+    assert "no polling" in row
+    # the shared vocabulary names the disambiguated quantities
+    assert "booked_now" in doc
+    assert "live claims" in doc

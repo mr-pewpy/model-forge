@@ -54,7 +54,7 @@ run through a user-configured OpenAI-compatible media gateway.
 | `model_forge_install` | Pull a model: plugin-side HF download (sha256, resume, job polling), a running Maya's HTTP pull, or the exact engine CLI command to run yourself; provision an engine (`action=engine_install`) from its vendor's official installer after your approval |
 | `model_forge_activate` | Connect a running chat model as Hermes' default (plan-only; `apply=true` writes config after human approval) |
 | `model_forge_generate_media` | 3D (image→GLB), music, SFX — jobs through a user-configured OpenAI-compatible media gateway |
-| `model_forge_storage` | Model weights on disk (downloads dir, Ollama models dir, HuggingFace hub cache): list names, sizes and modification times; delete a listed entry after your approval |
+| `model_forge_storage` | Model weights on disk (downloads dir, Ollama models dir, HuggingFace hub cache): list names, sizes and modification times; delete a listed entry after your approval; take the on-demand resource snapshot (`action=resources`) — memory usage rows and resident model blocks, shown only when asked |
 | `model_forge_broker` | Weight residency on a compute target: what weights are on disk and what is loaded now, what that books against the budget (`status`, with measured swap stats), and the claim/release verbs that run a multi-step swap (chat → image generation → back to chat) as one workflow scope; `swap` exchanges the resident weights for one incoming model in one measured call; `plan` previews the steps first, `bench` measures a model's real VRAM peak and books it as its nominal ceiling |
 
 Plus `tts/model_forge_tts.py` — a config-driven TTS/voice-clone command
@@ -71,8 +71,11 @@ Its data door is the read-only **`/model-forge`** command
 chat and the CLI, and always read-only. The same command renders plain-text
 rows for chat on every surface commands work on (Desktop chat, Telegram,
 CLI/TUI): `status`, `browse [modality]`, `broker`, `claim`, `release`,
-`swap`, and `help`. A **dashboard tab** (`model-forge/dashboard/`) renders
-the same cockpit data in the Hermes web dashboard.
+`swap`, and `help`, plus the quiet resource view (`storage resources`). A
+**dashboard tab** (`model-forge/dashboard/`) renders
+the same cockpit data in the Hermes web dashboard — with a collapsed
+**Resource view** in its storage panel (see "Resource view (on-demand)"
+below).
 
 ## Surface parity
 
@@ -195,6 +198,26 @@ measured swap history and stats (`count`, `last_total_seconds`,
 `average_total_seconds`) ride along in `status`. Like claim/release, swap
 only moves model weights on compute targets you already control — it is
 not approval-gated.
+
+### Resource view (on-demand)
+
+Resource visibility for weights and memory belongs with weight management —
+opened when needed, never a persistent display. The **Resource view** is
+quiet by design: nothing animates, nothing polls, and nothing is shown
+until you ask for it. Ask in chat with `/model-forge storage resources`:
+quiet text bars, one line per memory kind per compute target —
+`vram  [████████░░░░░░] 6.2/12.0 GB (52%)` — then the resident model
+blocks (model id, size, engine, lane), queued loads when any, and the
+measured swap stats where present. The Desktop pane and the dashboard tab
+carry the same view as a collapsed **Resource view** detail inside their
+storage sections: opening it loads one snapshot and offers a manual
+refresh; there are no timers and no auto-refresh while it is open or
+closed. The snapshot (`model_forge_storage` `action=resources`, or the
+`resources` JSON data door) reports VRAM and RAM as used / booked_now /
+free in GB with percentages — used from the hardware probe, booked_now as
+the live claims (the booked ceilings of the models resident right now),
+and an honest `unavailable` row when a probe fails. The default storage
+listing stays lean: none of this runs unless you ask.
 
 ## Model discovery
 

@@ -4,8 +4,10 @@
 // cockpit pane render: compute targets (hardware + detected engines),
 // declared engine endpoints, model fit rows (the model_forge_browse fit
 // data, advisory), and installed model storage (the model_forge_storage
-// list shape). Served by dashboard/plugin_api.py at
-// /api/plugins/model-forge/cockpit.
+// list shape) with a collapsed 'Resource view' (the on-demand memory
+// snapshot — loaded only when the view is expanded). Served by
+// dashboard/plugin_api.py at /api/plugins/model-forge/cockpit (and
+// /api/plugins/model-forge/resources for the resource view).
 //
 // Read-only by design: deletion is a tool verb that rides the human-approval
 // gate, so this tab renders the listing and names the delete verb honestly
@@ -20,6 +22,10 @@
   const C = SDK.components || {};
 
   const API_URL = "/api/plugins/model-forge/cockpit";
+  // The on-demand resource snapshot's own route — fetched only when the
+  // collapsed Resource view is expanded (and on its manual refresh click).
+  // Nothing polls it: quiet by design.
+  const RESOURCES_URL = "/api/plugins/model-forge/resources";
   // register() is called with the manifest.json name verbatim (same name
   // check the dashboard loader does).
 
@@ -113,6 +119,135 @@
       }));
   }
 
+  function MemoryBar(props) {
+    const row = props.row;
+    const label = String(row.kind || "");
+    if (row.status !== "ok" || row.used_gb == null || row.total_gb == null) {
+      return h(Line, { muted: true },
+        label + " unavailable — " + (row.detail || "no reading"));
+    }
+    const pct = Math.max(0, Math.min(100, Number(row.used_pct) || 0));
+    return h("div", {
+      style: {
+        display: "flex", alignItems: "center", gap: "8px", padding: "2px 0",
+        fontSize: "12px",
+      },
+    },
+      h("span", { style: { minWidth: "42px" } }, label),
+      h("div", {
+        style: {
+          width: "110px", height: "8px", borderRadius: "4px",
+          border: "1px solid var(--color-border)", overflow: "hidden",
+        },
+      }, h("div", {
+        style: { width: pct + "%", height: "100%",
+                 background: "var(--color-primary, currentColor)" },
+      })),
+      h("span", null,
+        row.used_gb + "/" + row.total_gb + " GB (" + Math.round(pct) + "%)" +
+        (row.booked_now_gb != null ? " · booked_now " + row.booked_now_gb + " GB" : "") +
+        (row.free_gb != null ? " · free " + row.free_gb + " GB" : "")));
+  }
+
+  function ResourceView() {
+    // Collapsed by default; the snapshot loads once on expand (and on the
+    // manual Refresh click) — no timers, no polling, no animation.
+    const [open, setOpen] = React.useState(false);
+    const [state, setState] = React.useState({ phase: "idle", data: null, error: "" });
+    const load = function () {
+      setState({ phase: "loading", data: null, error: "" });
+      SDK.fetchJSON(RESOURCES_URL)
+        .then(function (data) {
+          if (!data || typeof data !== "object") {
+            setState({ phase: "error", data: null,
+                       error: "the resource API returned an unexpected payload" });
+          } else if (data.ok === false) {
+            setState({ phase: "error", data: null,
+                       error: data.error || "the resource API reported a failure" });
+          } else {
+            setState({ phase: "ready", data: data, error: "" });
+          }
+        })
+        .catch(function (err) {
+          setState({ phase: "error", data: null,
+                     error: "the resource API is unavailable: " +
+                            ((err && err.message) || err) });
+        });
+    };
+    const toggle = function () {
+      if (!open && state.phase === "idle") load();
+      setOpen(!open);
+    };
+    const children = [
+      h("div", {
+        key: "toggle",
+        onClick: toggle,
+        style: {
+          cursor: "pointer", padding: "4px 0 2px", fontWeight: 600,
+          fontSize: "12px", color: "var(--color-foreground)",
+        },
+      }, (open ? "▾ " : "▸ ") + "Resource view (on-demand)"),
+    ];
+    if (!open) {
+      children.push(h(Line, { key: "closed", muted: true },
+        "Memory use (VRAM/RAM) and the resident model blocks — loaded once " +
+        "when you open it, never a persistent display. In chat: " +
+        "/model-forge storage resources."));
+      return h("div", null, children);
+    }
+    if (state.phase === "loading") {
+      children.push(h(Line, { key: "l", muted: true },
+        "Loading the resource snapshot…"));
+    } else if (state.phase === "error") {
+      children.push(h(Line, { key: "e", muted: true },
+        "Resource snapshot unavailable: " + state.error +
+        " Nothing was changed — Refresh to retry."));
+    } else if (state.data) {
+      (state.data.targets || []).forEach(function (t) {
+        children.push(h("div", {
+          key: "t-" + t.target,
+          style: { margin: "6px 0 2px", fontWeight: 600, fontSize: "12px" },
+        }, (t.label || t.target) + " · " + (t.kind || "")));
+        (t.memory || []).forEach(function (row, i) {
+          children.push(h(MemoryBar, { key: "m-" + t.target + "-" + i, row: row }));
+        });
+        const residents = t.residents || [];
+        children.push(h(Line, { key: "rh-" + t.target, muted: true },
+          "resident (" + residents.length + "):"));
+        residents.forEach(function (r, i) {
+          const size = r.size_gb != null
+            ? r.size_gb + " GB (" + r.size_label + ")"
+            : String(r.size_label || "size unknown");
+          children.push(h(Line, { key: "r-" + t.target + "-" + i },
+            r.model_id + " · size " + size + " · engine=" + r.engine +
+            " · lane=" + r.lane));
+        });
+        (t.queued_loads || []).forEach(function (q, i) {
+          children.push(h(Line, { key: "q-" + t.target + "-" + i, muted: true },
+            "queued load: " + q.model_id + " · " + q.state));
+        });
+        if (t.swap_stats) {
+          children.push(h(Line, { key: "ss-" + t.target, muted: true },
+            "swap stats (measured): count=" + t.swap_stats.count +
+            " · last=" + t.swap_stats.last_total_seconds + "s" +
+            " · average=" + t.swap_stats.average_total_seconds + "s"));
+        }
+      });
+      if (state.data.note) {
+        children.push(h(Line, { key: "n", muted: true }, state.data.note));
+      }
+    }
+    children.push(h("div", {
+      key: "refresh",
+      onClick: load,
+      style: {
+        cursor: "pointer", padding: "3px 0", fontSize: "12px", width: "max-content",
+        color: "var(--color-primary, currentColor)",
+      },
+    }, "Refresh (manual — nothing polls)"));
+    return h("div", null, children);
+  }
+
   function StorageSection(props) {
     const storage = props.data.storage || {};
     const entries = storage.entries || [];
@@ -128,7 +263,10 @@
       h(Line, { muted: true }, props.data.delete_note ||
         "Read-only listing. To delete an entry, run the model_forge_storage " +
         "tool with action=delete and the entry id — the human-approval gate " +
-        "names the exact path and size first. This tab never deletes files."));
+        "names the exact path and size first. This tab never deletes files."),
+      // The on-demand resource view: collapsed by default, loads its
+      // snapshot only when expanded (and on its manual Refresh) — quiet.
+      h(ResourceView, { key: "resource-view" }));
   }
 
   function Invitation(props) {

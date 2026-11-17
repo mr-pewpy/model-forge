@@ -19,6 +19,7 @@ ride the human-approval gate through ``policy_hook``).
 from __future__ import annotations
 
 import json
+import math
 import threading
 
 from .model_forge import schemas, tools
@@ -91,6 +92,10 @@ def _browse_payload(modality: str) -> str:
 
 def _broker_payload() -> str:
     return tools.model_forge_broker({"action": "status"})
+
+
+def _resources_payload() -> str:
+    return tools.model_forge_storage({"action": "resources"})
 
 
 # --- plain-text rendering (chat rows, tool state vocabulary verbatim) --------
@@ -330,6 +335,91 @@ def _render_broker(data: dict) -> str:
     return "\n".join(lines)
 
 
+# --- the resource view: quiet text bars (on-demand, never animated) -----------
+
+# One static Unicode bar per memory kind, sized to the used/total percentage.
+# Quiet by design: drawn once per requested snapshot, never animated, never
+# polled — the bars change only when the user asks for a fresh snapshot.
+_BAR_WIDTH = 14
+
+
+def _bar(pct) -> str:
+    try:
+        value = max(0.0, min(100.0, float(pct)))
+    except (TypeError, ValueError):
+        value = 0.0
+    filled = min(_BAR_WIDTH, int(math.ceil(value * _BAR_WIDTH / 100.0)))
+    return "█" * filled + "░" * (_BAR_WIDTH - filled)
+
+
+def _render_resource_memory(row: dict) -> str:
+    """One quiet bar line per memory kind — the plain-text chat format:
+    ``vram  [████████░░░░░░] 6.2/12.0 GB (52%)`` with the booked_now and
+    free figures appended quietly. An unobservable row says 'unavailable'
+    with its reason instead of drawing a bar."""
+    label = f"{str(row.get('kind') or ''):<5}"
+    used = row.get("used_gb")
+    total = row.get("total_gb")
+    pct = row.get("used_pct")
+    if row.get("status") != "ok" or used is None or total is None or pct is None:
+        return f"{label} unavailable — {row.get('detail') or 'no reading'}"
+    line = (f"{label} [{_bar(pct)}] "
+            f"{float(used):.1f}/{float(total):.1f} GB ({float(pct):.0f}%)")
+    booked = row.get("booked_now_gb")
+    if booked is not None:
+        line += f" · booked_now {float(booked):.1f} GB"
+        booked_pct = row.get("booked_now_pct")
+        if booked_pct is not None:
+            line += f" ({float(booked_pct):.0f}%)"
+    free = row.get("free_gb")
+    if free is not None:
+        line += f" · free {float(free):.1f} GB"
+    return line
+
+
+def _render_resources(data: dict) -> str:
+    """Plain-text resource view: one bar line per memory kind per compute
+    target, then the resident model blocks, queued loads (only when any),
+    and the measured swap stats (only where present)."""
+    lines = ["Model Forge resource view (on-demand, read-only)"]
+    for t in data.get("targets") or []:
+        lines.append(f"target {t.get('target')} ({t.get('label')}) — "
+                     f"{t.get('kind')}:")
+        for row in t.get("memory") or []:
+            lines.append(_render_resource_memory(row))
+        residents = t.get("residents") or []
+        lines.append(f"residents ({len(residents)}):")
+        if not residents:
+            lines.append("  none")
+        for r in residents:
+            size = r.get("size_gb")
+            size_txt = (f"{float(size):.1f} GB ({r.get('size_label')})"
+                        if size is not None
+                        else str(r.get("size_label") or "size unknown"))
+            line = (f"  {r.get('model_id')} · size {size_txt} · "
+                    f"engine={r.get('engine')} · lane={r.get('lane')}")
+            if r.get("size_bytes"):
+                line += f" · on disk {_fmt_bytes(r.get('size_bytes'))}"
+            lines.append(line)
+        queued = t.get("queued_loads") or []
+        if queued:
+            lines.append(f"queued loads ({len(queued)}):")
+            for q in queued:
+                lines.append(f"  {q.get('scope_id')} · {q.get('model_id')} · "
+                             f"{q.get('state')}")
+        if t.get("swap_stats"):
+            s = t["swap_stats"]
+            lines.append(
+                f"swap stats (measured): count={s.get('count')} · "
+                f"last={_num(s.get('last_total_seconds'), 's')} · "
+                f"average={_num(s.get('average_total_seconds'), 's')}")
+        if t.get("detail"):
+            lines.append(f"detail: {t['detail']}")
+    if data.get("note"):
+        lines.append(f"note: {data['note']}")
+    return "\n".join(lines)
+
+
 # --- claim / release guidance (read-only; the verbs are tool verbs) ----------
 
 _APPROVAL_GATE_ROWS = (
@@ -437,6 +527,11 @@ _USAGE = (
     "fit data)\n"
     "  storage            installed model weights as JSON (the "
     "model_forge_storage list shape: sizes, modification times)\n"
+    "  storage resources  quiet resource view: VRAM/RAM usage bars per "
+    "compute target, then the resident model blocks (on-demand — nothing "
+    "polls; shown only when you ask)\n"
+    "  resources          the resource snapshot as JSON (the Desktop pane's "
+    "Resource-view data door)\n"
     "  status             plain-text rows: targets, engines, storage, pull "
     "credentials, pointing invitation\n"
     "  browse [modality]  plain-text model rows with advisory fit verdicts\n"
@@ -460,18 +555,34 @@ def cockpit_command(raw_args: str = "") -> str:
     Subcommands: cockpit (default), models [modality], storage — the
     historical read-only JSON data paths, delegated unchanged to
     model_forge.tools.cockpit_command (the Desktop cockpit pane's data
-    door) — plus plain-text chat verbs: status, browse [modality],
-    broker [status], claim, release, swap, help. Returns text and never
-    raises; every data read is bounded by COMMAND_TIMEOUT_S and fails soft to
-    an honest reason. Read-only by design: policy decisions and mutations are
-    tool verbs routed through the human-approval gate.
+    door) — resources (the on-demand resource snapshot as JSON, the
+    pane/dashboard Resource-view data door), plus plain-text chat verbs:
+    storage resources (the quiet resource-view text bars), status, browse
+    [modality], broker [status], claim, release, swap, help. Returns text
+    and never raises; every data read is bounded by COMMAND_TIMEOUT_S and
+    fails soft to an honest reason. Read-only by design: policy decisions and
+    mutations are tool verbs routed through the human-approval gate. The
+    resource view runs only when its subcommand is typed — nothing polls,
+    animates, or auto-refreshes.
     """
     parts = [p for p in str(raw_args or "").split() if p]
     sub = parts[0].lower() if parts else "cockpit"
     try:
-        if sub in ("cockpit", "models", "storage"):
-            # Historical JSON subcommands: byte-identical delegation so the
-            # Desktop pane's slash.exec bridge keeps parsing the same JSON.
+        if sub == "storage" and len(parts) > 1 \
+                and parts[1].lower() == "resources":
+            # The quiet resource view (text bars) — on-demand: this read
+            # happens only when the user types the subcommand.
+            raw, why = _bounded_read("resources", _resources_payload)
+            if why or raw is None:
+                return f"error: {why or 'the resources read returned no data'}"
+            err = _json_error_row(raw, "resources")
+            if err is not None:
+                return err
+            return _cap_output(_render_resources(json.loads(raw)))
+        if sub in ("cockpit", "models", "storage", "resources"):
+            # Historical JSON subcommands (plus the resources data door):
+            # byte-identical delegation so the Desktop pane's slash.exec
+            # bridge keeps parsing the same JSON.
             return _json_cockpit_command(raw_args)
         if sub in ("help", "-h", "--help"):
             return _USAGE
@@ -592,10 +703,11 @@ def register(ctx):
         tools.cockpit_command,
         description=("Model Forge cockpit: compute targets, GPU hardware, "
                      "declared + detected engines, model fit data, and model "
-                     "storage (read-only); plain-text status, browse and "
+                     "storage (read-only); the on-demand resource view "
+                     "(`storage resources`); plain-text status, browse and "
                      "broker rows for chat."),
-        args_hint=("[cockpit|models [modality]|storage|status|"
-                   "browse [modality]|broker|claim|release|swap|help]"),
+        args_hint=("[cockpit|models [modality]|storage [resources]|resources|"
+                   "status|browse [modality]|broker|claim|release|swap|help]"),
     )
     # Policy gate: registering a compute target, rewriting the default model
     # config, deleting a model-storage entry, and running a vendor engine

@@ -116,9 +116,13 @@ def test_activate_requires_model_id():
 def test_storage_schema_shape():
     spec = schemas.STORAGE
     props = spec["parameters"]["properties"]
-    assert props["action"]["enum"] == ["list", "delete"]
+    assert props["action"]["enum"] == ["list", "delete", "resources"]
     assert "entry" in props  # entry identifier or exact path for delete
+    assert "target" in props  # optional compute target filter for resources
     assert spec["parameters"].get("required", []) == []  # list is the default
+    # resources is documented as explicit and on-demand
+    assert "on-demand" in spec["description"]
+    assert "resources" in props["action"]["description"]
 
 
 # --- hardware.py ------------------------------------------------------------

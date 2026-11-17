@@ -404,3 +404,249 @@ def test_status_and_cockpit_carry_storage_list_shape(tmp_path, monkeypatch):
     # and the full cockpit snapshot carries the storage block too
     snap = json.loads(tools.cockpit_command("cockpit"))
     assert snap["storage"]["entries"] == ref["entries"]
+
+
+# --- resource view (on-demand): model_forge_storage action=resources ----------
+
+# Design intent: the resource snapshot runs ONLY when asked (never along with
+# action=list), reports honest numbers from the hardware probe and the
+# residency ledger, and never fabricates a value for a failed probe.
+
+class _ProgressOrchestrator:
+    """Fake orchestrator reporting fixed progress rows (queued-load rows)."""
+
+    def __init__(self, rows=None):
+        self._rows = dict(rows or {})
+
+    def progress(self, key):
+        return self._rows.get(key)
+
+
+def _residency_ledger():
+    """A real ledger: one booked resident with an on-disk pull record."""
+    from model_forge.broker import ResidencyLedger
+    ledger = ResidencyLedger()
+    ledger.book("chat-a", {"vram_gb": 6.0, "source": "catalog-vram-floor",
+                           "load_s": None})
+    ledger.record_resident("local", "chat-a", engine="ollama", lane="chat")
+    ledger.record_pull("local", "chat-a", "/x/chat-a", 5_000_000_000)
+    return ledger
+
+
+def _resource_seams(monkeypatch, *, hw_probe=None, stack=None,
+                    vram_used=None, ram_used=None):
+    """Point every live seam of the resource snapshot at fakes: one local
+    compute target, a fake hardware probe (12 GB VRAM / 64 GB RAM), the
+    residency stack, and fake usage probes (6.2 GB VRAM / 16 GB RAM used).
+    Returns (tools, ledger, stack)."""
+    from model_forge import tools
+    from model_forge.registry import HardwareProfile
+    from model_forge.targets import ComputeTarget
+    target = ComputeTarget(id="local", label="This machine", kind="local",
+                           base_url="http://127.0.0.1:8080")
+    if hw_probe is None:
+        def _fake_hw_probe(t):
+            return HardwareProfile(
+                gpus=({"name": "Fake RTX", "vram_gb": 12.0},),
+                total_vram_gb=12.0, ram_gb=64.0, platform="linux")
+        hw_probe = _fake_hw_probe
+    ledger = _residency_ledger()
+    if stack is None:
+        stack = {"target_id": "local", "ledger": ledger,
+                 "orchestrator": None, "planner": None,
+                 "bookings": {}, "budget_gb": 12.0}
+    monkeypatch.setattr(tools, "load_targets", lambda: [target])
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid=None: target
+                        if tid in (None, "", "local") else None)
+    monkeypatch.setattr(tools, "_hw_for_target", hw_probe)
+    monkeypatch.setattr(tools, "broker_stack", lambda t, **kw: stack)
+    monkeypatch.setattr(tools, "gpu_vram_used_gb",
+                        vram_used or (lambda: 6.2))
+    monkeypatch.setattr(tools, "_ram_used_gb", ram_used or (lambda: 16.0))
+    monkeypatch.setattr(tools, "_ACTIVE_SCOPES", {})
+    return tools, ledger, stack
+
+
+def test_resources_action_row_shapes_and_bars_math(tmp_path, monkeypatch):
+    tools, _ledger, _stack = _resource_seams(monkeypatch)
+    out = json.loads(tools.model_forge_storage({"action": "resources"}))
+    assert out["ok"] is True and out["action"] == "resources"
+    assert "shown only when asked" in out["note"]
+    (target,) = out["targets"]
+    assert target["target"] == "local" and target["kind"] == "local"
+    rows = {r["kind"]: r for r in target["memory"]}
+    assert set(rows) == {"vram", "ram"}
+    vram = rows["vram"]
+    assert vram["label"] == "VRAM" and vram["status"] == "ok"
+    assert vram["total_gb"] == 12.0
+    assert vram["used_gb"] == 6.2
+    # booked_now = the live claims: the booked ceiling of the one resident
+    assert vram["booked_now_gb"] == 6.0
+    assert vram["free_gb"] == 5.8
+    # bars math: used/total percentages from the fakes
+    assert vram["used_pct"] == 51.7
+    assert vram["booked_now_pct"] == 50.0
+    assert vram["free_pct"] == 48.3
+    ram = rows["ram"]
+    assert ram["label"] == "RAM" and ram["status"] == "ok"
+    assert ram["total_gb"] == 64.0 and ram["used_gb"] == 16.0
+    assert ram["free_gb"] == 48.0
+    assert ram["used_pct"] == 25.0
+    assert ram["booked_now_pct"] == 9.4
+    assert ram["free_pct"] == 75.0
+    # resident model blocks: model id, size, engine, lane
+    (res,) = target["residents"]
+    assert res == {"model_id": "chat-a", "size_gb": 6.0,
+                   "size_label": "published footprint (advisory)",
+                   "size_bytes": 5_000_000_000,
+                   "engine": "ollama", "lane": "chat"}
+    assert target["queued_loads"] == []
+    # swap stats are present only where measured swaps exist
+    assert "swap_stats" not in target
+    # vocabulary: booked_now (live claims) never carries a booking label
+    assert "published" not in str(vram["booked_now_gb"])
+
+
+def test_resources_queued_loads_and_swap_stats_where_present(tmp_path,
+                                                             monkeypatch):
+    tools, ledger, stack = _resource_seams(monkeypatch)
+    ledger.record_swap({"model_id": "krea-2-turbo", "evicted": ["chat-a"],
+                        "total_seconds": 12.5, "ok": True})
+    stack["orchestrator"] = _ProgressOrchestrator({
+        "shot-1": {"state": "loading"},
+        "shot-2": {"state": "ready"},
+    })
+    monkeypatch.setattr(tools, "_ACTIVE_SCOPES", {
+        "shot-1": {"target_id": "local", "model_id": "krea-2-turbo",
+                   "modality": "image", "kind": "workflow"},
+        "shot-2": {"target_id": "local", "model_id": "chat-a",
+                   "modality": "chat", "kind": "workflow"},
+    })
+    out = json.loads(tools.model_forge_storage({"action": "resources"}))
+    target = out["targets"][0]
+    # queued loads: in-flight scopes only — a ready scope is not a queued load
+    assert target["queued_loads"] == [
+        {"scope_id": "shot-1", "model_id": "krea-2-turbo", "state": "loading"}]
+    assert target["swap_stats"] == {"count": 1, "last_total_seconds": 12.5,
+                                    "average_total_seconds": 12.5}
+
+
+def test_resources_probe_failure_is_an_honest_unavailable_row(tmp_path,
+                                                              monkeypatch):
+    def _boom(t):
+        raise RuntimeError("nvidia-smi exploded")
+
+    tools, _ledger, _stack = _resource_seams(monkeypatch, hw_probe=_boom)
+    out = json.loads(tools.model_forge_storage({"action": "resources"}))
+    target = out["targets"][0]
+    assert len(target["memory"]) == 2
+    for row in target["memory"]:
+        assert row["status"] == "unavailable"
+        assert ("hardware probe failed: RuntimeError: nvidia-smi exploded"
+                in row["detail"])
+        # never fake numbers: no total, no usage, no free, no percentages
+        assert row["total_gb"] is None
+        assert row["used_gb"] is None
+        assert row["free_gb"] is None
+        assert row["used_pct"] is None
+        assert row["free_pct"] is None
+        # the ledger's live claims stay honest and labeled
+        assert row["booked_now_gb"] == 6.0
+
+
+def test_resources_usage_probe_failure_keeps_honest_totals(tmp_path,
+                                                           monkeypatch):
+    def _boom():
+        raise OSError("sysconf gone")
+
+    tools, _ledger, _stack = _resource_seams(monkeypatch, ram_used=_boom)
+    out = json.loads(tools.model_forge_storage({"action": "resources"}))
+    rows = {r["kind"]: r for r in out["targets"][0]["memory"]}
+    # VRAM (its probe answered) stays a full ok row
+    assert rows["vram"]["status"] == "ok" and rows["vram"]["used_gb"] == 6.2
+    ram = rows["ram"]
+    assert ram["status"] == "unavailable"
+    assert "live ram usage probe failed: OSError: sysconf gone" in ram["detail"]
+    assert ram["total_gb"] == 64.0        # the honest probe total stays
+    assert ram["booked_now_gb"] == 6.0
+    assert ram["used_gb"] is None and ram["free_gb"] is None
+    assert ram["used_pct"] is None and ram["free_pct"] is None
+
+
+def test_resources_zero_total_is_an_unavailable_row_not_a_fake_zero(
+        tmp_path, monkeypatch):
+    from model_forge.registry import HardwareProfile
+
+    def _no_gpu(t):
+        return HardwareProfile(gpus=(), total_vram_gb=0.0, ram_gb=64.0,
+                               platform="linux")
+
+    tools, _ledger, _stack = _resource_seams(monkeypatch, hw_probe=_no_gpu)
+    out = json.loads(tools.model_forge_storage({"action": "resources"}))
+    rows = {r["kind"]: r for r in out["targets"][0]["memory"]}
+    vram = rows["vram"]
+    # a probe that reports no VRAM total -> an honest unavailable row
+    assert vram["status"] == "unavailable"
+    assert "no VRAM total was reported by the hardware probe" in vram["detail"]
+    assert vram["total_gb"] is None and vram["used_gb"] is None
+    # RAM on the same machine is unaffected
+    assert rows["ram"]["status"] == "ok" and rows["ram"]["total_gb"] == 64.0
+
+
+def test_resources_action_targets_one_compute_target(tmp_path, monkeypatch):
+    tools, _ledger, _stack = _resource_seams(monkeypatch)
+    out = json.loads(tools.model_forge_storage({"action": "resources",
+                                                "target": "local"}))
+    assert [t["target"] for t in out["targets"]] == ["local"]
+    out = json.loads(tools.model_forge_storage({"action": "resources",
+                                                "target": "nope"}))
+    assert "unknown target" in out["error"]
+
+
+def test_resources_action_is_read_only_and_list_stays_lean(tmp_path,
+                                                           monkeypatch):
+    _stub_plugins(monkeypatch, tmp_path)
+    _fake_home(monkeypatch, tmp_path)
+    downloads = tmp_path / "model-forge" / "downloads"
+    downloads.mkdir(parents=True)
+    (downloads / "a.bin").write_bytes(b"1234")
+    from model_forge import tools
+    # the resources action never rides the approval gate (read-only)
+    assert tools.policy_hook("model_forge_storage",
+                             {"action": "resources"}) is None
+    assert tools.policy_hook("model_forge_storage", {}) is None  # list
+    # non-intrusion at the data layer: action=list stays exactly the lean
+    # inventory — no resource block, no heavier read runs
+    out = json.loads(tools.model_forge_storage({"action": "list"}))
+    assert set(out) == {"ok", "entries", "roots", "roots_skipped", "note"}
+    raw = tools.model_forge_storage({})
+    assert '"resources"' not in raw
+    assert '"memory"' not in raw
+    assert '"queued_loads"' not in raw
+    assert '"swap_stats"' not in raw
+    assert "resources_hint" not in out
+
+
+def test_storage_output_has_one_resources_guidance_line(tmp_path, monkeypatch):
+    _stub_plugins(monkeypatch, tmp_path)
+    _fake_home(monkeypatch, tmp_path)
+    downloads = tmp_path / "model-forge" / "downloads"
+    downloads.mkdir(parents=True)
+    (downloads / "a.bin").write_bytes(b"1234")
+    from model_forge import tools
+    ref = list_storage()
+    cmd = json.loads(tools.cockpit_command("storage"))
+    # the listing itself is unchanged; one guidance line names the
+    # resources subcommand
+    assert cmd["entries"] == ref["entries"]
+    assert "storage resources" in cmd["resources_hint"]
+    assert "on-demand" in cmd["resources_hint"]
+
+
+def test_resources_json_data_door_returns_the_snapshot(tmp_path, monkeypatch):
+    tools, _ledger, _stack = _resource_seams(monkeypatch)
+    for args in ("resources", "storage resources"):
+        out = json.loads(tools.cockpit_command(args))
+        assert out["ok"] is True and out["action"] == "resources", args
+        assert out["targets"][0]["memory"], args

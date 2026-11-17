@@ -310,27 +310,37 @@ ACTIVATE = {
 STORAGE = {
     "name": "model_forge_storage",
     "description": (
-        "List and delete model weights on this machine: the Model Forge "
-        "downloads directory plus the engine-managed model directories "
-        "(the Ollama models dir, the Hugging Face hub cache). 'list' "
-        "(default) reports each entry's name, absolute path, size in "
-        "bytes, and filesystem modification time. 'delete' removes one "
+        "Model weights on this machine and the on-demand resource view. "
+        "'list' (default) reports each entry in the Model Forge downloads "
+        "directory plus the engine-managed model directories (the Ollama "
+        "models dir, the Hugging Face hub cache): name, absolute path, size "
+        "in bytes, and filesystem modification time. 'delete' removes one "
         "listed entry — the user approves the exact path and size first, "
         "and only an entry id or exact path from a previous list is "
-        "accepted (arbitrary paths are refused). Use when the user asks "
-        "what model files are on disk, how much space they take, or wants "
-        "unwanted weights deleted."
+        "accepted (arbitrary paths are refused). 'resources' (explicit, "
+        "on-demand) takes a read-only memory snapshot per compute target — "
+        "VRAM and RAM as used / booked_now / free in GB with percentages "
+        "(used from the hardware probe, booked_now = the live claims of the "
+        "models resident right now), resident model blocks (model id, size, "
+        "engine, lane), queued loads, and measured swap stats where present "
+        "— with honest 'unavailable' rows when a probe fails. The snapshot "
+        "runs only when asked: nothing polls or updates on its own, and "
+        "action=list stays lean. Use when the user asks what model files "
+        "are on disk, how much space they take, wants unwanted weights "
+        "deleted, or asks what is using memory right now."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "delete"],
+                "enum": ["list", "delete", "resources"],
                 "description": (
                     "'list' (default) inventories model storage; 'delete' "
                     "removes one listed entry (asks for the user's approval "
-                    "first)."
+                    "first); 'resources' takes the on-demand read-only "
+                    "memory snapshot (VRAM/RAM usage, resident model "
+                    "blocks) — shown only when asked."
                 ),
             },
             "entry": {
@@ -339,6 +349,13 @@ STORAGE = {
                     "For action=delete: the entry id returned by "
                     "action=list, or that entry's exact absolute path. "
                     "Anything else is refused."
+                ),
+            },
+            "target": {
+                "type": "string",
+                "description": (
+                    "For action=resources: one compute target id (default: "
+                    "every registered compute target)."
                 ),
             },
         },
