@@ -353,34 +353,44 @@ BROKER = {
         "weights are on disk and what is loaded in memory now, and the "
         "claim/release verbs that let one GPU lane serve several models in "
         "turn. 'status' (read-only) reports pulled weights with sizes, what "
-        "is resident, booked ceilings, and budget usage. 'claim' takes the "
-        "GPU lane for a modality or model: it runs the eviction policy, "
-        "steps down what must go, pre-warms the requested model, and "
-        "returns a scope id with honest progress states (queued / loading / "
-        "ready). 'release' ends a scope by id and restores exactly what was "
-        "resident at claim time. 'plan' is a dry run of claim — the "
-        "release/load steps with reasons, nothing executed. 'bench' "
-        "measures what you run: a short VRAM measurement window on a "
-        "loaded (or about-to-run) model records its real observed peak and "
-        "books it as the model's nominal ceiling — measured peaks replace "
-        "published estimates and are never downgraded. Use when the user "
-        "wants models swapped on one GPU (chat -> image generation -> "
-        "back to chat as one workflow), asks what is loaded and what it "
-        "costs, wants to preview a swap, or wants a model's true VRAM "
-        "footprint measured."
+        "is resident, booked ceilings, budget usage, and measured swap "
+        "stats. 'claim' takes the GPU lane for a modality or model: it runs "
+        "the eviction policy, steps down what must go, pre-warms the "
+        "requested model, and returns a scope id with honest progress states "
+        "(queued / loading / ready). 'release' ends a scope by id and "
+        "restores exactly what was resident at claim time. 'swap' is the "
+        "one-call exchange verb: it swaps the resident weights for one "
+        "incoming model in strict phases (PREFLIGHT / EVICT / LOAD / READY) "
+        "with measured timings — never estimates — and the pre-flight "
+        "guarantee that nothing is evicted before the preflight passes "
+        "(a failed preflight leaves residency untouched). 'plan' is a dry "
+        "run of claim — the release/load steps with reasons, nothing "
+        "executed. 'bench' measures what you run: a short VRAM measurement "
+        "window on a loaded (or about-to-run) model records its real "
+        "observed peak and books it as the model's nominal ceiling — "
+        "measured peaks replace published estimates and are never "
+        "downgraded. Use when the user wants models swapped on one GPU "
+        "(chat -> image generation -> back to chat as one workflow), wants "
+        "one model exchanged for another in one call with measured timings, "
+        "asks what is loaded and what it costs, wants to preview a swap, or "
+        "wants a model's true VRAM footprint measured."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["status", "claim", "release", "plan", "bench"],
+                "enum": ["status", "claim", "release", "plan", "swap",
+                         "bench"],
                 "description": (
                     "'status' = read-only residency summary; 'claim' = take "
                     "the GPU lane for a modality or model and return a scope "
                     "id; 'release' = end a scope and restore what was "
                     "resident at claim time; 'plan' = dry run of claim "
-                    "(nothing executed); 'bench' = measure a model's VRAM "
+                    "(nothing executed); 'swap' = exchange the resident "
+                    "weights for one incoming model in one measured call "
+                    "(pass dry_run=true for the preflight plan rows only — "
+                    "nothing is changed); 'bench' = measure a model's VRAM "
                     "peak over a short window and book it as its nominal "
                     "ceiling (pass model_id)."
                 ),
@@ -389,9 +399,10 @@ BROKER = {
                 "type": "string",
                 "description": (
                     "Catalog model id from model_forge_browse to claim the "
-                    "lane for (claim/plan), or the model id to measure "
-                    "(bench — load it first, or exercise it during the "
-                    "bench window)."
+                    "lane for (claim/plan), the incoming model to exchange "
+                    "the resident weights for (swap), or the model id to "
+                    "measure (bench — load it first, or exercise it during "
+                    "the bench window)."
                 ),
             },
             "modality": {
@@ -415,6 +426,26 @@ BROKER = {
                 "description": (
                     "Compute target id (default 'local'). See "
                     "model_forge_status for the list."
+                ),
+            },
+            "release": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "For action=swap: explicit outgoing model ids to step "
+                    "down (a comma-separated string is also accepted). "
+                    "Default: the eviction policy's own set. "
+                    "Image-generation swaps always evict GPU residents "
+                    "deterministically, so their explicit list is honored "
+                    "as part of the full eviction."
+                ),
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": (
+                    "For action=swap: true returns the preflight plan rows "
+                    "with an explicit 'nothing was changed' note and zero "
+                    "side effects. false/omitted = execute the swap."
                 ),
             },
         },

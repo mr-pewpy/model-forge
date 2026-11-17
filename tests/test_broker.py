@@ -27,6 +27,7 @@ from model_forge.broker import (
     OllamaLifecycle,
     Orchestrator,
     ResidencyLedger,
+    SWAP_HISTORY_LIMIT,
     VllmServerLifecycle,
     is_image_generation,
     loading_state,
@@ -1514,3 +1515,403 @@ def test_comfyui_vllm_and_maya_run_as_orchestrator_plan_steps():
     assert maya_http.calls == []
     assert {r.model_id for r in ledger.residents("local")} == {"flux"}
     assert orch.progress("local:flux")["state"] == "ready"
+
+
+# --- swap: the one-call weight exchange (hiccup-free by pre-flight) ----------
+
+class SwapRecorder(EngineLifecycle):
+    """Swap-test engine adapter: records the call ORDER (probes included),
+    advances the injected fake clock per call (so phase timings are exact),
+    fails on demand, and counts concurrent loads — swap choreography must
+    never see two loads in flight."""
+
+    def __init__(self, engine_id="ollama", clock=None, load_s=5.0,
+                 release_s=2.0, probe_s=1.0, fail_load=(), fail_release=(),
+                 probe_states=()):
+        self.engine_id = engine_id
+        self.clock = clock
+        self.load_s = load_s
+        self.release_s = release_s
+        self.probe_s = probe_s
+        self.fail_load = set(fail_load)
+        self.fail_release = set(fail_release)
+        self.probe_states = list(probe_states)
+        self.events = []
+        self.in_load = 0
+        self.overlaps = 0
+
+    def _tick(self, seconds):
+        if self.clock is not None:
+            self.clock.advance(seconds)
+
+    def ensure_loaded(self, model_id, **kwargs):
+        self.events.append(f"ensure_loaded:{model_id}")
+        self.in_load += 1
+        if self.in_load > 1:
+            self.overlaps += 1
+        self._tick(self.load_s)
+        self.in_load -= 1
+        if model_id in self.fail_load:
+            return {"ok": False,
+                    "reason": f"fake load failure for {model_id}"}
+        return {"ok": True, "reason": "warmed"}
+
+    def release(self, model_id):
+        self.events.append(f"release:{model_id}")
+        self._tick(self.release_s)
+        if model_id in self.fail_release:
+            return {"ok": False,
+                    "reason": f"fake release failure for {model_id}"}
+        return {"ok": True, "reason": "evicted"}
+
+    def probe(self):
+        self.events.append("probe")
+        self._tick(self.probe_s)
+        state = (self.probe_states.pop(0) if self.probe_states
+                 else "observed")
+        if state == "unknown":
+            return {"ok": False, "state": "unknown", "resident": [],
+                    "reason": "fake engine unreachable"}
+        return {"ok": True, "state": state, "resident": []}
+
+
+def _swap_setup(clock=None, budget=24.0, adapter=None, weights=("image-x",)):
+    """A swap-ready world: booked models, a declared budget, residents
+    chat-a (older) + chat-b (newer), recorded weights for the incoming
+    models, and one recording adapter behind every engine."""
+    clock = clock or FakeClock()
+    ledger = ResidencyLedger(
+        bookings={"chat-a": 6.0, "chat-b": 8.0, "chat-c": 12.0,
+                  "image-x": 18.0},
+        clock=clock)
+    ledger.set_budget("gpu", budget)
+    ledger.record_resident("gpu", "chat-a", engine="ollama", lane="chat")
+    clock.advance(10.0)             # chat-b is the newer resident
+    ledger.record_resident("gpu", "chat-b", engine="ollama", lane="chat")
+    clock.advance(10.0)
+    for mid in weights:
+        ledger.record_pull("gpu", mid, f"/models/{mid}.safetensors", 1024)
+    if adapter is None:
+        adapter = SwapRecorder("ollama", clock=clock)
+    orch = Orchestrator(ledger, EvictionPlanner(ledger, clock=clock),
+                        {"ollama": adapter}, clock=clock)
+    return ledger, adapter, orch
+
+
+def _image_request():
+    return LoadRequest("image-x", "ollama", lane="image", modality="image",
+                       weights_path="/models/image-x.safetensors")
+
+
+def test_swap_history_ring_is_bounded_with_exact_record_shape():
+    ledger = ResidencyLedger()
+    for i in range(SWAP_HISTORY_LIMIT + 1):
+        res = ledger.record_swap({
+            "model_id": f"m{i}", "evicted": [f"old{i}"],
+            "evict_seconds": 1.0, "load_seconds": 2.0,
+            "ready_seconds": 0.5, "total_seconds": 3.5 + i,
+            "ok": True, "warm_path": "warm"})
+        assert res["ok"] is True and res["limit"] == SWAP_HISTORY_LIMIT
+    history = ledger.swap_history()
+    assert len(history) == SWAP_HISTORY_LIMIT          # bounded ring
+    assert history[0]["model_id"] == "m1"              # the oldest dropped
+    assert history[-1]["model_id"] == f"m{SWAP_HISTORY_LIMIT}"
+    # exact record shape — the measured truth of one swap, nothing more
+    assert set(history[-1]) == {"model_id", "evicted", "evict_seconds",
+                                "load_seconds", "ready_seconds",
+                                "total_seconds", "ok", "warm_path"}
+    # a non-dict record is an honest error row, never a raise
+    assert ledger.record_swap("nope")["ok"] is False
+
+
+def test_swap_stats_are_measured_aggregates_never_estimates():
+    ledger = ResidencyLedger()
+    # nothing measured yet -> honest None, never a guessed 0
+    assert ledger.swap_stats() == {"count": 0, "last_total_seconds": None,
+                                   "average_total_seconds": None}
+    ledger.record_swap({"model_id": "a", "evicted": [], "evict_seconds": 1.0,
+                        "load_seconds": 2.0, "ready_seconds": 1.0,
+                        "total_seconds": 4.0, "ok": True,
+                        "warm_path": "keep_alive"})
+    ledger.record_swap({"model_id": "b", "evicted": ["x"],
+                        "evict_seconds": 2.0, "load_seconds": 4.0,
+                        "ready_seconds": 2.0, "total_seconds": 8.0,
+                        "ok": False, "warm_path": "process restart"})
+    stats = ledger.swap_stats()
+    assert stats == {"count": 2, "last_total_seconds": 8.0,
+                     "average_total_seconds": 6.0}
+    # a failed preflight (phases that never ran) still measures its total —
+    # the None phase seconds are never counted as zeroes
+    ledger.record_swap({"model_id": "c", "evicted": [],
+                        "evict_seconds": None, "load_seconds": None,
+                        "ready_seconds": None, "total_seconds": 1.0,
+                        "ok": False, "warm_path": None})
+    stats = ledger.swap_stats()
+    assert stats["count"] == 3
+    assert stats["last_total_seconds"] == 1.0
+    assert stats["average_total_seconds"] == (4.0 + 8.0 + 1.0) / 3
+
+
+def test_swap_preflight_failures_leave_residency_untouched():
+    """The hardest guarantee: no evict/release call may happen before the
+    preflight returns ok — every refusal path leaves residency untouched."""
+    # (a) no booked footprint for the incoming model
+    ledger, adapter, orch = _swap_setup()
+    row = orch.swap("gpu", LoadRequest("mystery", "ollama", lane="chat"))
+    assert row["ok"] is False
+    assert "no booked footprint" in row["reason"]
+    _assert_untouched(ledger, adapter, row)
+
+    # (b) nominal fit fails even with the eviction applied
+    ledger, adapter, orch = _swap_setup(budget=18.0)
+    row = orch.swap("gpu", LoadRequest("chat-c", "ollama", lane="chat"),
+                    release=["chat-a"])     # chat-b (8) + chat-c (12) > 18
+    assert row["ok"] is False
+    assert "nominal fit fails even with the eviction applied" in row["reason"]
+    _assert_untouched(ledger, adapter, row)
+
+    # (c) weights not present — a swap never begins a download mid-flight
+    ledger, adapter, orch = _swap_setup(weights=())
+    row = orch.swap("gpu", _image_request())
+    assert row["ok"] is False
+    assert "weights not present — run model_forge_install first" in \
+        row["reason"]
+    _assert_untouched(ledger, adapter, row)
+
+    # (d) engine not live/reachable
+    ledger, adapter, orch = _swap_setup()
+    adapter.probe_states = ["unknown"]
+    row = orch.swap("gpu", _image_request())
+    assert row["ok"] is False
+    assert "not live/reachable" in row["reason"]
+    assert adapter.events == ["probe"]     # liveness probe only — zero evicts
+    assert ledger.is_resident("gpu", "chat-a")
+    assert ledger.is_resident("gpu", "chat-b")
+
+    # (e) the incoming model cannot be its own eviction
+    ledger, adapter, orch = _swap_setup()
+    row = orch.swap("gpu", _image_request(), release=["image-x"])
+    assert row["ok"] is False
+    assert "cannot be named as its own eviction" in row["reason"]
+    _assert_untouched(ledger, adapter, row)
+
+    # (f) no nominal budget declared
+    ledger, adapter, orch = _swap_setup()
+    ledger._budgets.pop("gpu", None)      # as if the budget never existed
+    row = orch.swap("gpu", _image_request())
+    assert row["ok"] is False and "no nominal budget declared" in row["reason"]
+    _assert_untouched(ledger, adapter, row)
+
+
+def _assert_untouched(ledger, adapter, row):
+    """Shared preflight-refusal assertions: zero evict/load calls, residency
+    untouched, an honest resident state in the row, and an honest history
+    record (nothing measured for phases that never ran)."""
+    assert adapter.events == [] or adapter.events == ["probe"]
+    assert [e for e in adapter.events
+            if e.startswith(("release", "ensure_loaded"))] == []
+    assert ledger.is_resident("gpu", "chat-a")
+    assert ledger.is_resident("gpu", "chat-b")
+    assert not ledger.is_resident("gpu", "image-x")
+    assert "resident now:" in row["reason"]
+    record = ledger.swap_history()[-1]
+    assert record["ok"] is False and record["evicted"] == []
+    assert record["evict_seconds"] is None     # never ran — never a guessed 0
+    assert record["load_seconds"] is None
+    assert record["ready_seconds"] is None
+
+
+def test_swap_phase_ordering_evict_before_load_and_single_load():
+    ledger, adapter, orch = _swap_setup()
+    row = orch.swap("gpu", _image_request())
+    assert row["ok"] is True
+    # strict order: preflight probe -> BOTH evictions -> exactly ONE load ->
+    # ready probe. Evict completes before load starts, never interleaved.
+    assert adapter.events == ["probe", "release:chat-a", "release:chat-b",
+                              "ensure_loaded:image-x", "probe"]
+    assert adapter.overlaps == 0            # loads never concurrent
+    assert adapter.in_load == 0
+    assert [row["phases"][k]["name"] for k in
+            ("preflight", "evict", "load", "ready")] == \
+        ["PREFLIGHT", "EVICT", "LOAD", "READY"]
+    assert row["evicted"] == ["chat-a", "chat-b"]    # LRU first per policy
+    assert row["phases"]["load"]["steps"][0]["model_id"] == "image-x"
+
+
+def test_swap_timings_come_from_the_injectable_clock():
+    clock = FakeClock()
+    ledger, adapter, orch = _swap_setup(clock=clock)
+    row = orch.swap("gpu", _image_request())
+    assert row["ok"] is True
+    # the fake adapter advances the clock by exact amounts per call:
+    # preflight probe 1s, two evictions 2s each, one load 5s, ready probe 1s
+    timings = row["timings"]
+    assert timings["preflight_seconds"] == 1.0
+    assert timings["evict_seconds"] == 4.0
+    assert timings["load_seconds"] == 5.0
+    assert timings["ready_seconds"] == 1.0
+    assert timings["total_seconds"] == 11.0
+    # the measured row is what lands in history — measured, not estimated
+    record = ledger.swap_history()[-1]
+    assert record["total_seconds"] == 11.0
+    assert record["evict_seconds"] == 4.0
+    assert ledger.swap_stats()["average_total_seconds"] == 11.0
+    # each phase carries its own measured seconds too
+    assert row["phases"]["evict"]["seconds"] == 4.0
+    assert row["phases"]["load"]["seconds"] == 5.0
+    assert row["phases"]["ready"]["seconds"] == 1.0
+
+
+def test_swap_dry_run_has_zero_side_effects():
+    ledger, adapter, orch = _swap_setup()
+    row = orch.swap("gpu", _image_request(), dry_run=True)
+    assert row["ok"] is True and row["dry_run"] is True
+    assert "nothing was changed" in row["note"]
+    # zero side effects: only the read-only liveness probe ran
+    assert adapter.events == ["probe"]
+    assert ledger.is_resident("gpu", "chat-a")
+    assert ledger.is_resident("gpu", "chat-b")
+    assert not ledger.is_resident("gpu", "image-x")
+    assert ledger.swap_history() == ()        # dry runs never record
+    # the preflight plan rows come back
+    plan = row["phases"]["preflight"]
+    assert plan["ok"] is True
+    assert [r["model_id"] for r in plan["evict_plan"]] == ["chat-a", "chat-b"]
+    assert [r["model_id"] for r in plan["load_plan"]] == ["image-x"]
+    assert row["swap_stats"]["count"] == 0
+
+
+def test_swap_mid_flight_load_failure_states_what_is_resident():
+    clock = FakeClock()
+    adapter = SwapRecorder("ollama", clock=clock, fail_load=("image-x",))
+    ledger, adapter, orch = _swap_setup(clock=clock, adapter=adapter)
+    row = orch.swap("gpu", _image_request())
+    assert row["ok"] is False
+    # the row states exactly what is now resident — 'nothing' is honest —
+    # and why: never a raise, never a silent stall
+    assert row["resident_state"] == "nothing"
+    assert row["resident_now"] == []
+    assert "load of image-x failed" in row["reason"]
+    assert "resident now: nothing" in row["reason"]
+    assert row["evicted"] == ["chat-a", "chat-b"]
+    # phase honesty: evict succeeded and is measured, load failed and is
+    # measured, ready never ran — its seconds are None, never a guessed 0
+    assert row["phases"]["evict"]["ok"] is True
+    assert row["phases"]["load"]["ok"] is False
+    assert "ready" not in row["phases"]
+    assert row["timings"]["evict_seconds"] == 4.0
+    assert row["timings"]["load_seconds"] == 5.0
+    assert row["timings"]["ready_seconds"] is None
+    record = ledger.swap_history()[-1]
+    assert record["ok"] is False
+    assert record["evicted"] == ["chat-a", "chat-b"]
+    assert record["ready_seconds"] is None
+
+
+def test_swap_eviction_failure_stops_before_load_honestly():
+    adapter = SwapRecorder("ollama", fail_release=("chat-a",))
+    ledger, adapter, orch = _swap_setup(adapter=adapter)
+    row = orch.swap("gpu", _image_request())
+    assert row["ok"] is False
+    assert "eviction of chat-a failed" in row["reason"]
+    assert "stopped before load" in row["reason"]
+    assert "resident now:" in row["reason"]
+    assert [e for e in adapter.events if e.startswith("ensure_loaded")] == []
+    # the failed resident is still resident — the row says so honestly
+    assert ledger.is_resident("gpu", "chat-a")
+    assert row["evicted"] == []
+    assert row["timings"]["load_seconds"] is None
+
+
+def test_swap_warm_path_labels_warm_engine_vs_process_restart():
+    # warm-capable engine: Ollama's keep_alive warm path is recorded verbatim
+    clock = FakeClock()
+    http = FakeHttp()
+    ledger = ResidencyLedger(
+        bookings={"chat-a": 6.0, "chat-c": 12.0}, clock=clock)
+    ledger.set_budget("gpu", 20.0)
+    ledger.record_resident("gpu", "chat-a", engine="ollama", lane="chat")
+    ledger.record_pull("gpu", "chat-c", "/models/chat-c.gguf", 1024)
+    ollama = OllamaLifecycle(http=http)
+    orch = Orchestrator(ledger, EvictionPlanner(ledger, clock=clock),
+                        {"ollama": ollama}, clock=clock)
+    row = orch.swap("gpu", LoadRequest("chat-c", "ollama", lane="chat"))
+    assert row["ok"] is True
+    assert "keep_alive" in row["warm_path"]
+    assert "warm-swap" in row["warm_path"]
+
+    # llama.cpp-style engine: process restart, never a claimed warm path —
+    # and the stopped-but-startable engine passes the liveness preflight
+    clock2 = FakeClock()
+    runner = FakeRunner()
+    ledger2 = ResidencyLedger(bookings={"image-y": 18.0}, clock=clock2)
+    ledger2.set_budget("gpu", 24.0)
+    ledger2.record_pull("gpu", "image-y", "/models/image-y.gguf", 1024)
+    llamacpp = LlamaCppServerLifecycle(
+        runner=runner, which=lambda name: f"/usr/bin/{name}")
+    orch2 = Orchestrator(ledger2, EvictionPlanner(ledger2, clock=clock2),
+                         {"llamacpp": llamacpp}, clock=clock2)
+    row2 = orch2.swap("gpu", LoadRequest(
+        "image-y", "llamacpp", lane="chat",
+        weights_path="/models/image-y.gguf"))
+    assert row2["ok"] is True
+    assert row2["warm_path"].startswith("process restart")
+    assert "no warm-swap surface" in row2["warm_path"]
+    assert runner.argvs == [["/usr/bin/llama-server", "-m",
+                             "/models/image-y.gguf", "--port", "8080"]]
+    # the applied warm path is what lands in the measured history record
+    assert ledger2.swap_history()[-1]["warm_path"] == row2["warm_path"]
+
+
+def test_swap_image_entry_evicts_whole_card_despite_explicit_release():
+    """Battle rule, every time: an image-generation entry evicts GPU
+    residents deterministically — an explicit release list cannot keep a
+    resident on the card."""
+    ledger, adapter, orch = _swap_setup()
+    row = orch.swap("gpu", _image_request(), release=["chat-a"])
+    assert row["ok"] is True
+    assert row["evicted"] == ["chat-a", "chat-b"]    # the whole card, LRU first
+    assert not ledger.is_resident("gpu", "chat-a")
+    assert not ledger.is_resident("gpu", "chat-b")
+    assert ledger.is_resident("gpu", "image-x")
+    reason = next(c["reason"] for c in row["phases"]["preflight"]["checks"]
+                  if c["check"] == "release ids")
+    assert "deterministic full eviction" in reason
+
+
+def test_swap_explicit_release_evicts_only_named_ids_lru_first():
+    clock = FakeClock()
+    ledger, adapter, orch = _swap_setup(clock=clock, budget=26.0,
+                                        weights=("image-x", "chat-c"))
+    # explicit outgoing ids, least-recently used first; chat-b stays
+    row = orch.swap("gpu", LoadRequest("chat-c", "ollama", lane="chat"),
+                    release=["chat-b", "chat-a"])
+    assert row["ok"] is True
+    assert row["evicted"] == ["chat-a", "chat-b"]    # LRU first, not arg order
+    assert ledger.is_resident("gpu", "chat-c")
+    # a named id that is not resident is skipped with a stated reason
+    adapter.events.clear()
+    row2 = orch.swap("gpu", LoadRequest("image-x", "ollama", lane="image",
+                                        modality="image"),
+                     release=["ghost-model"])
+    assert row2["ok"] is True
+    reason = next(c["reason"] for c in
+                  row2["phases"]["preflight"]["checks"]
+                  if c["check"] == "release ids")
+    assert "ghost-model" in reason and "nothing to evict for it" in reason
+
+
+def test_swap_ready_probe_failure_is_an_honest_row():
+    clock = FakeClock()
+    adapter = SwapRecorder("ollama", clock=clock,
+                           probe_states=["observed", "stopped"])
+    ledger, adapter, orch = _swap_setup(clock=clock, adapter=adapter)
+    row = orch.swap("gpu", _image_request())
+    assert row["ok"] is False
+    assert "ready probe could not confirm" in row["reason"]
+    # the load did complete — the row says exactly what is resident now
+    assert row["resident_state"] == "image-x"
+    assert row["timings"]["load_seconds"] == 5.0
+    assert row["timings"]["ready_seconds"] == 1.0
+    assert row["phases"]["ready"]["ok"] is False
+    assert ledger.swap_history()[-1]["ok"] is False

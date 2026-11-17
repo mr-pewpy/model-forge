@@ -31,7 +31,7 @@ API_PATH = DASH_DIR / "plugin_api.py"
 MATRIX_PATH = REPO / "docs" / "surface-parity.md"
 
 _ALL_VERBS = ("cockpit", "models", "storage", "status", "browse", "broker",
-              "claim", "release", "help")
+              "claim", "release", "swap", "help")
 
 
 def _load_plugin_module():
@@ -189,6 +189,8 @@ def _broker_json() -> str:
         "budget": {"nominal_gb": 24.0, "booked_now_gb": 16.0,
                    "headroom_gb": 8.0},
         "unbooked_residents": [],
+        "swap_stats": {"count": 2, "last_total_seconds": 12.5,
+                       "average_total_seconds": 11.0},
         "active_scopes": [{"scope_id": "scope-1", "model_id": "qwen",
                            "modality": "chat", "kind": "claim"}],
         "note": "Read-only report. Booked ceilings carry provenance labels.",
@@ -439,6 +441,52 @@ def test_claim_and_release_are_guidance_only(plugin, monkeypatch):
     assert "queued -> loading -> ready" in release
 
 
+def test_swap_guidance_is_read_only_and_names_measured_timings(plugin,
+                                                               monkeypatch):
+    def explode():
+        raise AssertionError("swap guidance must not read data")
+
+    monkeypatch.setattr(plugin, "_broker_payload", explode)
+    for args in ("swap", "broker swap"):
+        out = plugin.cockpit_command(args)
+        assert "swap guidance" in out.lower()
+        assert "nothing is swapped" in out.lower()
+        assert "action=swap model_id=" in out
+        # measured, never estimated — and the phase names ride along
+        assert "every one measured" in out and "never estimated" in out
+        for phase in ("PREFLIGHT", "EVICT", "LOAD", "READY"):
+            assert phase in out
+        # the pre-flight guarantee is stated in the guidance itself
+        assert "Pre-flight guarantee" in out
+        assert "nothing is evicted before the preflight passes" in out
+        assert "nothing was changed" in out
+        # non-destructive, same class as claim/release — stated verbatim
+        assert "not approval-gated" in out
+        assert "same class as claim/release" in out
+
+
+def test_broker_claim_release_and_help_guidance_name_swap(plugin, monkeypatch):
+    monkeypatch.setattr(plugin, "_broker_payload", _broker_json)
+    broker = plugin.cockpit_command("broker")
+    claim = plugin.cockpit_command("claim")
+    release = plugin.cockpit_command("release")
+    help_text = plugin.cockpit_command("help")
+    for out in (broker, claim, release):
+        # swap is named as the one-call exchange verb with measured timings
+        assert "action=swap" in out
+        assert "measured" in out
+    assert "nothing is changed" in claim or "changes nothing" in claim
+    # the broker swap view is the same read-only swap guidance
+    assert plugin.cockpit_command("broker swap") == \
+        plugin.cockpit_command("swap")
+    # the broker rows carry the measured swap stats too
+    assert "swap stats (measured): count=2" in broker
+    assert "last=12.5s" in broker and "average=11.0s" in broker
+    # help lists the verb and names the non-gated class honestly
+    assert "swap" in help_text
+    assert "Broker claim/release/swap are tool verbs too" in help_text
+
+
 def test_approval_gate_inventory_is_stated(plugin):
     out = plugin.cockpit_command("claim")
     assert "human-approval gate" in out
@@ -558,7 +606,8 @@ def test_capability_matrix_names_every_surface():
         assert surface in lower, f"capability matrix omits surface {surface!r}"
     # every capability the matrix must cover is a named row
     for capability in ("model browsing", "fit verdicts", "model selection",
-                       "install", "claim", "release", "storage", "settings"):
+                       "install", "claim", "release", "swap", "storage",
+                       "settings"):
         assert capability in lower
     # the honest gaps are named, not hidden
     assert "rides the approval-gate verb" in doc
@@ -579,6 +628,31 @@ def test_readme_surface_parity_sections():
         for surface in ("Desktop", "Telegram", "CLI / TUI", "dashboard"):
             assert surface in text
         assert "/model-forge" in text
+
+
+def test_surface_parity_swap_row_documents_no_gate_reason():
+    # The approval table documents swap as the same non-destructive class as
+    # claim/release, with the stated reason — verified against the handlers.
+    doc = MATRIX_PATH.read_text()
+    table = doc[doc.index("## Approval coverage"):]
+    swap_row = next(line for line in table.splitlines()
+                    if "`model_forge_broker` `swap`" in line)
+    assert "No gate" in swap_row
+    assert "moves only model weights" in swap_row
+    assert "same class as claim/release" in swap_row
+    assert "no data is destroyed" in swap_row
+
+
+def test_readme_names_hiccup_free_swaps():
+    for path in (REPO / "README.md", PLUGIN_DIR / "README.md"):
+        text = path.read_text()
+        assert "Hiccup-free swaps" in text
+        assert "action=swap" in text
+        assert "pre-flight guarantee" in text
+        assert "measured timings, never estimates" in text
+        assert "nothing was changed" in text
+        # the command surface docs list the verb
+        assert "`broker`, `claim`, `release`,\n`swap`, and `help`" in text
 
 
 def test_readme_disclosure_names_every_network_surface():

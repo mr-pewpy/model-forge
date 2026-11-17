@@ -1779,6 +1779,9 @@ class _PassThroughLifecycle(EngineLifecycle):
             f"'{engine_id}' loads and reclaims models on its own; Model Forge "
             f"has no explicit load or eviction control for it")
 
+    WARM_PATH = ("engine-native load on first use (pass-through — the engine "
+                 "owns its load and reclaim policy)")
+
     def ensure_loaded(self, model_id, **_ignored) -> dict:
         return {"ok": True, "engine": self.engine_id, "action": "load",
                 "model_id": model_id, "state": "pass-through",
@@ -1983,6 +1986,7 @@ def _broker_status(stack: dict, target) -> dict:
                             if budget is not None else None),
         },
         "unbooked_residents": list(ledger.unbooked_residents(target.id)),
+        "swap_stats": ledger.swap_stats(),
         "active_scopes": [
             {"scope_id": sid, "model_id": rec.get("model_id"),
              "modality": rec.get("modality"), "kind": rec.get("kind")}
@@ -2073,6 +2077,73 @@ def _broker_release(stack: dict, scope_id: str) -> dict:
     }
     if not ok:
         out["error"] = result.get("reason", "the scope could not be released")
+    return out
+
+
+# --- swap: the one-call weight exchange --------------------------------------
+
+def _swap_release_ids(value) -> list:
+    """Explicit outgoing model ids for action=swap: a list of ids or a
+    comma-separated string, normalized to clean ids (order kept, duplicates
+    dropped)."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        parts = list(value)
+    else:
+        parts = [value]
+    out = []
+    for part in parts:
+        mid = str(part or "").strip()
+        if mid and mid not in out:
+            out.append(mid)
+    return out
+
+
+def _swap_dry_run(value) -> bool:
+    """The dry_run flag for action=swap: true or 'true' / '1' / 'yes' (any
+    case, whitespace tolerated). Default false — the swap executes."""
+    if value is True:
+        return True
+    return isinstance(value, str) \
+        and value.strip().lower() in ("true", "1", "yes")
+
+
+def _broker_swap(stack: dict, target, request, release, dry_run: bool) -> dict:
+    """The one-call weight exchange: resident weights step down and the
+    incoming model loads in strict measured phases (PREFLIGHT / EVICT / LOAD
+    / READY), with measured timings from the injectable clock — never
+    estimates. The pre-flight guarantee holds at every layer: nothing is
+    evicted before the preflight passes, a failed preflight leaves residency
+    untouched, and dry_run=True returns the preflight plan rows and changes
+    nothing."""
+    _seed_local_pulls(stack, target)
+    orchestrator = stack["orchestrator"]
+    result = orchestrator.swap(target.id, request, release=release,
+                               dry_run=dry_run)
+    ok = bool(result.get("ok"))
+    out = {
+        "ok": ok,
+        "action": "swap_failed" if (not ok and not dry_run) else "swap",
+        "dry_run": bool(dry_run),
+        "target": target.id,
+        "model_id": request.model_id,
+        "modality": request.modality,
+        "evicted": list(result.get("evicted") or []),
+        "warm_path": result.get("warm_path"),
+        "phases": result.get("phases") or {},
+        "timings": dict(result.get("timings") or {}),
+        "swap_stats": dict(result.get("swap_stats") or {}),
+        "resident_now": list(result.get("resident_now") or []),
+        "resident_state": result.get("resident_state", ""),
+        "reason": result.get("reason", ""),
+    }
+    if result.get("note"):
+        out["note"] = result["note"]
+    if not ok and not dry_run:
+        out["error"] = result.get("reason", "the swap did not complete")
     return out
 
 
@@ -2184,22 +2255,28 @@ def _broker_bench(stack: dict, target, model_id: str, sampler=None) -> dict:
 
 def model_forge_broker(args: dict | None = None, sampler=None, **kwargs) -> str:
     """Weight residency and workflow scopes on a compute target. Verbs:
-    status (read-only residency summary), claim (take the GPU lane for a
-    modality or model — evict per policy, pre-warm, return a scope id with
-    honest progress states), release (end a scope and restore what was
-    resident at claim time), plan (dry run of claim — nothing executed),
-    bench (measure a model's real VRAM peak over a short measurement window
-    and book it as the model's nominal ceiling — measured peaks replace
+    status (read-only residency summary, including measured swap stats),
+    claim (take the GPU lane for a modality or model — evict per policy,
+    pre-warm, return a scope id with honest progress states), release (end a
+    scope and restore what was resident at claim time), plan (dry run of
+    claim — nothing executed), swap (exchange the resident weights for one
+    incoming model in one choreographed call — PREFLIGHT / EVICT / LOAD /
+    READY, every phase measured, never estimated; a failed preflight leaves
+    residency untouched; optional release names explicit outgoing ids,
+    optional dry_run=true returns the plan rows and changes nothing), bench
+    (measure a model's real VRAM peak over a short measurement window and
+    book it as the model's nominal ceiling — measured peaks replace
     published estimates and are never downgraded). ``sampler`` is a test
     seam for the bench window's VRAM sampler; the live action samples real
     GPU memory."""
     args = args or {}
     try:
         action = str(args.get("action") or "").strip()
-        if action not in ("status", "claim", "release", "plan", "bench"):
+        if action not in ("status", "claim", "release", "plan", "swap",
+                          "bench"):
             return _dump({"error": f"unknown action: {action!r}; valid "
                                    f"actions: ['status', 'claim', 'release', "
-                                   f"'plan', 'bench']"})
+                                   f"'plan', 'swap', 'bench']"})
         if action == "release":
             scope_id = str(args.get("scope_id") or "").strip()
             if not scope_id:
@@ -2227,6 +2304,24 @@ def model_forge_broker(args: dict | None = None, sampler=None, **kwargs) -> str:
                                        "bench window)"})
             return _dump(_broker_bench(stack, target, model_id,
                                        sampler=sampler))
+        if action == "swap":
+            model_id = str(args.get("model_id") or "").strip()
+            if not model_id:
+                return _dump({"error": "model_id required for action=swap: "
+                                       "pass the incoming model id (a "
+                                       "catalog model id from "
+                                       "model_forge_browse)"})
+            entry, err = _claim_entry(model_id,
+                                      str(args.get("modality") or ""))
+            if err:
+                return _dump({"error": err})
+            request, err = _claim_request(entry)
+            if err:
+                return _dump({"error": err})
+            return _dump(_broker_swap(
+                stack, target, request,
+                release=_swap_release_ids(args.get("release")),
+                dry_run=_swap_dry_run(args.get("dry_run"))))
         entry, err = _claim_entry(str(args.get("model_id") or ""),
                                  str(args.get("modality") or ""))
         if err:

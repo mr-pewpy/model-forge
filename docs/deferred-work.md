@@ -417,6 +417,35 @@ The list is grouped as:
   bundles — Model Forge's six-engine lifecycle adapter set is the
   reference-consumer contract for the API shape.
 
+### B10. Remote-target swap weight records
+
+- **What it is:** the swap verb's pre-flight verifies the incoming model's
+  weights are already present before touching residency; for remote
+  compute targets that check relies on recorded pulls, and installs do not
+  yet write pull records for remote targets.
+- **Why it is deferred:** the local path is solved (installed weights are
+  read from the storage scan), and guessing remote state would violate the
+  fail-closed rule.
+- **What exists today:** remote swaps honestly refuse with a stated
+  "weights not present — run the install verb first" reason instead of
+  guessing, and nothing is evicted.
+- **What would unblock it:** writing pull records for remote-target
+  installs (planned as part of the remote-target workstream).
+
+### B11. Weights-free engine pre-start
+
+- **What it is:** the swap pre-flight warms the engine by confirming
+  liveness; a stopped engine passes pre-flight and starts during the
+  measured load phase.
+- **Why it is deferred:** no supported engine exposes a way to start its
+  server without naming the weights to serve, so a fully warm start before
+  eviction is not possible without faking it.
+- **What exists today:** the guarantee that nothing is evicted until the
+  load is certain to begin; stopped-but-startable engines start within the
+  measured load phase and the timings show it.
+- **What would unblock it:** engine-side support for a weights-free warm
+  process (or the engine bundles proposed in B9 exposing one).
+
 ---
 
 Nothing in this file is hidden from users: every limit stated here is also

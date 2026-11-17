@@ -55,7 +55,7 @@ run through a user-configured OpenAI-compatible media gateway.
 | `model_forge_activate` | Connect a running chat model as Hermes' default (plan-only; `apply=true` writes config after human approval) |
 | `model_forge_generate_media` | 3D (image→GLB), music, SFX — jobs through a user-configured OpenAI-compatible media gateway |
 | `model_forge_storage` | Model weights on disk (downloads dir, Ollama models dir, HuggingFace hub cache): list names, sizes and modification times; delete a listed entry after your approval |
-| `model_forge_broker` | Weight residency on a compute target: what weights are on disk and what is loaded now, what that books against the budget (`status`), and the claim/release verbs that run a multi-step swap (chat → image generation → back to chat) as one workflow scope; `plan` previews the steps first, `bench` measures a model's real VRAM peak and books it as its nominal ceiling |
+| `model_forge_broker` | Weight residency on a compute target: what weights are on disk and what is loaded now, what that books against the budget (`status`, with measured swap stats), and the claim/release verbs that run a multi-step swap (chat → image generation → back to chat) as one workflow scope; `swap` exchanges the resident weights for one incoming model in one measured call; `plan` previews the steps first, `bench` measures a model's real VRAM peak and books it as its nominal ceiling |
 
 Plus `tts/model_forge_tts.py` — a config-driven TTS/voice-clone command
 provider for any OpenAI-style `/v1/audio/speech` endpoint (see `tts/`), and
@@ -70,9 +70,9 @@ Its data door is the read-only **`/model-forge`** command
 (`cockpit`, `models [modality]`, `storage` — the JSON rows) — also handy in
 chat and the CLI, and always read-only. The same command renders plain-text
 rows for chat on every surface commands work on (Desktop chat, Telegram,
-CLI/TUI): `status`, `browse [modality]`, `broker`, `claim`, `release`, and
-`help`. A **dashboard tab** (`model-forge/dashboard/`) renders the same
-cockpit data in the Hermes web dashboard.
+CLI/TUI): `status`, `browse [modality]`, `broker`, `claim`, `release`,
+`swap`, and `help`. A **dashboard tab** (`model-forge/dashboard/`) renders
+the same cockpit data in the Hermes web dashboard.
 
 ## Surface parity
 
@@ -81,7 +81,7 @@ One Model Forge experience on every Hermes surface:
 | Surface | What you get |
 |---|---|
 | **Desktop app** | The cockpit pane (GPU & compute targets with the pointing invitation, declared + detected engines, model fit rows, installed model storage) plus the same tools in chat. |
-| **Telegram** (and other gateway chats) | The `/model-forge` command — `cockpit`, `models [modality]`, `storage` (JSON rows) and `status`, `browse [modality]`, `broker`, `claim`, `release`, `help` (plain-text rows built for chat) — plus every tool through the agent. |
+| **Telegram** (and other gateway chats) | The `/model-forge` command — `cockpit`, `models [modality]`, `storage` (JSON rows) and `status`, `browse [modality]`, `broker`, `claim`, `release`, `swap`, `help` (plain-text rows built for chat) — plus every tool through the agent. |
 | **CLI / TUI** | The same `/model-forge` command and tools; model switching is core (`/model`, `hermes model`). |
 | **Web dashboard** | The Model Forge tab (`model-forge/dashboard/`): the same cockpit data — targets, engines, models, storage — as a read-only snapshot. |
 | **Mobile (future)** | Everything here is gateway-side, so a future mobile chat client inherits it; on-device mobile inference is a named future lane. |
@@ -145,6 +145,10 @@ bookkeeping — verbs, not knobs:
   you claimed it.
 - **`plan`** is a dry run of claim: the release/load steps with their
   reasons, nothing executed.
+- **`swap`** is the one-call exchange verb (see "Hiccup-free swaps" below):
+  resident weights step down and an incoming model loads in measured
+  phases, with a pre-flight guarantee that nothing moves before the plan
+  passes.
 - **`bench`** measures what you run: a short VRAM measurement window on a
   loaded (or about-to-run) model records its observed peak and books it as
   the model's nominal ceiling — measured peaks replace published estimates
@@ -171,6 +175,26 @@ to gate it until a measured peak lands, and `status` marks those rows
 load/swap policy (llama-swap, ComfyUI, vLLM, media gateways) are recorded
 honestly as claimed for the scope; the engine moves the weights itself on
 first use, and the step reasons say so.
+
+### Hiccup-free swaps
+
+`model_forge_broker` `action=swap` exchanges the resident weights for one
+incoming model in a single call. It runs in strict phases — **PREFLIGHT**
+(plans the eviction set, fit-gates the incoming model against booked
+ceilings with the eviction applied, verifies the engine is live and that
+the weights are already on disk), **EVICT** (only the planned residents,
+least-recently used first), **LOAD** (exactly one load, right after the
+final eviction, through the engine's warm path), **READY** (probe to
+confirm) — and every phase carries measured timings, never estimates. The
+pre-flight guarantee: nothing is evicted before the preflight passes — a
+failed preflight leaves residency untouched, and a swap never begins a
+download mid-flight (it refuses with "weights not present — run
+model_forge_install first" instead). `dry_run=true` returns the plan rows
+with an explicit "nothing was changed" note and zero side effects, and the
+measured swap history and stats (`count`, `last_total_seconds`,
+`average_total_seconds`) ride along in `status`. Like claim/release, swap
+only moves model weights on compute targets you already control — it is
+not approval-gated.
 
 ## Model discovery
 

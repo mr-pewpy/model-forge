@@ -313,6 +313,12 @@ def _render_broker(data: dict) -> str:
                  f"headroom={_num(budget.get('headroom_gb'), ' GB')}")
     for sid in data.get("unbooked_residents") or []:
         lines.append(f"unbooked resident: {sid}")
+    swap_stats = data.get("swap_stats") or {}
+    if swap_stats:
+        lines.append(
+            f"swap stats (measured): count={swap_stats.get('count')} · "
+            f"last={_num(swap_stats.get('last_total_seconds'), 's')} · "
+            f"average={_num(swap_stats.get('average_total_seconds'), 's')}")
     scopes = data.get("active_scopes") or []
     lines.append(f"active scopes ({len(scopes)}): " + ("; ".join(
         f"{s.get('scope_id')} {s.get('model_id')} "
@@ -338,13 +344,20 @@ _APPROVAL_GATE_ROWS = (
 )
 
 _CLAIM_RELEASE_GUIDANCE = (
-    "Claim / release guidance (tool verbs — this command never mutates "
-    "anything):",
+    "Claim / release / swap guidance (tool verbs — this command never "
+    "mutates anything):",
     "  claim:   model_forge_broker action=claim model_id=<id> "
     "[modality=<m>] [target=<id>]",
     "           one workflow scope: eviction runs, weights load, and the "
     "scope reports honest states queued -> loading -> ready "
     "(a stated reason on failure, never a silent stall).",
+    "  swap:    model_forge_broker action=swap model_id=<incoming id> "
+    "[release=<outgoing ids>] [dry_run=true] — the one-call exchange verb: "
+    "resident weights step down and the incoming model loads in measured "
+    "phases (PREFLIGHT / EVICT / LOAD / READY) with measured timings, never "
+    "estimates. Nothing is evicted before the preflight passes — a failed "
+    "preflight leaves residency untouched; dry_run=true shows the plan rows "
+    "and changes nothing.",
     "  preview: model_forge_broker action=plan ... — a dry run of the claim; "
     "nothing is executed.",
     "  bench:   model_forge_broker action=bench model_id=<id> — measure the "
@@ -354,7 +367,7 @@ _CLAIM_RELEASE_GUIDANCE = (
     "claim returned> — ends the scope and restores what was resident at "
     "claim time.",
     "  status:  /model-forge broker — the read-only residency rows above.",
-    "Broker claim/release are not approval-gated: they only move model "
+    "Broker claim/release/swap are not approval-gated: they only move model "
     "weights on compute targets you already control.",
 )
 
@@ -375,8 +388,42 @@ def _render_release_guidance() -> str:
                  "time; states and steps come back in the tool's honest "
                  "progress rows (queued -> loading -> ready on the way in, "
                  "a stated reason on failure).")
+    lines.append("  to exchange the resident weights for a different model "
+                 "in one call, use model_forge_broker action=swap "
+                 "model_id=<incoming id> — measured phase timings "
+                 "(never estimates), and a failed preflight leaves "
+                 "residency untouched.")
     lines.append("  /model-forge broker shows current active scopes and "
                  "residency.")
+    lines.append("")
+    lines.extend(_APPROVAL_GATE_ROWS)
+    return "\n".join(lines)
+
+
+def _render_swap_guidance() -> str:
+    lines = ["Model Forge swap guidance (read-only — nothing is swapped)"]
+    lines.append("  model_forge_broker action=swap model_id=<incoming id> "
+                 "[release=<outgoing ids>] [target=<id>] [dry_run=true]")
+    lines.append("  exchanges the resident weights for one incoming model "
+                 "in one call, in strict phases, every one measured "
+                 "(never estimated):")
+    lines.append("    PREFLIGHT — no side effects: plans the eviction set, "
+                 "fit-gates the incoming model against booked ceilings with "
+                 "the eviction applied, verifies the engine is live, and "
+                 "verifies the weights are already present (a swap never "
+                 "begins a download mid-flight)")
+    lines.append("    EVICT — only the planned residents, least-recently "
+                 "used first")
+    lines.append("    LOAD — exactly one load, right after the final "
+                 "eviction, through the engine's warm path")
+    lines.append("    READY — probe to confirm")
+    lines.append("  Pre-flight guarantee: nothing is evicted before the "
+                 "preflight passes — a failed preflight leaves residency "
+                 "untouched. dry_run=true returns the plan rows with a "
+                 "'nothing was changed' note and zero side effects.")
+    lines.append("  Swap is not approval-gated: it only moves model weights "
+                 "on compute targets you already control (the same class as "
+                 "claim/release).")
     lines.append("")
     lines.extend(_APPROVAL_GATE_ROWS)
     return "\n".join(lines)
@@ -393,13 +440,15 @@ _USAGE = (
     "  status             plain-text rows: targets, engines, storage, pull "
     "credentials, pointing invitation\n"
     "  browse [modality]  plain-text model rows with advisory fit verdicts\n"
-    "  broker [status]    weight-residency rows plus claim/release guidance\n"
+    "  broker [status]    weight-residency rows plus claim/release/swap "
+    "guidance\n"
     "  claim              claim guidance (read-only; nothing is claimed)\n"
     "  release            release guidance (read-only; nothing is released)\n"
+    "  swap               swap guidance (read-only; nothing is swapped)\n"
     "  help               this text\n"
     "Mutating verbs are tool verbs that ride the human-approval gate "
     "(model_forge_target_add, model_forge_install, model_forge_activate, "
-    "model_forge_storage action=delete). Broker claim/release are tool "
+    "model_forge_storage action=delete). Broker claim/release/swap are tool "
     "verbs too (model_forge_broker)."
 )
 
@@ -412,9 +461,9 @@ def cockpit_command(raw_args: str = "") -> str:
     historical read-only JSON data paths, delegated unchanged to
     model_forge.tools.cockpit_command (the Desktop cockpit pane's data
     door) — plus plain-text chat verbs: status, browse [modality],
-    broker [status], claim, release, help. Returns text and never raises;
-    every data read is bounded by COMMAND_TIMEOUT_S and fails soft to an
-    honest reason. Read-only by design: policy decisions and mutations are
+    broker [status], claim, release, swap, help. Returns text and never
+    raises; every data read is bounded by COMMAND_TIMEOUT_S and fails soft to
+    an honest reason. Read-only by design: policy decisions and mutations are
     tool verbs routed through the human-approval gate.
     """
     parts = [p for p in str(raw_args or "").split() if p]
@@ -450,8 +499,10 @@ def cockpit_command(raw_args: str = "") -> str:
                     return _render_claim_guidance()
                 if parts[1].lower() == "release":
                     return _render_release_guidance()
+                if parts[1].lower() == "swap":
+                    return _render_swap_guidance()
                 return (f"error: unknown broker view: {parts[1]!r} (valid: "
-                        "status)\n" + _USAGE)
+                        "status, claim, release, swap)\n" + _USAGE)
             raw, why = _bounded_read("broker", _broker_payload)
             if why or raw is None:
                 return f"error: {why or 'the broker read returned no data'}"
@@ -463,6 +514,8 @@ def cockpit_command(raw_args: str = "") -> str:
             return _render_claim_guidance()
         if sub == "release":
             return _render_release_guidance()
+        if sub == "swap":
+            return _render_swap_guidance()
         return f"error: unknown subcommand: {sub!r}\n{_USAGE}"
     except Exception as exc:  # fail soft: the reason is the output
         return (f"error: the /model-forge {sub} read failed: "
@@ -542,7 +595,7 @@ def register(ctx):
                      "storage (read-only); plain-text status, browse and "
                      "broker rows for chat."),
         args_hint=("[cockpit|models [modality]|storage|status|"
-                   "browse [modality]|broker|claim|release|help]"),
+                   "browse [modality]|broker|claim|release|swap|help]"),
     )
     # Policy gate: registering a compute target, rewriting the default model
     # config, deleting a model-storage entry, and running a vendor engine

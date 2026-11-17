@@ -1552,15 +1552,23 @@ def test_broker_schema_shape_is_verbs_not_knobs():
     props = spec["parameters"]["properties"]
     assert spec["name"] == "model_forge_broker"
     assert props["action"]["enum"] == ["status", "claim", "release", "plan",
-                                      "bench"]
+                                      "swap", "bench"]
     assert spec["parameters"]["required"] == ["action"]
-    # minimal, self-explanatory surface: the five verbs plus what to act on
+    # minimal, self-explanatory surface: the six verbs plus what to act on
+    # (release + dry_run exist only for swap)
     assert set(props) == {"action", "model_id", "modality", "scope_id",
-                         "target"}
+                         "target", "release", "dry_run"}
     assert "unload_policy" not in spec["description"]
     # bench is a verb with a model id, nothing more — no window knobs
     assert "bench" in spec["description"]
     assert "bench" in props["action"]["description"]
+    # swap is the one-call exchange verb with measured timings, named as such
+    assert "swap" in spec["description"]
+    assert "measured" in spec["description"]
+    assert "swap" in props["action"]["description"]
+    assert "nothing was changed" in props["dry_run"]["description"]
+    assert props["release"]["type"] == "array"
+    assert props["dry_run"]["type"] == "boolean"
 
 
 def test_bookings_helper_maps_model_entry_footprints():
@@ -1764,6 +1772,143 @@ def test_broker_plan_dry_run_executes_nothing(tmp_path, monkeypatch):
     assert out["would"]["ok"] is False
     assert "exceeds the nominal budget" in out["would"]["reason"]
     assert calls == []
+
+
+# --- model_forge_broker action=swap: the one-call exchange -------------------
+
+def _swap_ready(stack):
+    """Fixture state for a swap: the image model's weights are present on
+    disk (a swap never begins a download mid-flight) and a chat model is
+    resident (the eviction set)."""
+    _book_chat_resident(stack)
+    stack["ledger"].record_pull("gpu-box", "krea-2-turbo",
+                                "/models/krea.safetensors", 1234)
+
+
+def test_broker_swap_runs_measured_phases(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=24.0)
+    _swap_ready(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "swap", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    assert out["ok"] is True and out["action"] == "swap"
+    assert out["dry_run"] is False
+    assert out["model_id"] == "krea-2-turbo"
+    # phase breakdown: strict order, each phase named and measured
+    assert [out["phases"][k]["name"] for k in
+            ("preflight", "evict", "load", "ready")] == \
+        ["PREFLIGHT", "EVICT", "LOAD", "READY"]
+    assert out["phases"]["preflight"]["ok"] is True
+    assert out["phases"]["evict"]["ok"] is True
+    assert out["phases"]["load"]["ok"] is True
+    assert out["phases"]["ready"]["ok"] is True
+    # the eviction happened before the load, exactly one load
+    assert calls == [("release", "ollama", "chat-a"),
+                     ("ensure_loaded", "comfyui", "krea-2-turbo")]
+    assert out["evicted"] == ["chat-a"]
+    # measured timings ride along (values come from the injectable clock)
+    timings = out["timings"]
+    assert set(timings) == {"preflight_seconds", "evict_seconds",
+                            "load_seconds", "ready_seconds",
+                            "total_seconds"}
+    assert isinstance(timings["total_seconds"], float)
+    # the warm path that applied is recorded verbatim
+    assert out["warm_path"] and isinstance(out["warm_path"], str)
+    # measured swap stats are exposed on the row
+    assert out["swap_stats"]["count"] == 1
+    assert out["swap_stats"]["last_total_seconds"] == \
+        timings["total_seconds"]
+    # residency is now exactly the incoming model
+    assert out["resident_now"] == ["krea-2-turbo"]
+    assert out["resident_state"] == "krea-2-turbo"
+
+
+def test_broker_swap_dry_run_changes_nothing(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=24.0)
+    _swap_ready(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "swap", "target": "gpu-box", "model_id": "krea-2-turbo",
+         "dry_run": True}))
+    assert out["ok"] is True and out["dry_run"] is True
+    assert "nothing was changed" in out["note"]
+    # zero side effects: no evict, no load — and no history record either
+    assert [c for c in calls if c[0] in ("release", "ensure_loaded")] == []
+    assert stack["ledger"].is_resident("gpu-box", "chat-a")
+    assert not stack["ledger"].is_resident("gpu-box", "krea-2-turbo")
+    assert stack["ledger"].swap_history() == ()
+    assert out["swap_stats"]["count"] == 0
+    # the preflight plan rows come back
+    plan = out["phases"]["preflight"]
+    assert plan["ok"] is True
+    assert [r["model_id"] for r in plan["evict_plan"]] == ["chat-a"]
+    assert [r["model_id"] for r in plan["load_plan"]] == ["krea-2-turbo"]
+
+
+def test_broker_swap_refuses_when_weights_not_present(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=24.0)
+    _book_chat_resident(stack)          # no recorded pull for the incoming
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "swap", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    assert out["ok"] is False and out["action"] == "swap_failed"
+    assert "weights not present — run model_forge_install first" in out["error"]
+    # the pre-flight guarantee: nothing evicted, nothing loaded
+    assert calls == []
+    assert stack["ledger"].is_resident("gpu-box", "chat-a")
+    assert "resident now:" in out["reason"]
+
+
+def test_broker_swap_release_ids_and_unknown_action_message(tmp_path,
+                                                            monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=24.0)
+    _swap_ready(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    # explicit outgoing ids arrive as a comma-separated string and are
+    # normalized; an id that is not resident is skipped with a stated reason
+    out = json.loads(tools.model_forge_broker(
+        {"action": "swap", "target": "gpu-box", "model_id": "krea-2-turbo",
+         "release": "chat-a, ghost-model"}))
+    assert out["ok"] is True
+    assert out["evicted"] == ["chat-a"]
+    skipped_rows = [c for c in out["phases"]["preflight"]["checks"]
+                    if "skipped" in c.get("reason", "")]
+    assert skipped_rows and "ghost-model" in skipped_rows[0]["reason"]
+    # an unknown action names the valid verb set, swap included
+    out = json.loads(tools.model_forge_broker({"action": "warp"}))
+    assert "'swap'" in out["error"]
+    # swap needs an incoming model id
+    out = json.loads(tools.model_forge_broker({"action": "swap"}))
+    assert "model_id required for action=swap" in out["error"]
+
+
+def test_broker_status_exposes_measured_swap_stats(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=24.0)
+    _swap_ready(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "status", "target": "gpu-box"}))
+    assert out["swap_stats"] == {"count": 0, "last_total_seconds": None,
+                                 "average_total_seconds": None}
+    out = json.loads(tools.model_forge_broker(
+        {"action": "swap", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    assert out["ok"] is True
+    out = json.loads(tools.model_forge_broker(
+        {"action": "status", "target": "gpu-box"}))
+    stats = out["swap_stats"]
+    assert stats["count"] == 1
+    assert stats["last_total_seconds"] == stats["average_total_seconds"]
+    assert isinstance(stats["last_total_seconds"], float)
 
 
 def test_bench_records_measured_peak_and_gates_fit(tmp_path, monkeypatch):

@@ -41,8 +41,10 @@ when a task needs a different model. Four pieces:
   honestly as measured or published.
 - ``Orchestrator`` — claim/release workflow scopes (a scope claims the lane
   for a modality and restores what was resident on release), pre-warm on
-  intent, and honest progress states (``queued`` / ``loading (~Ns)`` /
-  ``ready``) as pure data.
+  intent, honest progress states (``queued`` / ``loading (~Ns)`` /
+  ``ready``) as pure data, and ``swap`` — the one-call weight exchange in
+  strict measured phases (PREFLIGHT / EVICT / LOAD / READY) with the hard
+  guarantee that no evict/release call runs before the preflight passes.
 
 Everything external is injectable (HTTP functions, process runners, binary
 lookups, clocks) so this module performs no I/O outside those seams.
@@ -57,6 +59,7 @@ guessed fit.
 from __future__ import annotations
 
 import abc
+import collections
 import json
 import math
 import os
@@ -70,6 +73,7 @@ from typing import Protocol
 
 __all__ = [
     "RECENCY_WINDOW_S",
+    "SWAP_HISTORY_LIMIT",
     "Booking",
     "ComfyUILifecycle",
     "ComfyUiLifecycle",
@@ -97,6 +101,10 @@ __all__ = [
 # Policy proven under production load: models used within roughly the last ten minutes stay
 # warm; recency outranks pure LRU near the top of the stack.
 RECENCY_WINDOW_S = 600.0
+
+# The swap history ring: the last SWAP_HISTORY_LIMIT measured swap records
+# (bounded — old records drop off; stats aggregate over the kept window).
+SWAP_HISTORY_LIMIT = 20
 
 
 # --- plan data ---------------------------------------------------------------
@@ -242,6 +250,8 @@ class ResidencyLedger:
         self._pulls: dict[str, dict[str, PullRecord]] = {}
         self._residents: dict[str, dict[str, ResidentRecord]] = {}
         self._free_vram: dict[str, float] = {}
+        self._swap_history: collections.deque = collections.deque(
+            maxlen=SWAP_HISTORY_LIMIT)
         for model_id, spec in (bookings or {}).items():
             self.book(model_id, spec)
 
@@ -423,6 +433,63 @@ class ResidencyLedger:
                          self._residents.get(target_id, {}).values()
                          if rec.model_id not in self._bookings)
 
+    # -- swap history (a bounded ring of measured swap records) --
+    def record_swap(self, record) -> dict:
+        """Record one executed swap in the bounded history ring
+        (``SWAP_HISTORY_LIMIT`` entries — the oldest record drops off).
+
+        The record is the measured truth of one swap: ``model_id``,
+        ``evicted`` (the model ids actually evicted, in order), the measured
+        per-phase seconds ``evict_seconds`` / ``load_seconds`` /
+        ``ready_seconds`` (``None`` for a phase that never ran — never a
+        guessed 0), the measured ``total_seconds``, ``ok``, and the
+        ``warm_path`` that applied. Dry runs never record — they change
+        nothing."""
+        if not isinstance(record, dict):
+            return {"ok": False,
+                    "error": "swap record must be a dict row"}
+        row = {
+            "model_id": record.get("model_id"),
+            "evicted": list(record.get("evicted") or ()),
+            "evict_seconds": record.get("evict_seconds"),
+            "load_seconds": record.get("load_seconds"),
+            "ready_seconds": record.get("ready_seconds"),
+            "total_seconds": record.get("total_seconds"),
+            "ok": bool(record.get("ok")),
+            "warm_path": record.get("warm_path"),
+        }
+        with self._lock:
+            self._swap_history.append(row)
+            kept = len(self._swap_history)
+        return {"ok": True, "kept": kept, "limit": SWAP_HISTORY_LIMIT}
+
+    def swap_history(self) -> tuple:
+        """Every kept swap record, oldest first (bounded ring)."""
+        with self._lock:
+            return tuple(dict(row) for row in self._swap_history)
+
+    def swap_stats(self) -> dict:
+        """Aggregate swap stats over the bounded history: ``count`` (records
+        kept), ``last_total_seconds`` and ``average_total_seconds`` in
+        measured seconds — ``None`` when nothing has been measured yet, never
+        an estimate."""
+        with self._lock:
+            rows = list(self._swap_history)
+        if not rows:
+            return {"count": 0, "last_total_seconds": None,
+                    "average_total_seconds": None}
+        totals = [r["total_seconds"] for r in rows
+                  if isinstance(r.get("total_seconds"), (int, float))]
+        last = rows[-1].get("total_seconds")
+        return {
+            "count": len(rows),
+            "last_total_seconds": (float(last)
+                                   if isinstance(last, (int, float))
+                                   else None),
+            "average_total_seconds": (sum(totals) / len(totals)
+                                      if totals else None),
+        }
+
 
 # --- measured footprints ----------------------------------------------------
 
@@ -529,9 +596,16 @@ class EngineLifecycle(abc.ABC):
     Every method returns a plain dict row (``ok`` + honest ``reason``) and
     never raises: an engine quirk must not sink the caller, and an unattended
     run degrades to a stated reason, never a stall. What a failed release
-    means is a policy decision — the policy layer fails closed on it."""
+    means is a policy decision — the policy layer fails closed on it.
+
+    ``WARM_PATH`` names, honestly, how this engine takes weights: a genuine
+    warm-swap surface (Ollama ``keep_alive``, llama-swap routing, the ComfyUI
+    workflow cache), a process restart, or engine-native placement. A swap
+    records the label verbatim — it never claims a warm path the engine does
+    not have."""
 
     engine_id: str = ""
+    WARM_PATH: str = ("engine-native load (no warm-swap surface declared)")
 
     @abc.abstractmethod
     def ensure_loaded(self, model_id: str, **kwargs) -> dict:
@@ -567,6 +641,8 @@ class OllamaLifecycle(EngineLifecycle):
     The HTTP function is injectable; the default is stdlib urllib."""
 
     engine_id = "ollama"
+    WARM_PATH = ("warm-swap via keep_alive (the generate call parks the "
+                 "weights resident; evict with keep_alive=0)")
 
     def __init__(self, base_url="http://127.0.0.1:11434", http=None,
                  keep_alive="5m"):
@@ -630,6 +706,8 @@ class LlamaSwapLifecycle(EngineLifecycle):
     ``probe``."""
 
     engine_id = "llama-swap"
+    WARM_PATH = ("warm-swap via routing (llama-swap swaps models on demand "
+                 "by route; no explicit load or eviction control)")
     NO_CONTROL = ("llama-swap swaps models on demand by route; "
                   "no explicit load or eviction control")
 
@@ -690,6 +768,8 @@ class LlamaCppServerLifecycle(EngineLifecycle):
     built, no half-started server."""
 
     engine_id = "llamacpp"
+    WARM_PATH = ("process restart (start llama-server on the weights; no "
+                 "warm-swap surface)")
 
     def __init__(self, binary="llama-server", port=8080, extra_args=(),
                  runner=None, which=None):
@@ -777,6 +857,8 @@ class ComfyUiLifecycle(EngineLifecycle):
     The HTTP function is injectable; the default is stdlib urllib."""
 
     engine_id = "comfyui"
+    WARM_PATH = ("warm-swap via the workflow cache (readiness + explicit "
+                 "cache-free between generative jobs)")
     FREE_BODY = {"unload_models": True, "free_memory": True}
     CONTRACT = "readiness + cache-free"
     RELEASE_CONTRACT = "explicit cache-free"
@@ -885,6 +967,8 @@ class VllmServerLifecycle(EngineLifecycle):
     closed: no argv is even built, no half-started server."""
 
     engine_id = "vllm"
+    WARM_PATH = ("process restart (process stop/start; engine sleep/wake is "
+                 "not used — no warm-swap surface)")
     LIFECYCLE = "process stop/start (engine sleep/wake is not used)"
 
     def __init__(self, binary="vllm", port=8000, extra_args=(),
@@ -988,6 +1072,8 @@ class MayaLifecycle(EngineLifecycle):
     The HTTP function is injectable; the default is stdlib urllib."""
 
     engine_id = "maya"
+    WARM_PATH = ("warm-swap via engine-native auto-swap (a request naming "
+                 "the model loads it; no explicit load endpoint exists)")
     LOAD_CONTROL = ("engine-native auto-swap — Maya loads a model when a "
                     "request names it; no explicit load endpoint exists")
     NO_UNLOAD = ("Maya exposes no unload primitive — release is a "
@@ -1082,6 +1168,8 @@ class ExoLifecycle(EngineLifecycle):
     The HTTP function is injectable; the default is stdlib urllib."""
 
     engine_id = "exo"
+    WARM_PATH = ("engine-native instance placement (POST /place_instance; "
+                 "creation is asynchronous)")
     LOAD_CONTROL = ("engine-native instance placement — POST /place_instance "
                     "asks the exo cluster to place and load the model; "
                     "creation is asynchronous (wait via GET /instance/await "
@@ -1652,3 +1740,412 @@ class Orchestrator:
     def _record(self, key, row) -> None:
         self._history.setdefault(key, []).append(row)
         self._current[key] = row
+
+    # -- swap: the one-call weight exchange -----------------------------------
+
+    # What a READY probe must show to confirm a swap: an observed / running /
+    # ready engine. "unknown" (fail-soft probe) and "stopped" (a dead
+    # process) never confirm readiness.
+    READY_STATES = ("observed", "running", "ready")
+
+    def swap(self, target_id, request, release=None, dry_run=False) -> dict:
+        """Exchange the resident weights for an incoming model in ONE
+        choreographed call, in strict phases — each one measured by the
+        injectable clock seam:
+
+        - ``PREFLIGHT`` (no side effects): plan the eviction set and the load,
+          fit-gate the incoming against the NOMINAL booked ceilings WITH the
+          eviction applied (a refusal leaves residency untouched), verify the
+          target engine is live/reachable — engine liveness/readiness only,
+          the pre-warm: a stopped-but-startable server process passes and
+          starts during LOAD, and weights are never loaded early — and verify
+          the incoming weights are already present on the target (a swap must
+          not begin a download mid-flight; it refuses with ``weights not
+          present — run model_forge_install first`` instead).
+        - ``EVICT``: only the planned residents, in policy order
+          (least-recently used first), measured.
+        - ``LOAD``: immediately after the final eviction, exactly ONE load,
+          measured — through the engine's warm path where one exists (the
+          adapter's ``ensure_loaded`` handles it; the applied warm path is
+          recorded verbatim in the row).
+        - ``READY``: probe to confirm, measured.
+
+        The hard guarantee: no evict/release call runs before PREFLIGHT
+        returns ok — a failed preflight leaves residency untouched. Mid-flight
+        failures are honest rows, never a raise and never a hang: the row
+        states exactly what is now resident (``"nothing"`` is an honest
+        state) and why.
+
+        ``release`` names explicit outgoing model ids (default: the eviction
+        policy's own set); image-generation entries evict GPU residents
+        deterministically every time regardless. ``dry_run=True`` returns the
+        preflight plan rows with a ``nothing was changed`` note and has zero
+        side effects. Every executed swap lands in the ledger's bounded swap
+        history (``ResidencyLedger.swap_history`` / ``swap_stats``); dry runs
+        never record."""
+        t0 = self._clock()
+        model_id = str(getattr(request, "model_id", "") or "").strip()
+        phases: dict = {}
+        checks: list = []
+        preflight = {"name": "PREFLIGHT", "ok": False, "reason": "",
+                     "seconds": None, "checks": checks,
+                     "evict_plan": [], "load_plan": []}
+        phases["preflight"] = preflight
+        dry_note = ("dry run — nothing was changed (no weights were evicted "
+                    "or loaded; the rows below are the preflight plan)")
+        untouched_note = ("nothing was evicted or loaded — residency is "
+                          "untouched")
+
+        def _finish(ok, reason, *, evicted=(), warm_path=None,
+                    evict_seconds=None, load_seconds=None,
+                    ready_seconds=None, note=""):
+            timings = {
+                "preflight_seconds": preflight.get("seconds"),
+                "evict_seconds": evict_seconds,
+                "load_seconds": load_seconds,
+                "ready_seconds": ready_seconds,
+                "total_seconds": self._clock() - t0,
+            }
+            return self._swap_result(
+                target_id, model_id, ok, reason,
+                evicted=list(evicted), warm_path=warm_path,
+                phases=phases, timings=timings, dry_run=bool(dry_run),
+                note=note)
+
+        def _refuse(reason, check):
+            checks.append({"check": check, "ok": False, "reason": reason})
+            preflight["reason"] = reason
+            preflight["seconds"] = self._clock() - t0
+            return _finish(False, reason,
+                           note=dry_note if dry_run else untouched_note)
+
+        # ---- PREFLIGHT: plan and verify — no side effects before ok ----
+        if not model_id:
+            return _refuse("swap needs an incoming model id — nothing to "
+                           "swap in (fail-closed)", "incoming model")
+        booked_gb = self._ledger.booked_vram_gb(model_id)
+        if booked_gb is None:
+            return _refuse(
+                f"no booked footprint for {model_id} — fit is gated on "
+                f"nominal booked ceilings and none is booked (fail-closed); "
+                f"book a registry footprint or a measured peak first",
+                "booked footprint")
+        checks.append({"check": "booked footprint", "ok": True,
+                       "reason": f"{model_id} books {booked_gb:g} GB "
+                                 f"(nominal ceiling)"})
+        budget = self._ledger.budget_gb(target_id)
+        if budget is None:
+            return _refuse(
+                f"no nominal budget declared for compute target "
+                f"{target_id!r} — fit cannot be gated on booked ceilings "
+                f"(fail-closed)", "nominal budget")
+        checks.append({"check": "nominal budget", "ok": True,
+                       "reason": f"{budget:g} GB nominal budget declared"})
+
+        plan = self._planner.plan_load_many(target_id, [request])
+        if not plan.ok:
+            return _refuse(plan.reason, "eviction + load plan")
+        checks.append({"check": "eviction + load plan", "ok": True,
+                       "reason": plan.reason})
+
+        residents = self._ledger.residents(target_id)
+        by_id = {rec.model_id: rec for rec in residents}
+        image_entry = is_image_generation(getattr(request, "modality", ""),
+                                          getattr(request, "lane", ""))
+        explicit = [str(r or "").strip() for r in (release or ())]
+        explicit = [r for r in explicit if r]
+        if explicit and model_id in explicit:
+            return _refuse(
+                f"the incoming model {model_id} cannot be named as its own "
+                f"eviction — nothing was evicted (fail-closed)",
+                "release ids")
+        policy_ids = [step.model_id for step in plan.release_steps]
+        explicit_skipped = [r for r in explicit if r not in by_id]
+        skipped_note = (
+            f"; skipped {', '.join(sorted(explicit_skipped))} — not resident "
+            f"on {target_id!r}, nothing to evict for it"
+            if explicit_skipped else "")
+        if explicit and image_entry:
+            # Image-generation entry claims the whole card: deterministic
+            # full eviction every time — the policy set is the eviction set.
+            evict_ids = list(policy_ids)
+            checks.append({
+                "check": "release ids", "ok": True,
+                "reason": (f"image-generation entry claims the whole GPU — "
+                           f"the explicit release list is honored as part of "
+                           f"the deterministic full eviction "
+                           f"({len(evict_ids)} resident(s))"
+                           f"{skipped_note}")})
+        elif explicit:
+            named = [r for r in explicit if r in by_id]
+            # Explicit outgoing ids in policy order (least-recently used
+            # first). Unbooked residents join them: their VRAM cannot be
+            # accounted in the nominal gate (the planner's own rule).
+            chosen = set(named)
+            for rec in residents:
+                if self._ledger.booked_vram_gb(rec.model_id) is None:
+                    chosen.add(rec.model_id)
+            evict_ids = [rec.model_id for rec in
+                         sorted((by_id[m] for m in chosen),
+                                key=lambda rec: rec.last_used)]
+            reason_ids = (f"{len(named)} explicit release id(s) planned"
+                          + skipped_note
+                          + ("; unbooked residents join them (their VRAM "
+                             "cannot be accounted in the nominal gate)"
+                             if chosen else ""))
+            checks.append({"check": "release ids", "ok": True,
+                           "reason": reason_ids or
+                                     "nothing resident to evict"})
+        else:
+            evict_ids = list(policy_ids)
+
+        # Fit gate on nominal booked ceilings WITH the eviction applied —
+        # live free VRAM only orders candidates, never gates.
+        evict_set = set(evict_ids)
+        keep_gb = sum(self._ledger.booked_vram_gb(rec.model_id) or 0.0
+                      for rec in residents if rec.model_id not in evict_set)
+        incoming_gb = 0.0 if model_id in by_id else booked_gb
+        if keep_gb + incoming_gb > budget:
+            return _refuse(
+                f"nominal fit fails even with the eviction applied: kept "
+                f"residents book {keep_gb:g} GB and {model_id} books "
+                f"{incoming_gb:g} GB into a {budget:g} GB budget "
+                f"(fail-closed); nothing was evicted",
+                "nominal fit with eviction applied")
+        checks.append({
+            "check": "nominal fit with eviction applied", "ok": True,
+            "reason": f"{keep_gb + incoming_gb:g} GB booked into a "
+                      f"{budget:g} GB nominal budget with "
+                      f"{len(evict_ids)} eviction(s) applied (live free VRAM "
+                      f"orders only, never gates)"})
+
+        # Engine liveness (the pre-warm: liveness/readiness ONLY — a stopped
+        # but startable server process passes and starts during LOAD; weights
+        # are never loaded before eviction).
+        adapter = self._adapters.get(getattr(request, "engine", ""))
+        if adapter is None:
+            return _refuse(
+                f"no engine adapter registered for "
+                f"{getattr(request, 'engine', '')!r} — cannot verify engine "
+                f"liveness or load {model_id} (fail-closed)",
+                "engine liveness")
+        probe = adapter.probe()
+        state = str(probe.get("state") or "")
+        if not probe.get("ok") or state == "unknown":
+            probe_reason = probe.get("reason") or (f"probe state {state!r} "
+                                                   f"confirms no liveness")
+            return _refuse(
+                f"engine {getattr(request, 'engine', '')!r} is not "
+                f"live/reachable — {probe_reason}; the pre-warm is engine "
+                f"liveness only and the swap stops here (fail-closed)",
+                "engine liveness")
+        live_reason = (f"engine {request.engine!r} answers its probe "
+                       f"(state {state!r}) — pre-warm is engine "
+                       f"liveness/readiness only; weights are never loaded "
+                       f"before eviction")
+        if state == "idle":
+            live_reason += (f"; the engine process is stopped but startable "
+                            f"— it starts during the measured LOAD phase")
+        checks.append({"check": "engine liveness", "ok": True,
+                       "reason": live_reason})
+
+        # Weights already present: a swap must not begin a download mid-flight.
+        present = any(p.model_id == model_id
+                      for p in self._ledger.pulled(target_id))
+        if not present:
+            return _refuse(
+                f"weights not present — run model_forge_install first "
+                f"({model_id} has no recorded weights on {target_id!r}; a "
+                f"swap must not begin a download mid-flight)",
+                "weights present")
+        checks.append({
+            "check": "weights present", "ok": True,
+            "reason": f"{model_id} weights are present on {target_id!r} — "
+                      f"no download will begin mid-flight"})
+
+        step_reason = {step.model_id: step.reason
+                       for step in plan.release_steps}
+        preflight["evict_plan"] = [
+            {"model_id": mid, "engine": by_id[mid].engine,
+             "lane": by_id[mid].lane,
+             "reason": step_reason.get(
+                 mid, f"explicit release requested — {mid} steps down for "
+                      f"the incoming model")}
+            for mid in evict_ids if mid in by_id]
+        preflight["load_plan"] = [
+            {"model_id": step.model_id, "engine": step.engine,
+             "lane": step.lane, "weights_path": step.weights_path,
+             "estimated_s": step.estimated_s, "reason": step.reason}
+            for step in plan.load_steps]
+        preflight["ok"] = True
+        preflight["reason"] = (f"preflight ok: {len(evict_ids)} eviction(s) "
+                               f"planned, {len(plan.load_steps)} load(s) "
+                               f"planned (one at a time), engine live, "
+                               f"weights present")
+        preflight["seconds"] = self._clock() - t0
+
+        if dry_run:
+            warm = str(getattr(adapter, "WARM_PATH", "") or "")
+            return _finish(True, preflight["reason"], warm_path=warm or None,
+                           note=dry_note)
+
+        # ---- EVICT: only the planned residents, policy order, measured ----
+        with self._lock:
+            t_evict = self._clock()
+            evicted: list = []
+            evict_steps: list = []
+            for mid in evict_ids:
+                rec = by_id.get(mid)
+                if rec is None:
+                    continue
+                step_t = self._clock()
+                ev_adapter = self._adapters.get(rec.engine)
+                if ev_adapter is None:
+                    evict_seconds = self._clock() - t_evict
+                    phases["evict"] = {
+                        "name": "EVICT", "ok": False, "seconds": evict_seconds,
+                        "evicted": list(evicted), "steps": evict_steps,
+                        "reason": f"no engine adapter registered for "
+                                  f"{rec.engine!r}"}
+                    return _finish(
+                        False,
+                        f"no engine adapter registered for {rec.engine!r} — "
+                        f"cannot evict {mid}; the swap stopped before load "
+                        f"(fail-closed) after evicting {len(evicted)} "
+                        f"model(s)", evicted=evicted,
+                        evict_seconds=evict_seconds)
+                res = ev_adapter.release(mid)
+                step_seconds = self._clock() - step_t
+                evict_steps.append({
+                    "model_id": mid, "engine": rec.engine,
+                    "ok": bool(res.get("ok")), "seconds": step_seconds,
+                    "reason": res.get("reason", "")})
+                if not res.get("ok"):
+                    evict_seconds = self._clock() - t_evict
+                    phases["evict"] = {
+                        "name": "EVICT", "ok": False, "seconds": evict_seconds,
+                        "evicted": list(evicted), "steps": evict_steps,
+                        "reason": res.get("reason", "")}
+                    return _finish(
+                        False,
+                        f"eviction of {mid} failed — "
+                        f"{res.get('reason', 'no reason given')}; the swap "
+                        f"stopped before load (fail-closed) after evicting "
+                        f"{len(evicted)} model(s)", evicted=evicted,
+                        evict_seconds=evict_seconds)
+                self._ledger.record_released(target_id, mid)
+                evicted.append(mid)
+            evict_seconds = self._clock() - t_evict
+            phases["evict"] = {
+                "name": "EVICT", "ok": True, "seconds": evict_seconds,
+                "evicted": list(evicted), "steps": evict_steps,
+                "reason": (f"{len(evicted)} resident(s) evicted in policy "
+                           f"order (least-recently used first)"
+                           if evicted else
+                           "nothing to evict — the eviction set was empty")}
+
+            # ---- LOAD: exactly one load, right after the last eviction ----
+            t_load = self._clock()
+            warm_path = str(getattr(adapter, "WARM_PATH", "") or
+                            "engine-native load (no warm-swap surface "
+                            "declared)")
+            if not plan.load_steps:
+                load_seconds = self._clock() - t_load
+                phases["load"] = {
+                    "name": "LOAD", "ok": True, "seconds": load_seconds,
+                    "warm_path": warm_path, "steps": [],
+                    "reason": f"{model_id} is already resident — nothing to "
+                              f"load"}
+            else:
+                step = plan.load_steps[0]
+                res = adapter.ensure_loaded(model_id,
+                                            weights_path=step.weights_path)
+                load_seconds = self._clock() - t_load
+                phases["load"] = {
+                    "name": "LOAD", "ok": bool(res.get("ok")),
+                    "seconds": load_seconds, "warm_path": warm_path,
+                    "steps": [{"model_id": model_id, "engine": step.engine,
+                               "ok": bool(res.get("ok")),
+                               "seconds": load_seconds,
+                               "reason": res.get("reason", "")}],
+                    "reason": res.get("reason", "")}
+                if not res.get("ok"):
+                    return _finish(
+                        False,
+                        f"load of {model_id} failed after evicting "
+                        f"{len(evicted)} model(s) — "
+                        f"{res.get('reason', 'no reason given')}",
+                        evicted=evicted, evict_seconds=evict_seconds,
+                        load_seconds=load_seconds, warm_path=warm_path)
+                self._ledger.record_resident(target_id, model_id,
+                                             engine=step.engine,
+                                             lane=step.lane)
+                self._load_specs[(target_id, model_id)] = {
+                    "weights_path": step.weights_path,
+                    "estimated_s": step.estimated_s}
+
+            # ---- READY: probe to confirm, measured ----
+            t_ready = self._clock()
+            ready_probe = adapter.probe()
+            ready_seconds = self._clock() - t_ready
+            ready_state = str(ready_probe.get("state") or "")
+            confirmed = (bool(ready_probe.get("ok"))
+                         and ready_state in self.READY_STATES)
+            ready_why = ready_probe.get("reason") or (f"probe state "
+                                                      f"{ready_state!r}")
+            phases["ready"] = {
+                "name": "READY", "ok": confirmed, "seconds": ready_seconds,
+                "probe": ready_probe,
+                "reason": (f"ready confirmed (probe state {ready_state!r})"
+                           if confirmed else
+                           f"the ready probe could not confirm the load — "
+                           f"{ready_why}")}
+        if not confirmed:
+            return _finish(
+                False,
+                f"the load completed but the ready probe could not confirm "
+                f"it — {ready_why}",
+                evicted=evicted, evict_seconds=evict_seconds,
+                load_seconds=load_seconds, ready_seconds=ready_seconds,
+                warm_path=warm_path)
+        load_note = (f"{model_id} loaded via {warm_path}"
+                     if plan.load_steps else
+                     f"{model_id} is already resident (nothing to load)")
+        return _finish(
+            True,
+            f"swap complete: {len(evicted)} evicted, {load_note}, "
+            f"ready confirmed", evicted=evicted,
+            evict_seconds=evict_seconds, load_seconds=load_seconds,
+            ready_seconds=ready_seconds, warm_path=warm_path)
+
+    def _swap_result(self, target_id, model_id, ok, reason, *, evicted,
+                     warm_path, phases, timings, dry_run, note="") -> dict:
+        """Build the swap row (pure data) and — unless this was a dry run —
+        record the measured truth in the ledger's bounded swap history. The
+        row always states exactly what is resident now (``"nothing"`` is an
+        honest state); failures append it to the reason too."""
+        residents = sorted(rec.model_id
+                           for rec in self._ledger.residents(target_id))
+        resident_state = ", ".join(residents) if residents else "nothing"
+        if not ok:
+            reason = f"{reason}; resident now: {resident_state}"
+        if not dry_run:
+            self._ledger.record_swap({
+                "model_id": model_id,
+                "evicted": list(evicted),
+                "evict_seconds": timings.get("evict_seconds"),
+                "load_seconds": timings.get("load_seconds"),
+                "ready_seconds": timings.get("ready_seconds"),
+                "total_seconds": timings.get("total_seconds"),
+                "ok": bool(ok),
+                "warm_path": warm_path,
+            })
+        row = {"ok": bool(ok), "action": "swap", "target_id": target_id,
+               "model_id": model_id, "dry_run": bool(dry_run),
+               "evicted": list(evicted), "warm_path": warm_path,
+               "phases": phases, "timings": dict(timings),
+               "resident_now": residents, "resident_state": resident_state,
+               "reason": reason, "swap_stats": self._ledger.swap_stats()}
+        if note:
+            row["note"] = note
+        return row
