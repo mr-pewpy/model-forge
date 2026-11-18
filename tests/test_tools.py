@@ -1195,9 +1195,18 @@ def test_install_schema_example_is_a_real_repo_path():
 
 # --- tools.py: engine_install (approved vendor installers) ------------------
 
-_OLLAMA_CMD = "curl -fsSL https://ollama.com/install.sh | sh"
-_STRATA_CMD = ("curl -fsSL https://github.com/Niko1221/Strata/releases/"
-               "latest/download/install.sh | sh")
+_OLLAMA_URL = "https://ollama.com/install.sh"
+_OLLAMA_SHA = ("25f64b810b947145095956533e1bdf56eacea2673c55a7e586be4515fc882c9f")
+_STRATA_URL = ("https://github.com/Niko1221/Strata/releases/download/v0.2.15/"
+               "install.sh")
+_STRATA_SHA = ("1fcfbab133880249b7a6eaefb643f25b29a9b8f45624d2d8673e35948c329eda")
+_MAYA_REPO = "https://github.com/mw00/project-maya"
+_MAYA_COMMIT = "56b5216ab4464ac41c26b1be32eb63b98de53d0a"
+
+
+def _plan_command(engine):
+    from model_forge import tools
+    return tools.engine_install_plan(engine)["command"]
 
 
 def _installer_spy(monkeypatch, result=None, raise_exc=None):
@@ -1212,6 +1221,24 @@ def _installer_spy(monkeypatch, result=None, raise_exc=None):
         return result or {"returncode": 0, "output_tail": "install ok"}
 
     monkeypatch.setattr("model_forge.tools._run_installer", runner)
+    return calls
+
+
+def _stage_spy(monkeypatch, tmp_path, ok=True, error="checksum mismatch"):
+    """Fake stager: pretends the pinned artifact verified (writing a local
+    file) or failed. Records nothing real and never downloads or clones."""
+    calls = []
+    artifact = tmp_path / "staged-install.sh"
+
+    def stager(engine):
+        calls.append(engine)
+        if not ok:
+            return {"ok": False, "error": f"{error} — nothing was run"}
+        artifact.write_text("#!/bin/sh\ntrue\n")
+        return {"ok": True, "artifact": str(artifact),
+                "command": f"sh {artifact}"}
+
+    monkeypatch.setattr("model_forge.tools._stage_installer", stager)
     return calls
 
 
@@ -1240,19 +1267,38 @@ def _poll_until_done(job_id, rounds=100):
     return st
 
 
-def test_engine_install_plan_shows_exact_command_before_execute(tmp_path,
-                                                                monkeypatch):
+def test_engine_install_plan_shows_pinned_command_before_execute(tmp_path,
+                                                                 monkeypatch):
     _stub_hermes_modules(monkeypatch, tmp_path)
     from model_forge import tools
     calls = _installer_spy(monkeypatch)
     out = json.loads(tools.model_forge_install(
         {"action": "engine_install", "engine": "ollama"}))
-    # plan first: the exact vendor command, and nothing ran
+    # plan first: the pinned pipeline is described, and the exact command the
+    # runner will execute is shown — nothing ran
     assert out["ok"] is True and out["action"] == "vendor_installer"
-    assert out["command"] == _OLLAMA_CMD
     assert out["executed"] is False and "job_id" not in out
+    assert _OLLAMA_URL in out["pipeline"] and _OLLAMA_SHA in out["pipeline"]
+    assert "latest" not in out["pipeline"] and "latest" not in out["command"]
+    # the display is honest: no fake sha256sum pipeline, and the shown command
+    # is the literal staged command the runner runs
+    assert "sha256sum" not in out["pipeline"] and "sha256sum" not in out["command"]
+    assert out["command"].startswith("sh ") and "install.sh" in out["command"]
+    assert out["pinned"] == {"url": _OLLAMA_URL, "sha256": _OLLAMA_SHA}
+    assert any(_OLLAMA_SHA in s for s in out["steps"])
     assert "execute=true" in out["hint"] and "denial" in out["hint"]
     assert calls == []
+    # strata pins a fixed tag, never releases/latest
+    strata = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "strata"}))
+    assert "releases/download/v0.2.15/install.sh" in strata["pipeline"]
+    assert _STRATA_SHA in strata["pipeline"] and "latest" not in strata["pipeline"]
+    # maya pins a commit, and only then runs ./setup.sh in the checkout
+    maya = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "maya"}))
+    assert _MAYA_COMMIT in maya["pipeline"]
+    assert maya["command"].endswith("./setup.sh")
+    assert any(_MAYA_COMMIT in s for s in maya["steps"])
     # planning is read-only: no approval gate for it
     assert tools.policy_hook("model_forge_install",
                              {"action": "engine_install",
@@ -1269,14 +1315,21 @@ def test_policy_hook_engine_install_approve_directive():
                            "execute": True})
     assert d["action"] == "approve"
     assert d["rule_key"] == "model-forge:engine_install"
-    assert _OLLAMA_CMD in d["message"]        # the exact command shown
+    assert _plan_command("ollama") in d["message"]   # the exact command shown
+    assert _OLLAMA_SHA in d["message"]               # and its pin
     assert "ollama" in d["message"]
-    # the Strata documented install command appears verbatim as well
+    # the Strata pinned tag and checksum appear verbatim as well
     d = tools.policy_hook("model_forge_install",
                           {"action": "engine_install", "engine": "strata",
                            "execute": True})
     assert d["rule_key"] == "model-forge:engine_install"
-    assert _STRATA_CMD in d["message"]
+    assert _plan_command("strata") in d["message"]
+    assert "v0.2.15" in d["message"] and "latest" not in d["message"]
+    # maya: the pinned commit is shown
+    d = tools.policy_hook("model_forge_install",
+                          {"action": "engine_install", "engine": "maya",
+                           "execute": True})
+    assert _MAYA_COMMIT in d["message"]
     # a model-install call still needs no approval (historical contract)
     assert tools.policy_hook("model_forge_install",
                              {"model_id": "m"}) is None
@@ -1315,6 +1368,7 @@ def test_engine_install_approved_flow_runs_and_polls(tmp_path, monkeypatch):
     from model_forge import tools
     from model_forge.engines.base import EngineStatus
     calls = _installer_spy(monkeypatch)
+    staged = _stage_spy(monkeypatch, tmp_path)
     monkeypatch.setattr(
         tools, "detect_engines",
         lambda base_url="", **kw: [EngineStatus(
@@ -1328,15 +1382,39 @@ def test_engine_install_approved_flow_runs_and_polls(tmp_path, monkeypatch):
     res = json.loads(out["result"])
     assert res["ok"] is True and res["action"] == "engine_install_started"
     assert res["executed"] is True and res["job_id"]
-    assert res["command"] == _OLLAMA_CMD
+    # the plan/job record shows the PINNED pipeline and the pinned tag
+    assert _OLLAMA_SHA in res["pipeline"] and "latest" not in res["command"]
     # poll through the shared jobs store (model_forge_install job_id)
     st = _poll_until_done(res["job_id"])
     assert st["state"] == "done"
     assert st["kind"] == "engine_install" and st["engine"] == "ollama"
-    assert st["command"] == _OLLAMA_CMD and st["returncode"] == 0
+    assert st["command"] == res["command"]        # pinned command recorded
+    assert st["executed_command"] == calls[0]     # the staged, verified file
+    assert st["returncode"] == 0
+    assert st["executed_command"].startswith("sh ")
+    assert st["artifact"] in st["executed_command"]
+    # the runner seam was handed the VERIFIED LOCAL artifact, not a download
+    # pipeline
+    assert staged == ["ollama"]
     # completion re-runs engine detection and reports it honestly
     assert st["detection"]["detected"] is True
-    assert calls == [_OLLAMA_CMD]             # the approved command only
+    assert len(calls) == 1                        # one verified run only
+
+
+def test_engine_install_staging_failure_runs_nothing(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    calls = _installer_spy(monkeypatch)
+    _stage_spy(monkeypatch, tmp_path, ok=False,
+               error=f"checksum mismatch for {_OLLAMA_URL}")
+    res = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "ollama", "execute": True}))
+    st = _poll_until_done(res["job_id"])
+    assert st["state"] == "error"
+    assert "checksum mismatch" in st["error"] and "nothing was run" in st["error"]
+    assert st["command"] == res["command"]        # the pinned command is shown
+    assert calls == []                            # the runner never ran
+    assert "returncode" not in st
 
 
 def test_engine_install_failure_and_timeout_reported_honestly(tmp_path,
@@ -1347,6 +1425,7 @@ def test_engine_install_failure_and_timeout_reported_honestly(tmp_path,
     # a non-zero installer exit is an error, never a false 'done'
     _installer_spy(monkeypatch, result={"returncode": 2,
                                        "output_tail": "permission denied"})
+    _stage_spy(monkeypatch, tmp_path)
     res = json.loads(tools.model_forge_install(
         {"action": "engine_install", "engine": "ollama", "execute": True}))
     st = _poll_until_done(res["job_id"])
@@ -1357,6 +1436,7 @@ def test_engine_install_failure_and_timeout_reported_honestly(tmp_path,
     _installer_spy(monkeypatch,
                    raise_exc=subprocess.TimeoutExpired(cmd="installer",
                                                        timeout=1.0))
+    _stage_spy(monkeypatch, tmp_path)
     res = json.loads(tools.model_forge_install(
         {"action": "engine_install", "engine": "strata", "execute": True}))
     st = _poll_until_done(res["job_id"])
@@ -1416,6 +1496,114 @@ def test_engine_install_unknown_engine_never_runs(tmp_path, monkeypatch):
     # unknown actions name the valid ones instead of falling through
     out = json.loads(tools.model_forge_install({"action": "banana"}))
     assert "error" in out and "engine_install" in out["error"]
+
+
+def test_minimal_env_forwards_no_credentials(monkeypatch):
+    from model_forge import tools
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
+    monkeypatch.setenv("HERMES_TOKEN", "tok-secret")
+    env = tools._minimal_env()
+    # exactly the four names an installer child needs — nothing else
+    assert set(env) == {"PATH", "HOME", "LANG", "TMPDIR"}
+    for leaked in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HERMES_TOKEN"):
+        assert leaked not in env
+    assert "secret" not in json.dumps(env)
+
+
+def test_run_installer_popen_receives_minimal_env(monkeypatch):
+    from model_forge import tools
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        pid = 424242
+
+        def communicate(self, timeout=None):
+            return (b"install ok", None)
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr(tools.subprocess, "Popen", fake_popen)
+    out = tools._run_installer("sh /tmp/staged-install.sh", 5.0)
+    assert out["returncode"] == 0 and out["output_tail"] == "install ok"
+    assert captured["command"] == "sh /tmp/staged-install.sh"
+    env = captured["kwargs"]["env"]
+    assert set(env) == {"PATH", "HOME", "LANG", "TMPDIR"}
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert "OPENAI_API_KEY" not in env          # no keys reach the child
+    assert captured["kwargs"]["start_new_session"] is True
+
+
+def test_stage_installer_verifies_sha256_and_refuses_mismatch(tmp_path,
+                                                              monkeypatch):
+    import hashlib
+    from model_forge import tools
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    # checksum mismatch: nothing is written and nothing is run
+    out = tools._stage_installer("ollama",
+                                 downloader=lambda url: b"tampered payload")
+    assert out["ok"] is False
+    assert "checksum mismatch" in out["error"]
+    assert "nothing was run" in out["error"] and _OLLAMA_SHA in out["error"]
+    assert not (tmp_path / "model-forge-installers").exists()
+    # download failure fails closed, honestly
+    def boom(url):
+        raise OSError("connection refused")
+    out = tools._stage_installer("ollama", downloader=boom)
+    assert out["ok"] is False
+    assert "download of" in out["error"] and "nothing was run" in out["error"]
+    # a verified artifact: the local file is what the runner seam would get
+    good = b"#!/bin/sh\ntrue\n"
+    monkeypatch.setitem(tools._ENGINE_INSTALLERS["ollama"], "sha256",
+                        hashlib.sha256(good).hexdigest())
+    out = tools._stage_installer("ollama", downloader=lambda url: good)
+    assert out["ok"] is True
+    assert Path(out["artifact"]).read_bytes() == good
+    assert out["command"] == f"sh {out['artifact']}"
+
+
+def test_stage_installer_maya_runs_setup_only_from_pinned_checkout(tmp_path,
+                                                                   monkeypatch):
+    import types
+    from model_forge import tools
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    calls = []
+
+    def fake_git(args, cwd=None):
+        calls.append(list(args))
+        if "rev-parse" in args:
+            return types.SimpleNamespace(returncode=0,
+                                         stdout=_MAYA_COMMIT.encode())
+        return types.SimpleNamespace(returncode=0, stdout=b"")
+
+    monkeypatch.setattr(tools, "_git_run", fake_git)
+    out = tools._stage_installer("maya")
+    assert out["ok"] is True
+    assert out["command"] == f"cd {out['artifact']} && ./setup.sh"
+    # the pinned commit was checked out, and the checked-out HEAD re-verified
+    # before any part of setup runs
+    assert ["-C", out["artifact"], "checkout", _MAYA_COMMIT] in calls
+    assert ["-C", out["artifact"], "rev-parse", "HEAD"] in calls
+    assert calls[-1][2] == "rev-parse"
+
+    # a HEAD that does not match the pin runs nothing
+    def bad_git(args, cwd=None):
+        if "rev-parse" in args:
+            return types.SimpleNamespace(returncode=0, stdout=b"deadbeef")
+        return types.SimpleNamespace(returncode=0, stdout=b"")
+
+    monkeypatch.setattr(tools, "_git_run", bad_git)
+    out = tools._stage_installer("maya")
+    assert out["ok"] is False
+    assert "checkout mismatch" in out["error"] and "nothing was run" in out["error"]
+    assert _MAYA_COMMIT in out["error"]
+    assert "command" not in out                 # setup.sh is never reached
 
 
 def test_generate_media_3d_job_poll_http_error_surfaces_status_and_body(
@@ -2166,7 +2354,7 @@ def test_broker_stack_threads_injectable_engine_seams(tmp_path, monkeypatch):
         def poll(self):
             return None
 
-    def fake_runner(argv):
+    def fake_runner(argv, env=None):
         # engine processes may only be spawned through this seam — recorded,
         # never real
         spawn_calls.append(list(argv))
@@ -2715,3 +2903,489 @@ def test_activate_media_setup_provider_strings_use_shared_vocabulary(
         "hermes config set plugins.entries.model-forge-video.settings"
         ".base_url http://gpu-box.example.com:8080/v1 && hermes config set "
         "video_gen.provider " + tools._MEDIA_PROVIDER_NAME)
+
+
+# --- model_forge_broker: starting an engine server needs approval ------------
+# A model-callable claim/swap that would START a server process (the vLLM and
+# llama.cpp lifecycles) must ride the human-approval gate, exactly like
+# engine_install — the server binds loopback only, and an unapproved server
+# start is the bug this gate prevents.
+
+def _policy_hook_env(monkeypatch, tmp_path, resident=()):
+    """Handler environment for the broker policy cases: a real residency stack
+    behind the broker_stack seam, with the named models already resident."""
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    stack = _residency_stack(_REMOTE, [])
+    for model_id in resident:
+        stack["ledger"].record_resident(_REMOTE.id, model_id, engine="vllm",
+                                        lane="vision")
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    return tools, stack
+
+
+def test_policy_hook_escalates_a_claim_that_starts_a_server(tmp_path,
+                                                            monkeypatch):
+    tools, _ = _policy_hook_env(monkeypatch, tmp_path)
+    # minicpm-v-4.6 is a vLLM (process) model; not resident -> a claim starts
+    # the server process, so the gate must see it.
+    d = tools.policy_hook("model_forge_broker",
+                          {"action": "claim", "target": "gpu-box",
+                           "model_id": "minicpm-v-4.6"})
+    assert d is not None and d["action"] == "approve"
+    assert d["rule_key"] == "model-forge:broker_server_start"
+    assert "minicpm-v-4.6" in d["message"]
+    assert "vllm" in d["message"]
+    assert "gpu-box" in d["message"]
+    assert "port: 8000" in d["message"]
+    assert "127.0.0.1" in d["message"]
+    assert "starts nothing" in d["message"]
+
+
+def test_policy_hook_escalates_a_swap_that_starts_a_server(tmp_path,
+                                                           monkeypatch):
+    tools, _ = _policy_hook_env(monkeypatch, tmp_path)
+    d = tools.policy_hook("model_forge_broker",
+                          {"action": "swap", "target": "gpu-box",
+                           "model_id": "minicpm-v-4.6"})
+    assert d["action"] == "approve"
+    assert d["rule_key"] == "model-forge:broker_server_start"
+    assert "minicpm-v-4.6" in d["message"]
+
+
+def test_policy_hook_passes_when_the_model_is_already_resident(tmp_path,
+                                                               monkeypatch):
+    # A claim over an already-resident, already-running model starts nothing.
+    tools, _ = _policy_hook_env(monkeypatch, tmp_path,
+                                resident=("minicpm-v-4.6",))
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "claim", "target": "gpu-box",
+                              "model_id": "minicpm-v-4.6"}) is None
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "swap", "target": "gpu-box",
+                              "model_id": "minicpm-v-4.6"}) is None
+
+
+def test_policy_hook_ignores_dry_run_swap(tmp_path, monkeypatch):
+    # dry_run changes nothing and starts nothing — no approval.
+    tools, _ = _policy_hook_env(monkeypatch, tmp_path)
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "swap", "target": "gpu-box",
+                              "model_id": "minicpm-v-4.6",
+                              "dry_run": True}) is None
+
+
+def test_policy_hook_passes_for_non_process_engines(tmp_path, monkeypatch):
+    # comfyui is HTTP-native — a claim/swap starts no process.
+    tools, _ = _policy_hook_env(monkeypatch, tmp_path)
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "claim", "target": "gpu-box",
+                              "model_id": "krea-2-turbo"}) is None
+    # a modality claim resolving to the curated HTTP-engine model too
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "claim", "target": "gpu-box",
+                              "modality": "image"}) is None
+
+
+def test_policy_hook_passes_for_read_only_broker_verbs(tmp_path, monkeypatch):
+    tools, _ = _policy_hook_env(monkeypatch, tmp_path)
+    for action in ("status", "plan", "release", "bench"):
+        assert tools.policy_hook("model_forge_broker",
+                                 {"action": action, "target": "gpu-box",
+                                  "model_id": "minicpm-v-4.6"}) is None
+
+
+def test_policy_hook_denial_blocks_a_server_starting_claim(tmp_path,
+                                                           monkeypatch):
+    tools, _ = _policy_hook_env(monkeypatch, tmp_path)
+    ran = []
+
+    def dispatch(_args):
+        ran.append("ran")
+        return {"ok": True}
+
+    args = {"action": "claim", "target": "gpu-box",
+            "model_id": "minicpm-v-4.6"}
+    denied = _simulate_approval_gate("model_forge_broker", args,
+                                     decision="deny", dispatch=dispatch)
+    assert denied["blocked"] is True
+    assert denied["directive"]["rule_key"] == "model-forge:broker_server_start"
+    assert ran == []                        # the handler never ran
+    approved = _simulate_approval_gate("model_forge_broker", args,
+                                       decision="approve", dispatch=dispatch)
+    assert approved["blocked"] is False and ran == ["ran"]
+
+
+# --- broker release / media lane: restoring a server needs approval ---------
+# A release restores what was resident at claim time. When that restore loads
+# a NON-resident process-engine model (llama.cpp / vLLM), the release SPAWNS a
+# server process — the reviewer-reproduced hole: the claim that evicted the
+# model needed no approval (an HTTP engine), yet its later release started a
+# server. The gate must see it, exactly like a starting claim. A release that
+# restores nothing, restores an already-resident model, or restores only
+# HTTP-native engines starts nothing and must NOT prompt.
+
+def _process_resident(stack, model_id, *, vram=6.0, engine="llamacpp",
+                      lane="chat"):
+    """A claim-time resident on a (possibly process) engine, with its booking."""
+    spec = {"vram_gb": vram, "source": "catalog-vram-floor", "load_s": None}
+    stack["ledger"].book(model_id, spec)
+    stack["bookings"][model_id] = spec
+    stack["ledger"].record_resident("gpu-box", model_id, engine=engine,
+                                    lane=lane)
+
+
+def _release_stack(monkeypatch, tmp_path, budget=24.0):
+    calls = []
+    adapters = {e: _RecordingAdapter(e, calls)
+                for e in ("ollama", "comfyui", "llamacpp", "media-gateway")}
+    stack = _residency_stack(_REMOTE, calls, budget=budget, adapters=adapters)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    return tools, stack, calls
+
+
+def test_policy_hook_passes_release_of_an_unknown_scope(tmp_path, monkeypatch):
+    tools, _, _ = _release_stack(monkeypatch, tmp_path)
+    # an unknown scope is refused by the handler before any start — no prompt
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "release", "target": "gpu-box",
+                              "scope_id": "never-claimed"}) is None
+    # and a release with no scope_id is refused too
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "release", "target": "gpu-box"}) is None
+
+
+def test_policy_hook_escalates_a_release_that_restores_a_process_server(
+        tmp_path, monkeypatch):
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=6.0, engine="llamacpp")
+    # an image-generation claim evicts the whole card (chat-a goes) with NO
+    # approval — comfyui is HTTP-native and starts no server
+    claimed = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    assert claimed["ok"] is True
+    scope_id = claimed["scope_id"]
+    assert not stack["ledger"].is_resident("gpu-box", "chat-a")
+    # releasing the scope would RE-LOAD chat-a on llama.cpp -> a server start
+    d = tools.policy_hook("model_forge_broker",
+                          {"action": "release", "scope_id": scope_id,
+                           "target": "gpu-box"})
+    assert d is not None and d["action"] == "approve"
+    assert d["rule_key"] == "model-forge:broker_server_start"
+    assert "chat-a" in d["message"] and "llamacpp" in d["message"]
+    assert "RE-START" in d["message"] and "127.0.0.1" in d["message"]
+    assert "port: 8080" in d["message"]
+
+
+def test_policy_hook_resolves_release_target_from_the_active_scope(
+        tmp_path, monkeypatch):
+    # the release handler resolves the target from the active scope when none
+    # is passed; the gate must resolve it the same way to see the restore.
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=6.0, engine="llamacpp")
+    claimed = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    scope_id = claimed["scope_id"]
+    d = tools.policy_hook("model_forge_broker",
+                          {"action": "release", "scope_id": scope_id})
+    assert d is not None and d["rule_key"] == "model-forge:broker_server_start"
+
+
+def test_policy_hook_passes_a_release_restoring_only_http_engine(
+        tmp_path, monkeypatch):
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-b", vram=6.0, engine="ollama")
+    claimed = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    scope_id = claimed["scope_id"]
+    assert not stack["ledger"].is_resident("gpu-box", "chat-b")
+    # restoring an HTTP-native engine (ollama) starts no process -> no prompt
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "release", "scope_id": scope_id,
+                              "target": "gpu-box"}) is None
+
+
+def test_policy_hook_passes_a_release_whose_restore_is_still_resident(
+        tmp_path, monkeypatch):
+    # a restore set whose process model is already resident loads nothing
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=6.0, engine="llamacpp")
+    claimed = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    scope_id = claimed["scope_id"]
+    # chat-a comes back resident before the release (e.g. another path)
+    _process_resident(stack, "chat-a", vram=6.0, engine="llamacpp")
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "release", "scope_id": scope_id,
+                              "target": "gpu-box"}) is None
+
+
+def test_policy_hook_escalates_a_media_submit_with_a_process_resident(
+        tmp_path, monkeypatch):
+    # a media job claims the lane and releases it later; a resident
+    # process-engine model could be evicted and re-started on that release
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=6.0, engine="llamacpp")
+    d = tools.policy_hook("model_forge_generate_media",
+                          {"modality": "3d", "target": "gpu-box",
+                           "model": "gen/3d"})
+    assert d is not None and d["action"] == "approve"
+    assert d["rule_key"] == "model-forge:broker_server_start"
+    assert "chat-a" in d["message"] and "llamacpp" in d["message"]
+
+
+def test_policy_hook_passes_a_media_submit_without_a_process_resident(
+        tmp_path, monkeypatch):
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=6.0, engine="ollama")
+    assert tools.policy_hook("model_forge_generate_media",
+                             {"modality": "3d", "target": "gpu-box",
+                              "model": "gen/3d"}) is None
+    # an unknown target is refused by the handler before any start
+    assert tools.policy_hook("model_forge_generate_media",
+                             {"modality": "3d", "target": "nope",
+                              "model": "gen/3d"}) is None
+    # needs_args (no model): the handler submits nothing
+    assert tools.policy_hook("model_forge_generate_media",
+                             {"modality": "3d", "target": "gpu-box"}) is None
+
+
+def test_policy_hook_a_media_poll_of_a_running_job_does_not_escalate(
+        tmp_path, monkeypatch):
+    # A poll performs no release while the job still runs — the handler only
+    # releases the held scope on a terminal record. Polling a long-running job
+    # must therefore NOT prompt on every poll (the regression this guards).
+    from model_forge.broker import LoadRequest
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=18.0, engine="llamacpp")
+    stack["ledger"].book("gen/3d", {"vram_gb": 20.0, "source": "stand-in"})
+    # an open media scope (3d) whose claim evicted chat-a (18 + 20 > 24)
+    claimed = stack["orchestrator"].claim(
+        "media-x", "gpu-box",
+        LoadRequest("gen/3d", "media-gateway", lane="3d", modality="3d"))
+    assert claimed["ok"] is True
+    assert not stack["ledger"].is_resident("gpu-box", "chat-a")
+    tools._MEDIA_SCOPE_JOBS["job-9"] = {
+        "scope_id": "media-x", "target_id": "gpu-box",
+        "model_id": "gen/3d", "modality": "3d"}
+    # the job record reads back as still running -> this poll releases nothing
+    monkeypatch.setattr(tools, "_fetch_media_job",
+                        lambda target, job_id: {"status": "running"})
+    assert tools.policy_hook("model_forge_generate_media",
+                             {"modality": "3d", "target": "gpu-box",
+                              "job_id": "job-9"}) is None
+
+
+def test_policy_hook_escalates_a_media_poll_release_restoring_a_server(
+        tmp_path, monkeypatch):
+    from model_forge.broker import LoadRequest
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=18.0, engine="llamacpp")
+    stack["ledger"].book("gen/3d", {"vram_gb": 20.0, "source": "stand-in"})
+    # an open media scope (3d) whose claim evicted chat-a (18 + 20 > 24)
+    claimed = stack["orchestrator"].claim(
+        "media-x", "gpu-box",
+        LoadRequest("gen/3d", "media-gateway", lane="3d", modality="3d"))
+    assert claimed["ok"] is True
+    assert not stack["ledger"].is_resident("gpu-box", "chat-a")
+    tools._MEDIA_SCOPE_JOBS["job-9"] = {
+        "scope_id": "media-x", "target_id": "gpu-box",
+        "model_id": "gen/3d", "modality": "3d"}
+    # the job record is terminal: this poll releases the scope, and that
+    # restore re-loads chat-a on llama.cpp -> it must prompt
+    monkeypatch.setattr(tools, "_fetch_media_job",
+                        lambda target, job_id: {"status": "done"})
+    d = tools.policy_hook("model_forge_generate_media",
+                          {"modality": "3d", "target": "gpu-box",
+                           "job_id": "job-9"})
+    assert d is not None and d["rule_key"] == "model-forge:broker_server_start"
+    assert "chat-a" in d["message"] and "llamacpp" in d["message"]
+
+
+def test_policy_hook_a_media_poll_fails_safe_when_the_job_record_is_unreadable(
+        tmp_path, monkeypatch):
+    # an unreadable/missing job record is uncertainty about whether this poll
+    # releases -> escalate (the over-approximation is deliberate)
+    from model_forge.broker import LoadRequest
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=18.0, engine="llamacpp")
+    stack["ledger"].book("gen/3d", {"vram_gb": 20.0, "source": "stand-in"})
+    stack["orchestrator"].claim(
+        "media-x", "gpu-box",
+        LoadRequest("gen/3d", "media-gateway", lane="3d", modality="3d"))
+    tools._MEDIA_SCOPE_JOBS["job-9"] = {
+        "scope_id": "media-x", "target_id": "gpu-box",
+        "model_id": "gen/3d", "modality": "3d"}
+
+    def boom(target, job_id):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(tools, "_fetch_media_job", boom)
+    d = tools.policy_hook("model_forge_generate_media",
+                          {"modality": "3d", "target": "gpu-box",
+                           "job_id": "job-9"})
+    assert d is not None and d["rule_key"] == "model-forge:broker_server_start"
+
+
+def test_policy_hook_release_denial_blocks_the_restore(tmp_path, monkeypatch):
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=6.0, engine="llamacpp")
+    claimed = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    scope_id = claimed["scope_id"]
+    ran = []
+
+    def dispatch(_args):
+        ran.append("ran")
+        return {"ok": True}
+
+    args = {"action": "release", "scope_id": scope_id, "target": "gpu-box"}
+    denied = _simulate_approval_gate("model_forge_broker", args,
+                                     decision="deny", dispatch=dispatch)
+    assert denied["blocked"] is True
+    assert denied["directive"]["rule_key"] == "model-forge:broker_server_start"
+    assert ran == []          # the restore never ran without approval
+
+
+# --- _git_run / hardware probes: minimal child environment ------------------
+
+def test_git_run_child_gets_minimal_env_and_no_credential_prompt(monkeypatch):
+    from model_forge import tools
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
+    monkeypatch.setenv("HF_TOKEN", "hf-secret")
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = b""
+
+    def fake_run(argv, **kw):
+        captured["argv"] = list(argv)
+        captured["kw"] = kw
+        return _Proc()
+
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+    tools._git_run(["clone", "https://github.com/mw00/project-maya", "/tmp/x"])
+    assert captured["argv"][0] == "git"
+    env = captured["kw"]["env"]
+    # no pins can hang the clone, and no Hermes credentials reach git
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert set(env) == {"PATH", "HOME", "LANG", "TMPDIR",
+                        "GIT_TERMINAL_PROMPT"}
+    assert "OPENAI_API_KEY" not in env and "HF_TOKEN" not in env
+
+
+def test_hardware_probe_children_get_minimal_env(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret2")
+    captured = []
+
+    class _Proc:
+        returncode = 0
+        stdout = "GPU0, 8192\n"
+
+    def fake_run(argv, **kw):
+        captured.append((list(argv), dict(kw)))
+        return _Proc()
+
+    monkeypatch.setattr(hardware.subprocess, "run", fake_run)
+    monkeypatch.setattr(hardware.shutil, "which",
+                        lambda name: f"/usr/bin/{name}")
+    hardware._probe_nvidia()
+    hardware._probe_amd_rocm()
+    assert len(captured) == 2
+    for _, kw in captured:
+        env = kw.get("env")
+        assert env is not None
+        assert set(env) == {"PATH", "HOME", "LANG", "TMPDIR"}
+        assert "OPENAI_API_KEY" not in env and "ANTHROPIC_API_KEY" not in env
+
+
+def test_policy_hook_release_fails_safe_when_uncertain(tmp_path, monkeypatch):
+    # if the restore cannot be inspected, escalate — an extra approval is
+    # acceptable; an unapproved start is the bug
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    tools._ACTIVE_SCOPES["s-x"] = {"target_id": "gpu-box"}
+
+    def boom(target, **kw):
+        raise RuntimeError("broker stack unavailable")
+
+    monkeypatch.setattr(tools, "broker_stack", boom)
+    d = tools.policy_hook("model_forge_broker",
+                          {"action": "release", "scope_id": "s-x",
+                           "target": "gpu-box"})
+    assert d is not None and d["rule_key"] == "model-forge:broker_server_start"
+
+
+def test_policy_hook_media_fails_safe_when_uncertain(tmp_path, monkeypatch):
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+
+    def boom(target, **kw):
+        raise RuntimeError("broker stack unavailable")
+
+    monkeypatch.setattr(tools, "broker_stack", boom)
+    d = tools.policy_hook("model_forge_generate_media",
+                          {"modality": "3d", "target": "gpu-box",
+                           "model": "gen/3d"})
+    assert d is not None and d["rule_key"] == "model-forge:broker_server_start"
+
+
+# --- engine_install approval: the exact executed command is shown -----------
+
+def test_engine_install_approval_shows_the_exact_executed_command(
+        tmp_path, monkeypatch):
+    import hashlib
+    import types
+    from model_forge import tools
+    from model_forge.tools import engine_install_plan
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    # The stager is the single source of the executed command. Run it with
+    # fakes (nothing is downloaded or cloned) and compare what the plan and the
+    # approval message show against what the runner is actually handed.
+    good = b"#!/bin/sh\ntrue\n"
+    monkeypatch.setitem(tools._ENGINE_INSTALLERS["ollama"], "sha256",
+                        hashlib.sha256(good).hexdigest())
+    staged = tools._stage_installer("ollama", downloader=lambda url: good)
+    assert staged["ok"] is True
+    executed = staged["command"]
+
+    def fake_git(args, cwd=None):
+        if "rev-parse" in args:
+            return types.SimpleNamespace(returncode=0,
+                                         stdout=_MAYA_COMMIT.encode())
+        return types.SimpleNamespace(returncode=0, stdout=b"")
+
+    monkeypatch.setattr(tools, "_git_run", fake_git)
+    maya = tools._stage_installer("maya")
+    assert maya["ok"] is True
+
+    # script installer: the plan and the approved text show the SAME string
+    # the stager produced — byte-identical, not merely shell-equivalent
+    plan = engine_install_plan("ollama")
+    d = tools.policy_hook("model_forge_install",
+                          {"action": "engine_install", "engine": "ollama",
+                           "execute": True})
+    assert d["rule_key"] == "model-forge:engine_install"
+    assert plan["command"] == executed
+    assert f"command: {executed}" in d["message"]
+    assert f"acquire: {plan['pipeline']}" in d["message"]
+    assert "sha256sum" not in d["message"]
+    # git installer: same single source of truth, ./setup.sh inside the pin
+    maya_plan = engine_install_plan("maya")
+    d_maya = tools.policy_hook("model_forge_install",
+                               {"action": "engine_install", "engine": "maya",
+                                "execute": True})
+    assert maya_plan["command"] == maya["command"]
+    assert maya_plan["command"].endswith("./setup.sh")
+    assert f"command: {maya['command']}" in d_maya["message"]
+    assert f"acquire: {maya_plan['pipeline']}" in d_maya["message"]
+
+    # the plan's command IS what the background job records as executed — one
+    # string from the stager, shown and run
+    calls = _installer_spy(monkeypatch)
+    spy_stage = _stage_spy(monkeypatch, tmp_path)
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    started = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "ollama", "execute": True}))
+    st = _poll_until_done(started["job_id"])
+    assert spy_stage == ["ollama"]
+    assert calls[0] == st["executed_command"]

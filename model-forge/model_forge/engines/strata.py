@@ -141,7 +141,9 @@ def detect(base_url: str = "") -> EngineStatus:
         available=bool(cli),
         detail=("CLI found; run `strata launch` to start a model"
                 if cli else
-                "not installed (curl -fsSL https://github.com/Niko1221/Strata/"
-                "releases/latest/download/install.sh | sh)"),
+                "not installed — Model Forge installs the pinned Strata "
+                "v0.2.15 release script (sha256 "
+                "1fcfbab133880249b7a6eaefb643f25b29a9b8f45624d2d8673e35948c329eda) "
+                "via model_forge_install action=engine_install"),
         modalities=("chat", "vision"),
     )

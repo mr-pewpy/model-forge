@@ -712,6 +712,11 @@ def register(ctx):
     # Policy gate: registering a compute target, rewriting the default model
     # config, deleting a model-storage entry, and running a vendor engine
     # installer (model_forge_install action=engine_install, execute=true) are
-    # user decisions, not model decisions — tools.policy_hook escalates all
-    # four to Hermes' human-approval gate (fail closed on denial or timeout).
+    # user decisions, not model decisions. So is every tool call that would
+    # START an engine server process (rule_key
+    # model-forge:broker_server_start): a claim or swap that loads a
+    # process-engine model, a release whose restore re-loads one, and a media
+    # job whose lane claim or release would — tools.policy_hook escalates all
+    # of them to Hermes' human-approval gate (fail closed on denial or
+    # timeout).
     ctx.register_hook("pre_tool_call", tools.policy_hook)

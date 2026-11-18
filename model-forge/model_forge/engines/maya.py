@@ -99,10 +99,11 @@ def detect(base_url: str = "") -> EngineStatus:
         id="maya",
         display_name="Project Maya",
         available=False,
-        detail=("not running (install: git clone "
-                "https://github.com/mw00/project-maya && ./setup.sh — "
-                "serves OpenAI-compatible /v1 on :8080 and auto-swaps models "
-                "on request)") if not base_url else
+        detail=("not running (Model Forge installs the pinned Project Maya "
+                "checkout at commit "
+                "56b5216ab4464ac41c26b1be32eb63b98de53d0a, then runs "
+                "./setup.sh — serves OpenAI-compatible /v1 on :8080 and "
+                "auto-swaps models on request)") if not base_url else
                f"no Maya answering at {root}",
         modalities=("chat", "vision", "ocr"),
     )

@@ -104,7 +104,8 @@ The list is grouped as:
 - **Why:** the plugin catalog is source-only (no bundled binaries), and
   engines stay the user's to launch — the disclosure states this up front.
 - **What exists today:** `model_forge_install` with `action=engine_install`
-  runs a vendor's official install command as a background job after the
+  runs a vendor's PINNED install command (installer script SHA-256 checked;
+  Maya checked out at a fixed commit) as a background job after the
   human-approval gate, and the bring-your-own-endpoint path connects any
   running engine without installing anything.
 - **What would unblock it:** core-provisioned engine bundles (see B9) or
@@ -249,20 +250,22 @@ The list is grouped as:
 - **What would unblock it:** an Exo-specific surface those older builds
   serve, to use as an honest fingerprint.
 
-### A18. Broker `claim`/`release` may start and stop server processes without a gate
+### A18. Broker verbs that stop or evict an engine server are not gated
 
-- **What it is:** a weight-residency claim or release can start and stop an
-  engine server process (llama-server, vLLM) on a compute target as part of
-  the swap, and these verbs do not ride the human-approval gate.
-- **Why:** they move only model weights, on compute targets the user
-  registered (each registration passed the gate) or configured in settings,
-  and destroy no data — the approval coverage map records this as a
-  documented no-gate action.
+- **What it is:** starting an engine server process (llama-server, vLLM) from
+  a weight-residency claim, swap, release or media-lane call now rides the
+  human-approval gate (rule_key `model-forge:broker_server_start`), but
+  STOPPING one is still ungated: a claim that evicts a resident model, or a
+  release that ends a scope, stops the process without asking.
+- **Why:** a stop is non-destructive — the weights stay on disk and the model
+  can be re-loaded (a re-load that starts a server does pass the gate), on
+  compute targets the user registered (each registration passed the gate) or
+  configured in settings.
 - **What exists today:** the disclosure states the process start/stop
   behavior; the verbs are non-destructive and fail closed on a refused claim.
-- **What would unblock it:** a gate scoped to servers the user started
-  themselves (externally-started servers), which is a future consideration
-  (see B8).
+- **What would unblock it:** a gate scoped to stopping servers the user
+  started themselves (externally-started servers), which is a future
+  consideration (see B8).
 
 ### A19. Automated quality gates are partly short of their own targets
 
@@ -278,6 +281,30 @@ The list is grouped as:
   release gate exercised the remaining workflows by hand.
 - **What would unblock it:** live-engine fixtures for the degradation
   branches and a working mutation-testing run.
+
+### A20. The approval gate and the release handler re-evaluate the restore separately
+
+- **What it is:** before a release that would start an engine server, the
+  human-approval gate inspects the release's restore plan (models the scope
+  would re-load) and asks for approval; the release handler then computes the
+  same plan again when it runs. The two share their construction code
+  (`_restore_requests` / `restore_plan`), but they are separate evaluations
+  against live ledger state — so a concurrent claim that evicts a restored
+  model inside the window between the gate's inspection and the handler can
+  make the handler's recomputed plan start a server the gate did not see.
+- **Why:** the gate is a pre-call hook over live state; the ledger can change
+  between the hook and the handler, and closing that gap means re-verifying
+  (or consuming the gated decision) inside the handler, which is not built.
+- **What exists today:** the window is narrow — it requires an interleaved
+  concurrent claim/eviction in the gap — and it can only restore models that
+  were resident at claim time (the restore set is fixed then, never
+  model-chosen). Every server-starting claim, swap, release and media-lane
+  release still rides the gate (`rule_key
+  model-forge:broker_server_start`), and any server a restore starts binds
+  127.0.0.1 only. Only a state change inside the window escapes the gate.
+- **What would unblock it:** handler-side re-verification of the restore
+  against the gate's approval, or the handler consuming the exact plan the
+  gate approved (a follow-up, not done today).
 
 ---
 

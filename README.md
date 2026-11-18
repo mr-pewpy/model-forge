@@ -390,16 +390,22 @@ alternative, and what would unblock each item — is in
   checks `PATH` for the `strata` CLI. Hardware probes also read system state
   directly: amdgpu sysfs on Linux and the Windows memory API
   (`GlobalMemoryStatusEx`). `model_forge_install` with `action=engine_install`
-  executes vendor-official install commands in a background process, but only
-  after explicit user approval at the human-approval gate: Ollama
-  (`curl -fsSL https://ollama.com/install.sh | sh`), Strata
-  (`curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh`),
-  and Project Maya (`git clone https://github.com/mw00/project-maya && cd project-maya && ./setup.sh`).
+  executes PINNED, checksum-verified vendor installers in a background
+  process, and only after explicit user approval at the human-approval gate:
+  Ollama's install script (downloaded and checked against a pinned SHA-256),
+  Strata's pinned `v0.2.15` release installer (also SHA-256 checked — never
+  `releases/latest`), and Project Maya (cloned, checked out at a pinned
+  commit, HEAD re-verified, then `./setup.sh`). A checksum or checkout
+  mismatch runs nothing. The installer child gets a minimal environment
+  (PATH, HOME, LANG, TMPDIR only — no provider keys or tokens).
   llama.cpp is never installed — it defers to Hermes core's managed llama.cpp
-  runtime (the built-in Local Models catalog and downloads). Outside of
-  weight residency claims and releases (which may start and stop
-  `llama-server` and vLLM server processes on this machine as part of the
-  swap), no engine launcher is run by the plugin.
+  runtime (the built-in Local Models catalog and downloads). Residency
+  claims, releases and swaps may start and stop `llama-server` and vLLM
+  server processes on this machine; every such START (including a release
+  whose restore re-loads a non-resident process-engine model, and a media
+  job's lane claim/release) rides the human-approval gate
+  (`model-forge:broker_server_start`) and binds `127.0.0.1` only. Outside
+  those gated starts, no engine launcher is run by the plugin.
 - **Background:** long model downloads and approved engine installs run on
   a daemon background thread (job records are pollable with
   `model_forge_install` `job_id`); installer jobs carry a hard timeout (900
@@ -430,21 +436,26 @@ alternative, and what would unblock each item — is in
   `custom_providers` entry (see Approvals), and the `model-forge-providers`
   package's `hermes model` setup step writes those same two sections after
   you pick a model interactively.
-- **Approvals:** four actions escalate to Hermes' human-approval gate and
+- **Approvals:** actions escalate to Hermes' human-approval gate and
   fail closed on denial or timeout — registering a compute target, writing
   the default model config plus a `custom_providers` entry (so the
   activated model is switchable with `/model`) via
   `model_forge_activate` with `apply=true`,
   deleting a model-storage entry (`model_forge_storage` with `action=delete`;
-  the prompt names the exact path and size), and running a vendor engine
+  the prompt names the exact path and size), running a vendor engine
   installer (`model_forge_install` with `action=engine_install`,
   `execute=true`; the prompt shows the exact command, and denial or
-  timeout runs nothing).
-  Model pulls, media jobs, and broker `claim`/`release` are deliberately
-  not approval-gated: they write nothing outside the plugin's data
-  directories and talk only to compute targets and endpoints you
-  registered (each registration passed the gate) or configured in
-  settings yourself. The full write-action coverage map — every write
+  timeout runs nothing), and any call that would START or RE-START an
+  engine server process — a `model_forge_broker` `claim`/`swap`, a
+  `release` whose restore re-loads a non-resident llama.cpp/vLLM model, or
+  a `model_forge_generate_media` job whose GPU-lane claim/release would
+  (rule key `model-forge:broker_server_start`; the prompt names the
+  engine, model, target and port, and the server binds `127.0.0.1` only).
+  Model pulls are deliberately not approval-gated: they write nothing
+  outside the plugin's data directories. A claim/release that starts
+  nothing — an HTTP-native engine, or a model that is still resident and
+  running — needs no gate.
+  The full write-action coverage map — every write
   action mapped to its rule key or its documented reason for needing
   none — is in [docs/surface-parity.md](docs/surface-parity.md).
 - **Credentials:** none required. HF/ModelScope tokens are optional, stored

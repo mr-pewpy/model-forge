@@ -6,10 +6,12 @@ logic is unit-tested without touching the network or the Hermes config.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -180,35 +182,108 @@ def write_custom_provider_entry(entry: dict) -> dict:
     return merged
 
 
-# Engine provisioning: the vendor-official install commands Model Forge's
+# Engine provisioning: the vendor-official installers Model Forge's
 # engine_install action may plan and run. The command is never model-supplied
-# — only these fixed strings can execute, and only after the human-approval
-# gate approves the exact command (rule_key model-forge:engine_install).
-# llama.cpp is deliberately absent: Hermes core manages a llama.cpp runtime
+# — only these fixed, PINNED specs can execute, and only after the
+# human-approval gate approves the exact command (rule_key
+# model-forge:engine_install). Each entry pins its provenance so what runs
+# cannot change while the pinned value stands still: an installer script is
+# downloaded to a temp file and its SHA-256 checked against a pinned constant
+# before anything runs; the Maya clone is checked out at a fixed commit and
+# the checked-out HEAD re-verified before setup.sh runs. A checksum mismatch,
+# a download failure or a checkout mismatch runs NOTHING. llama.cpp is
+# deliberately absent: Hermes core manages a llama.cpp runtime
 # (hardware-priced Local Models catalog and downloads), so engine_install
 # returns guidance to it instead of installing binaries.
+_ENGINE_INSTALL_ROOT = "${TMPDIR:-/tmp}/model-forge-installers"
+
+
+def _pipeline(key: str, spec: dict) -> str:
+    """Plain-wording description of the PINNED acquisition step an installer
+    entry performs before it runs anything — download + checksum verification
+    for a script, clone + pinned checkout + HEAD re-verification for git.
+    Describes what verifies honestly (Python checks the SHA-256; there is no
+    shell ``sha256sum`` pipeline), so the shown plan never advertises a
+    command that does not run."""
+    base = f"{_ENGINE_INSTALL_ROOT}/{key}"
+    if spec["kind"] == "script":
+        dest = f"{base}/{spec['url'].rsplit('/', 1)[-1]}"
+        return (f"download {spec['url']} to {dest}, verify its SHA-256 "
+                f"{spec['sha256']} in Python (a mismatch or download failure "
+                f"runs nothing), then stage the verified local copy")
+    dest = f"{base}/project-maya"
+    return (f"git clone {spec['repo']} {dest}, git checkout "
+            f"{spec['commit']}, re-verify the checked-out HEAD matches that "
+            f"commit (a mismatch runs nothing), then stage the pinned "
+            f"checkout")
+
+
+def _installer_dest(key: str, spec: dict) -> str:
+    """The on-disk path the pinned artifact is staged to for ``key``. Resolved
+    through ``_install_root`` every time, so the path the plan and the
+    approval message name is byte-for-byte the path the stager writes and the
+    runner is handed — one root, never two."""
+    base = os.path.join(_install_root(), key)
+    if spec["kind"] == "script":
+        return os.path.join(base, spec["url"].rsplit("/", 1)[-1])
+    return os.path.join(base, "project-maya")
+
+
+def _installer_command(spec: dict, dest: str) -> str:
+    """The literal shell command the installer runner is handed for the
+    staged artifact at ``dest`` — the local script for a script installer, or
+    ``./setup.sh`` inside the pinned checkout for git. This is the ONE
+    construction: the plan, the approval message and the stager all call it,
+    so the approved text is exactly the command that runs (same string, not
+    merely shell-equivalent)."""
+    if spec["kind"] == "script":
+        return f"{spec['runner']} {shlex.quote(dest)}"
+    return f"cd {shlex.quote(dest)} && ./setup.sh"
+
+
+def _installer_entry(key: str, *, vendor: str, kind: str, steps,
+                     **pinned) -> dict:
+    """One approved-installer catalog entry: vendor, acquisition kind, the
+    pinned provenance fields, the human steps, and the plain-wording pinned
+    pipeline. The literal executed command is NOT baked here — it is built on
+    demand from the same ``_installer_command`` helper the stager uses, so the
+    shown command and the run command can never be two different strings."""
+    spec = {"vendor": vendor, "kind": kind, **pinned, "steps": list(steps)}
+    spec["pipeline"] = _pipeline(key, spec)
+    return spec
+
+
 _ENGINE_INSTALLERS = {
-    "ollama": {
-        "vendor": "Ollama",
-        "command": "curl -fsSL https://ollama.com/install.sh | sh",
-        "steps": ["run the Ollama official install script "
-                  "(curl -fsSL https://ollama.com/install.sh | sh)"],
-    },
-    "strata": {
-        "vendor": "Strata",
-        "command": ("curl -fsSL https://github.com/Niko1221/Strata/releases/"
-                    "latest/download/install.sh | sh"),
-        "steps": ["run the Strata official install script "
-                  "(curl -fsSL https://github.com/Niko1221/Strata/releases/"
-                  "latest/download/install.sh | sh)"],
-    },
-    "maya": {
-        "vendor": "Project Maya",
-        "command": ("git clone https://github.com/mw00/project-maya "
-                    "&& cd project-maya && ./setup.sh"),
-        "steps": ["git clone https://github.com/mw00/project-maya",
-                  "./setup.sh (run from inside the cloned repository)"],
-    },
+    "ollama": _installer_entry(
+        "ollama", vendor="Ollama", kind="script",
+        url="https://ollama.com/install.sh",
+        sha256="25f64b810b947145095956533e1bdf56eacea2673c55a7e586be4515fc882c9f",
+        runner="sh",
+        steps=["download the Ollama official install script and verify its "
+               "SHA-256 (https://ollama.com/install.sh, "
+               "25f64b810b947145095956533e1bdf56eacea2673c55a7e586be4515fc882c9f)",
+               "run the verified local copy with sh — a checksum mismatch "
+               "runs nothing"]),
+    "strata": _installer_entry(
+        "strata", vendor="Strata", kind="script",
+        url=("https://github.com/Niko1221/Strata/releases/download/v0.2.15/"
+             "install.sh"),
+        sha256="1fcfbab133880249b7a6eaefb643f25b29a9b8f45624d2d8673e35948c329eda",
+        runner="sh",
+        steps=["download the Strata v0.2.15 release install script and verify "
+               "its SHA-256 (https://github.com/Niko1221/Strata/releases/"
+               "download/v0.2.15/install.sh, "
+               "1fcfbab133880249b7a6eaefb643f25b29a9b8f45624d2d8673e35948c329eda)",
+               "run the verified local copy with sh — a checksum mismatch "
+               "runs nothing"]),
+    "maya": _installer_entry(
+        "maya", vendor="Project Maya", kind="git",
+        repo="https://github.com/mw00/project-maya",
+        commit="56b5216ab4464ac41c26b1be32eb63b98de53d0a",
+        steps=["git clone https://github.com/mw00/project-maya",
+               "git checkout 56b5216ab4464ac41c26b1be32eb63b98de53d0a and "
+               "verify the checked-out HEAD — a mismatch runs nothing",
+               "./setup.sh (run from inside the pinned checkout)"]),
 }
 # Hard timeout for an approved installer job: the process group is killed at
 # the limit so nothing can hang unattended.
@@ -229,6 +304,104 @@ def _installer_for(engine_id: str) -> dict | None:
     is the ONLY source of executable commands — model-supplied strings never
     reach a shell."""
     return _ENGINE_INSTALLERS.get(_installer_key(engine_id))
+
+
+def _install_root() -> str:
+    """Resolved install root, read from the environment at call time. The plan,
+    the approval message and the stager all resolve it through this one helper,
+    so the shown path and the staged path never diverge."""
+    return os.path.join(os.environ.get("TMPDIR") or "/tmp",
+                        "model-forge-installers")
+
+
+def _fetch_url(url: str, timeout: float = 60.0) -> bytes:
+    """Download a pinned installer script. Seam: tests replace this so no
+    network call happens; failures raise and the caller turns them into an
+    honest error row."""
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _git_run(args: list[str], cwd: str | None = None):
+    """Run one git command for the Maya pin. Seam: tests replace this so no
+    real clone happens. The child gets the minimal environment (no Hermes
+    credentials) and ``GIT_TERMINAL_PROMPT=0`` so a clone can never hang on
+    an interactive credential prompt — it fails instead."""
+    env = {**_minimal_env(), "GIT_TERMINAL_PROMPT": "0"}
+    return subprocess.run(["git", *args], cwd=cwd, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, env=env)
+
+
+def _proc_tail(proc) -> str:
+    out = getattr(proc, "stdout", b"") or b""
+    if isinstance(out, bytes):
+        out = out.decode("utf-8", "replace")
+    return out.strip()[-400:]
+
+
+def _stage_installer(engine_id: str, *, downloader=None, git=None) -> dict:
+    """Fetch and VERIFY the pinned installer artifact — the only thing the
+    runner seam is ever handed. Returns ``{"ok": True, "artifact",
+    "command"}`` or ``{"ok": False, "error"}``; never raises and never runs
+    any part of the vendor installer. A checksum mismatch, a download
+    failure or a checkout mismatch leaves nothing to run."""
+    key = _installer_key(engine_id)
+    spec = _ENGINE_INSTALLERS.get(key)
+    if spec is None:
+        return {"ok": False,
+                "error": f"no approved installer for '{key}' — nothing was run"}
+    downloader = downloader or _fetch_url
+    git = git or _git_run
+    base = os.path.join(_install_root(), key)
+    dest = _installer_dest(key, spec)
+    try:
+        if spec["kind"] == "script":
+            try:
+                data = downloader(spec["url"])
+            except Exception as exc:  # noqa: BLE001 — an honest error row
+                return {"ok": False,
+                        "error": (f"download of {spec['url']} failed: "
+                                  f"{type(exc).__name__}: {exc} — nothing "
+                                  "was run")}
+            digest = hashlib.sha256(data).hexdigest()
+            if digest != spec["sha256"]:
+                return {"ok": False,
+                        "error": (f"checksum mismatch for {spec['url']}: "
+                                  f"expected {spec['sha256']}, got {digest} — "
+                                  "nothing was run")}
+            os.makedirs(base, exist_ok=True)
+            with open(dest, "wb") as fh:
+                fh.write(data)
+            return {"ok": True, "artifact": dest,
+                    "command": _installer_command(spec, dest)}
+        # git: clone, check out the pinned commit, re-verify the HEAD.
+        if os.path.exists(dest):
+            shutil.rmtree(dest, ignore_errors=True)
+        os.makedirs(base, exist_ok=True)
+        clone = git(["clone", spec["repo"], dest])
+        if getattr(clone, "returncode", 1) != 0:
+            return {"ok": False,
+                    "error": (f"git clone of {spec['repo']} failed: "
+                              f"{_proc_tail(clone)} — nothing was run")}
+        co = git(["-C", dest, "checkout", spec["commit"]])
+        if getattr(co, "returncode", 1) != 0:
+            shutil.rmtree(dest, ignore_errors=True)
+            return {"ok": False,
+                    "error": (f"git checkout of {spec['commit']} failed: "
+                              f"{_proc_tail(co)} — nothing was run")}
+        head = git(["-C", dest, "rev-parse", "HEAD"])
+        got = _proc_tail(head)
+        if getattr(head, "returncode", 1) != 0 or got != spec["commit"]:
+            shutil.rmtree(dest, ignore_errors=True)
+            return {"ok": False,
+                    "error": (f"checkout mismatch for {spec['repo']}: "
+                              f"expected HEAD {spec['commit']}, got "
+                              f"{got or '(unknown)'} — nothing was run")}
+        return {"ok": True, "artifact": dest,
+                "command": _installer_command(spec, dest)}
+    except Exception as exc:  # noqa: BLE001 — the job record carries it
+        return {"ok": False,
+                "error": f"{type(exc).__name__}: {exc} — nothing was run"}
 
 
 def policy_hook(tool_name: str, args: dict | None = None, task_id: str = "",
@@ -302,15 +475,29 @@ def policy_hook(tool_name: str, args: dict | None = None, task_id: str = "",
             and args.get("execute") is True:
         spec = _installer_for(str(args.get("engine") or ""))
         if spec is not None:
+            key = _installer_key(str(args.get("engine") or ""))
+            # The SAME construction the stager runs — the approved text and the
+            # executed command are one string (see _installer_command).
+            command = _installer_command(spec, _installer_dest(key, spec))
+            if spec["kind"] == "script":
+                pin = (f"  pinned sha256: {spec['sha256']}\n"
+                       f"  source: {spec['url']}\n")
+            else:
+                pin = (f"  pinned commit: {spec['commit']}\n"
+                       f"  source: {spec['repo']}\n")
             return {
                 "action": "approve",
                 "message": (
                     "Model Forge wants to install the "
                     f"{spec['vendor']} inference engine on this machine by "
-                    "running the vendor's official install command in a "
-                    "background job:\n"
-                    f"  command: {spec['command']}\n"
-                    f"  engine: {_installer_key(str(args.get('engine') or ''))}\n"
+                    "running its PINNED installer in a background job. The "
+                    "pinned artifact is acquired and verified first (a "
+                    "checksum or checkout mismatch runs nothing); the runner "
+                    "then executes EXACTLY this command:\n"
+                    f"  command: {command}\n"
+                    f"  acquire: {spec['pipeline']}\n"
+                    + pin +
+                    f"  engine: {key}\n"
                     "Progress is pollable with model_forge_install job_id, "
                     "and a hard timeout stops the installer if it runs too "
                     "long. Approve to run it — denying or letting this "
@@ -318,6 +505,80 @@ def policy_hook(tool_name: str, args: dict | None = None, task_id: str = "",
                 "rule_key": "model-forge:engine_install",
             }
         return None   # no approved installer -> nothing can execute
+    if tool_name == "model_forge_broker" \
+            and args.get("action") in ("claim", "swap"):
+        # A claim/swap can start an engine SERVER process (vLLM/llama.cpp),
+        # which is a model-callable side effect the model must not make
+        # alone. dry_run swaps change nothing, so they never escalate.
+        if not (args.get("action") == "swap"
+                and _swap_dry_run(args.get("dry_run"))):
+            detail = _broker_would_start_server(args)
+            if detail is not None:
+                return {
+                    "action": "approve",
+                    "message": (
+                        "Model Forge wants to start an inference engine "
+                        "SERVER process on a compute target (a "
+                        f"{detail['engine']} server for a claim/swap). "
+                        "Starting an engine server requires your approval:\n"
+                        f"  engine: {detail['engine']}\n"
+                        f"  model: {detail['model_id']}\n"
+                        f"  target: {detail['target']}\n"
+                        f"  port: {detail['port']}\n"
+                        "  bind: 127.0.0.1 only — loopback, never all "
+                        "interfaces\n"
+                        "Approving starts the server; denying or letting "
+                        "this prompt time out starts nothing."),
+                    "rule_key": "model-forge:broker_server_start",
+                }
+    if tool_name == "model_forge_broker" and args.get("action") == "release":
+        # A release restores what was resident at claim time; if that
+        # restore would load a non-resident process-engine model, the
+        # release SPAWNS a server process. Same gate as a starting claim.
+        detail = _release_would_start_server(args)
+        if detail is not None:
+            return {
+                "action": "approve",
+                "message": (
+                    "Model Forge wants to RELEASE a workflow scope, which "
+                    "would RE-START an inference engine SERVER process on a "
+                    "compute target to restore what was resident at claim "
+                    f"time (a {detail['engine']} server). Starting an engine "
+                    "server requires your approval:\n"
+                    f"  engine: {detail['engine']}\n"
+                    f"  model: {detail['model_id']}\n"
+                    f"  target: {detail['target']}\n"
+                    f"  port: {detail['port']}\n"
+                    "  bind: 127.0.0.1 only — loopback, never all "
+                    "interfaces\n"
+                    "Approving restarts the server; denying or letting "
+                    "this prompt time out starts nothing."),
+                "rule_key": "model-forge:broker_server_start",
+            }
+    if tool_name == "model_forge_generate_media":
+        # A media job claims the GPU lane around itself and releases it when
+        # the job ends; the release restores what was resident at claim time.
+        # If that restore would load a non-resident process-engine model, the
+        # release SPAWNS a server process — gate it like a starting claim.
+        detail = _media_would_start_server(args)
+        if detail is not None:
+            return {
+                "action": "approve",
+                "message": (
+                    "Model Forge wants to run a media job whose GPU-lane "
+                    "claim/release would start or RE-START an inference "
+                    f"engine SERVER process (a {detail['engine']} server). "
+                    "Starting an engine server requires your approval:\n"
+                    f"  engine: {detail['engine']}\n"
+                    f"  model: {detail['model_id']}\n"
+                    f"  target: {detail['target']}\n"
+                    f"  port: {detail['port']}\n"
+                    "  bind: 127.0.0.1 only — loopback, never all "
+                    "interfaces\n"
+                    "Approving starts the server; denying or letting "
+                    "this prompt time out starts nothing."),
+                "rule_key": "model-forge:broker_server_start",
+            }
     return None
 
 
@@ -703,12 +964,22 @@ def engine_install_plan(engine_id: str, core_probe=None) -> dict:
                          f"Forge can provision {sorted(_ENGINE_INSTALLERS)} "
                          "from their vendors' official installers and guides "
                          "'llamacpp' to Hermes core's managed runtime"}
+    pinned = ({"url": spec["url"], "sha256": spec["sha256"]}
+              if spec["kind"] == "script"
+              else {"repo": spec["repo"], "commit": spec["commit"]})
+    # Built by the same helper the stager runs, from the same artifact path —
+    # the planned command IS the executed command, byte for byte.
+    command = _installer_command(spec, _installer_dest(key, spec))
     return {"ok": True, "action": "vendor_installer", "engine": key,
-            "vendor": spec["vendor"], "command": spec["command"],
-            "steps": list(spec["steps"]), "executes": True,
-            "detail": f"the {spec['vendor']} vendor-official install "
-                      "command; it runs only with execute=true after the "
-                      "human-approval gate approves this exact command "
+            "vendor": spec["vendor"], "command": command,
+            "pipeline": spec["pipeline"],
+            "steps": list(spec["steps"]), "executes": True, "pinned": pinned,
+            "detail": f"the {spec['vendor']} pinned install — the artifact is "
+                      "verified against the pinned release tag / commit / "
+                      "SHA-256 before it runs (command is the exact staged "
+                      "command); it runs only with execute=true after the "
+                      "human-approval gate approves "
+                      "this exact command "
                       "(rule_key model-forge:engine_install)"}
 
 
@@ -750,13 +1021,29 @@ def _confirm_engine(engine_id: str) -> dict:
                       "it and Model Forge will detect it"}
 
 
+def _minimal_env() -> dict:
+    """The smallest environment an installer child needs: PATH, HOME, LANG
+    and TMPDIR only. Nothing else from the parent is forwarded — no provider
+    keys, tokens or other credentials reach the vendor install script. The
+    caller names what the child needs; this helper adds nothing on its own."""
+    return {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME") or os.path.expanduser("~"),
+        "LANG": os.environ.get("LANG", "C"),
+        "TMPDIR": os.environ.get("TMPDIR") or "/tmp",
+    }
+
+
 def _run_installer(command: str, timeout_s: float) -> dict:
-    """Run the approved vendor install command in its own session. The hard
-    timeout kills the whole process group so nothing can hang unattended;
-    on timeout this raises subprocess.TimeoutExpired (the job record says
-    'timeout', never a false 'done')."""
+    """Run the approved, verified installer command in its own session with a
+    minimal environment (see ``_minimal_env`` — no Hermes credentials reach
+    the vendor script). The hard timeout kills the whole process group so
+    nothing can hang unattended; on timeout this raises
+    subprocess.TimeoutExpired (the job record says 'timeout', never a false
+    'done')."""
     proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, start_new_session=True)
+                            stderr=subprocess.STDOUT, start_new_session=True,
+                            env=_minimal_env())
     try:
         out, _ = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
@@ -773,11 +1060,14 @@ def _run_installer(command: str, timeout_s: float) -> dict:
             "output_tail": (out or b"").decode("utf-8", "replace")[-2000:]}
 
 
-def _engine_install_job(job_id: str, plan: dict, runner=None) -> None:
-    """Background installer job (daemon thread, the pull.py pattern): writes
-    progress records to the shared jobs store (polled with
-    model_forge_install job_id), enforces the hard timeout, and confirms the
-    install by re-running engine detection."""
+def _engine_install_job(job_id: str, plan: dict, runner=None,
+                        stager=None) -> None:
+    """Background installer job (daemon thread, the pull.py pattern): stages
+    and VERIFIES the pinned artifact first, then writes progress records to
+    the shared jobs store (polled with model_forge_install job_id), enforces
+    the hard timeout, and confirms the install by re-running engine
+    detection. A staging failure (checksum mismatch, download failure,
+    checkout mismatch) is an honest error row that ran nothing."""
     from . import pull
     state = {"job_id": job_id, "kind": "engine_install",
              "engine": plan["engine"], "vendor": plan["vendor"],
@@ -785,8 +1075,19 @@ def _engine_install_job(job_id: str, plan: dict, runner=None) -> None:
              "hard_timeout_s": _ENGINE_INSTALL_TIMEOUT_S}
     pull._write_job(job_id, state)
     try:
+        stager = stager or _stage_installer
+        staged = stager(plan["engine"])
+        if not staged.get("ok"):
+            state["state"] = "error"
+            state["error"] = (staged.get("error")
+                              or "the installer artifact could not be "
+                                 "verified — nothing was run")
+            pull._write_job(job_id, state)
+            return
+        state["artifact"] = staged.get("artifact")
+        state["executed_command"] = staged["command"]
         runner = runner or _run_installer
-        result = runner(plan["command"], _ENGINE_INSTALL_TIMEOUT_S)
+        result = runner(staged["command"], _ENGINE_INSTALL_TIMEOUT_S)
         state["returncode"] = result.get("returncode")
         state["output_tail"] = result.get("output_tail", "")
         if result.get("returncode") == 0:
@@ -814,10 +1115,11 @@ def _engine_install_job(job_id: str, plan: dict, runner=None) -> None:
     pull._write_job(job_id, state)
 
 
-def start_engine_install(engine_id: str, runner=None) -> dict:
+def start_engine_install(engine_id: str, runner=None, stager=None) -> dict:
     """Start the approved vendor installer as a background job (daemon
     thread + jobs-store records). Call only after the human-approval gate
-    approved the exact command — the plan (engine_install_plan) comes first."""
+    approved the exact command — the plan (engine_install_plan) comes first.
+    The job stages and verifies the pinned artifact before running anything."""
     from . import pull
     plan = engine_install_plan(engine_id)
     if not plan.get("command"):
@@ -831,7 +1133,8 @@ def start_engine_install(engine_id: str, runner=None) -> dict:
                              "engine": plan["engine"], "vendor": plan["vendor"],
                              "command": plan["command"], "state": "starting",
                              "hard_timeout_s": _ENGINE_INSTALL_TIMEOUT_S})
-    threading.Thread(target=_engine_install_job, args=(job_id, plan, runner),
+    threading.Thread(target=_engine_install_job,
+                     args=(job_id, plan, runner, stager),
                      daemon=True).start()
     return {"ok": True, "job_id": job_id,
             "poll": f"model_forge_install with job_id={job_id}"}
@@ -1293,7 +1596,6 @@ def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
         plan = media_plan(modality, target.base_url)
         if not plan.get("ok"):
             return _dump(plan)
-        root = root_url(target.base_url)
         if modality == "3d":
             if args.get("job_id"):
                 job_id = str(args["job_id"])
@@ -1302,12 +1604,8 @@ def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
                                   "error": "job_id must be 1-128 ASCII "
                                            "letters, digits, '_' or '-' "
                                            f"(got {job_id!r})"})
-                req = urllib.request.Request(
-                    f"{root}/jobs/{job_id}")
                 try:
-                    with urllib.request.urlopen(req, timeout=30.0) as resp:
-                        job = _json.loads(
-                            resp.read().decode("utf-8", "replace"))
+                    job = _fetch_media_job(target, job_id)
                 except Exception as exc:  # noqa: BLE001
                     # Same honesty as the submit paths: name the HTTP status
                     # and a response snippet instead of a generic error.
@@ -1911,6 +2209,206 @@ def _claim_request(entry):
                        modality=entry.modality), ""
 
 
+# The process-based engine lifecycles (broker.py): these start a server
+# process on load; every other engine is HTTP-native or an observational
+# pass-through and starts nothing. Their default listening ports are shown in
+# the approval prompt.
+_PROCESS_ENGINE_PORTS = {"llamacpp": 8080, "vllm": 8000}
+
+
+def _broker_would_start_server(args) -> dict | None:
+    """Whether a model_forge_broker ``claim``/``swap`` call WOULD start an
+    engine SERVER process, and the honest detail for the approval prompt —
+    else ``None``.
+
+    Mirrors the handler's own resolution (``_claim_entry`` -> ``_claim_engine``
+    resolve the model to its engine exactly as the handler does) and the
+    planner's own residency gate (``ledger.is_resident``): a claim/swap loads
+    the model — and so starts a process — only when it is NOT already resident
+    on the target, so a claim that merely takes the lane over a live server
+    starts nothing and does not escalate. Only the process-based lifecycles
+    (llama.cpp, vLLM) start a server.
+
+    Fail-safe by design: any uncertainty about whether a process would start
+    escalates. An extra approval is acceptable; an unapproved server start is
+    the bug."""
+    model_id = str(args.get("model_id") or "").strip()
+    modality = str(args.get("modality") or "").strip()
+    target_id = str(args.get("target") or "").strip() or "local"
+    try:
+        entry, err = _claim_entry(model_id, modality)
+    except Exception:  # noqa: BLE001 — uncertainty -> escalate (fail-safe)
+        return {"model_id": model_id or f"(modality {modality!r})",
+                "engine": "(unresolved)", "port": "its default",
+                "target": target_id}
+    # An unresolvable request (unknown model / no curated model for the
+    # modality / no engine) is refused by the handler BEFORE anything starts,
+    # so no server would start — that is certain, not uncertain.
+    if err or entry is None:
+        return None
+    engine = _claim_engine(entry)
+    if engine not in _PROCESS_ENGINE_PORTS:
+        return None    # HTTP-native or pass-through engine: no process starts
+    try:
+        target = get_target(args.get("target"))
+    except Exception:  # noqa: BLE001 — uncertainty -> escalate (fail-safe)
+        target = None
+    if target is None:
+        # An unknown target is refused by the handler before any start.
+        return None
+    detail = {"model_id": entry.id, "engine": engine,
+              "port": _PROCESS_ENGINE_PORTS.get(engine, "its default"),
+              "target": target.id}
+    try:
+        # The same broker stack the handler will use (cached per target) — a
+        # construction, never a spawn; the ledger is the planner's own
+        # residency gate.
+        resident = broker_stack(target)["ledger"].is_resident(target.id,
+                                                              entry.id)
+    except Exception:  # noqa: BLE001 — uncertainty -> escalate (fail-safe)
+        return detail
+    if resident:
+        return None    # already resident: the claim/swap starts nothing
+    return detail
+
+
+def _release_would_start_server(args) -> dict | None:
+    """Whether releasing a scope WOULD start a process-engine server, and the
+    honest detail for the approval prompt — else ``None``.
+
+    A release restores the scope's claim-time residents. The restore plan is
+    computed the same way the handler's release does — the orchestrator
+    plans without executing (``restore_plan``) and the planner skips models
+    that are already resident — so the gate sees exactly what the release
+    would load. Only a load step on a process-engine lifecycle (llama.cpp,
+    vLLM) starts a server; a release that restores nothing, restores an
+    already-resident model, or restores only HTTP-native engines starts
+    nothing and does not escalate. An unknown scope is refused by the
+    handler before any start, so it does not escalate either.
+
+    Fail-safe: any uncertainty about whether the restore would start a
+    process escalates."""
+    scope_id = str(args.get("scope_id") or "").strip()
+    if not scope_id:
+        return None    # the handler refuses: nothing released, nothing starts
+    target_id = (str(args.get("target") or "").strip()
+                 or _ACTIVE_SCOPES.get(scope_id, {}).get("target_id") or "")
+    try:
+        target = get_target(target_id or None) or get_target(None)
+    except Exception:  # noqa: BLE001 — uncertainty -> escalate (fail-safe)
+        target = None
+    if target is None:
+        return {"scope_id": scope_id, "target": target_id or "local",
+                "engine": "(unresolved)", "model_id": "",
+                "port": "its default"}
+    try:
+        plan = broker_stack(target)["orchestrator"].restore_plan(scope_id)
+    except Exception:  # noqa: BLE001 — uncertainty -> escalate (fail-safe)
+        return {"scope_id": scope_id, "target": target.id,
+                "engine": "(unresolved)", "model_id": "",
+                "port": "its default"}
+    if plan is None:
+        return None    # unknown scope: release fails closed, starts nothing
+    steps = [step for step in plan.load_steps
+             if step.engine in _PROCESS_ENGINE_PORTS]
+    if not steps:
+        return None    # nothing process-based would be (re)started
+    return {"scope_id": scope_id, "target": target.id,
+            "engine": steps[0].engine, "model_id": steps[0].model_id,
+            "port": _PROCESS_ENGINE_PORTS.get(steps[0].engine, "its default"),
+            "models": [step.model_id for step in steps]}
+
+
+def _media_would_start_server(args) -> dict | None:
+    """Whether a ``model_forge_generate_media`` call WOULD start a
+    process-engine server, and the honest detail for the approval prompt —
+    else ``None``.
+
+    The media lane claims a workflow scope around the job and releases it
+    when the job ends; the release restores what was resident at claim time.
+    Two shapes reach the gate:
+
+    - A poll (modality 3d with a ``job_id``). The handler releases the held
+      scope ONLY when the job record is terminal (``_media_job_finished``);
+      while the job still runs the call performs no release, so a
+      still-running poll must NOT escalate — otherwise every poll of a long
+      job would prompt. The job record is read here the same way the handler
+      reads it; a terminal job computes the restore plan exactly via
+      ``restore_plan`` (the same path a ``model_forge_broker`` release uses).
+    - A submit that claims the lane now (3d, music, sfx): no scope exists
+      yet, so it is fail-safe — the release can only restore a claim-time
+      resident, so if a process-engine model is resident on the target the
+      claim could evict it and the release would re-start it, and the gate
+      escalates (this over-approximation stays). With no process-engine
+      resident the release can restore nothing that starts a process
+      (certain), and nothing escalates.
+
+    Fail-safe: any uncertainty escalates — including a job record that cannot
+    be read at all, which is why the poll path escalates on a fetch failure
+    rather than assuming the job is still running."""
+    try:
+        target = get_target(args.get("target"))
+    except Exception:  # noqa: BLE001 — uncertainty -> escalate (fail-safe)
+        target = None
+    if target is None:
+        return None    # the handler refuses an unknown target before any start
+
+    def unresolved(model_id=""):
+        return {"model_id": model_id, "engine": "(unresolved)",
+                "port": "its default", "target": target.id}
+
+    modality = str(args.get("modality") or "").strip()
+    job_id = str(args.get("job_id") or "").strip()
+    held = _MEDIA_SCOPE_JOBS.get(job_id) if job_id else None
+    if modality == "3d" and job_id:
+        # Poll path — the handler's 3d ``job_id`` branch. It releases the held
+        # scope only when the job record is terminal; while the job runs (or
+        # if no scope is held here) this call releases nothing and starts
+        # nothing. Reading the record decides which case this call is in.
+        if held is None:
+            return None    # no held scope: this poll releases nothing
+        try:
+            job = _fetch_media_job(target, job_id)
+        except Exception:  # noqa: BLE001 — state unknown -> escalate
+            return unresolved(held.get("model_id") or "")
+        if not _media_job_finished(job):
+            return None    # still running: this poll releases nothing
+        try:
+            plan = broker_stack(target)["orchestrator"].restore_plan(
+                held["scope_id"])
+        except Exception:  # noqa: BLE001 — uncertainty -> escalate
+            return unresolved(held.get("model_id") or "")
+        if plan is None:
+            return None
+        steps = [step for step in plan.load_steps
+                 if step.engine in _PROCESS_ENGINE_PORTS]
+        if not steps:
+            return None
+        return {"model_id": steps[0].model_id, "engine": steps[0].engine,
+                "port": _PROCESS_ENGINE_PORTS.get(steps[0].engine,
+                                                  "its default"),
+                "target": target.id,
+                "models": [step.model_id for step in steps]}
+    # Submit path: predict the claim by what is resident now (fail-safe — a
+    # resident process-engine model could be evicted and re-started on the
+    # lane's release).
+    if not str(args.get("model") or "").strip():
+        return None    # needs_args: the handler submits nothing
+    try:
+        residents = broker_stack(target)["ledger"].residents(target.id)
+    except Exception:  # noqa: BLE001 — uncertainty -> escalate (fail-safe)
+        return unresolved(str(args.get("model") or ""))
+    process = [rec for rec in residents
+               if rec.engine in _PROCESS_ENGINE_PORTS]
+    if not process:
+        return None    # release restores nothing that starts a process
+    rec = process[0]
+    return {"model_id": rec.model_id, "engine": rec.engine,
+            "port": _PROCESS_ENGINE_PORTS.get(rec.engine, "its default"),
+            "target": target.id,
+            "models": [r.model_id for r in process]}
+
+
 def _claim_entry(model_id: str = "", modality: str = ""):
     """What to claim: an explicit catalog model id, or a modality's default
     curated model (its first non-stub, non-catalog-marker entry)."""
@@ -2173,7 +2671,7 @@ def gpu_vram_used_gb() -> float:
     an honest row, never a guessed peak."""
     out = subprocess.run(
         _NVIDIA_SMI_USED, capture_output=True, text=True, timeout=10,
-        check=True).stdout
+        check=True, env=_minimal_env()).stdout
     total_mib = 0.0
     seen = False
     for line in out.splitlines():
@@ -2356,6 +2854,17 @@ def _media_job_finished(job: dict) -> bool:
     to end it (never guess completion)."""
     status = str((job or {}).get("status") or "").strip().lower()
     return status in _MEDIA_JOB_TERMINAL
+
+
+def _fetch_media_job(target, job_id: str) -> dict:
+    """GET one media job record from a target's gateway. Seam: tests replace
+    this so no network call happens. Raises on a transport failure — the
+    caller turns it into an honest error row (the poll path) or a fail-safe
+    escalation (the approval gate), never a raise across a tool boundary."""
+    req = urllib.request.Request(
+        f"{root_url(target.base_url)}/jobs/{job_id}")
+    with urllib.request.urlopen(req, timeout=30.0) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
 
 
 def _media_stand_in(modality: str):

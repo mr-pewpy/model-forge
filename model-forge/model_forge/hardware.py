@@ -37,12 +37,29 @@ _AMD_PCI_VENDOR = "0x1002"
 _ROCM_TOTAL_RE = re.compile(r"GPU\[(\d+)\]\s*:.*VRAM Total Memory \(B\):\s*(\d+)")
 
 
+def _minimal_env() -> dict:
+    """The smallest environment a vendor probe child needs: PATH, HOME, LANG
+    and TMPDIR only. Nothing else from the parent is forwarded — no provider
+    keys or tokens reach nvidia-smi / rocm-smi (the same confinement
+    policy the installer and engine-server children get). hardware.py cannot
+    import tools.py (tools imports hardware, so that would cycle), so this
+    is the local copy — the same import-direction reason broker.py documents
+    for its own copy."""
+    return {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME") or os.path.expanduser("~"),
+        "LANG": os.environ.get("LANG", "C"),
+        "TMPDIR": os.environ.get("TMPDIR") or "/tmp",
+    }
+
+
 def _probe_nvidia() -> tuple[dict, ...]:
     if shutil.which("nvidia-smi") is None:
         return ()
     try:
         out = subprocess.run(
-            _NVIDIA_SMI, capture_output=True, text=True, timeout=10, check=True
+            _NVIDIA_SMI, capture_output=True, text=True, timeout=10,
+            check=True, env=_minimal_env()
         ).stdout
     except (subprocess.SubprocessError, OSError):
         return ()
@@ -66,7 +83,8 @@ def _probe_amd_rocm() -> tuple[dict, ...]:
         return ()
     try:
         out = subprocess.run(
-            _ROCM_SMI_VRAM, capture_output=True, text=True, timeout=10, check=True
+            _ROCM_SMI_VRAM, capture_output=True, text=True, timeout=10,
+            check=True, env=_minimal_env()
         ).stdout
     except (subprocess.SubprocessError, OSError):
         return ()

@@ -565,16 +565,30 @@ def test_install_handler_multi_file_lists_components(tmp_path, monkeypatch):
 
 # --- engine provisioning: engine_install plans + discovery integration ------
 
+_OLLAMA_SHA = "25f64b810b947145095956533e1bdf56eacea2673c55a7e586be4515fc882c9f"
+_STRATA_SHA = "1fcfbab133880249b7a6eaefb643f25b29a9b8f45624d2d8673e35948c329eda"
+
+
 def test_engine_install_plan_vendor_commands():
     from model_forge.tools import engine_install_plan
     plan = engine_install_plan("ollama")
     assert plan["ok"] is True and plan["action"] == "vendor_installer"
     assert plan["vendor"] == "Ollama" and plan["executes"] is True
-    assert plan["command"] == "curl -fsSL https://ollama.com/install.sh | sh"
+    # the pinned pipeline names the download + the SHA-256 verified in Python
+    assert "https://ollama.com/install.sh" in plan["pipeline"]
+    assert _OLLAMA_SHA in plan["pipeline"]
+    assert "latest" not in plan["pipeline"] and "latest" not in plan["command"]
+    # the shown command is the literal staged command the runner runs — no
+    # fake sha256sum pipeline in the display
+    assert "sha256sum" not in plan["pipeline"] and "sha256sum" not in plan["command"]
+    assert plan["command"].startswith("sh ") and "install.sh" in plan["command"]
+    assert plan["pinned"] == {"url": "https://ollama.com/install.sh",
+                              "sha256": _OLLAMA_SHA}
     maya = engine_install_plan("maya")
-    assert maya["command"] == ("git clone https://github.com/mw00/project-maya "
-                               "&& cd project-maya && ./setup.sh")
-    assert any("git clone https://github.com/mw00/project-maya" in s
+    assert "git clone https://github.com/mw00/project-maya" in maya["pipeline"]
+    assert "56b5216ab4464ac41c26b1be32eb63b98de53d0a" in maya["pipeline"]
+    assert maya["command"].endswith("./setup.sh")
+    assert any("56b5216ab4464ac41c26b1be32eb63b98de53d0a" in s
                for s in maya["steps"])
     # engine ids are normalized; empty and unknown ids are refused honestly
     assert engine_install_plan(" Strata ")["engine"] == "strata"
@@ -584,22 +598,46 @@ def test_engine_install_plan_vendor_commands():
     assert missing["ok"] is False and missing["action"] == "needs_engine"
 
 
-def test_engine_install_commands_match_adapter_documented_installs(monkeypatch):
-    # the planner's commands are exactly the installs the adapters document
+def test_engine_install_commands_are_pinned_not_release_latest():
+    # what executes comes only from the pinned catalog: a fixed Strata release
+    # tag plus a SHA-256, and a fixed Maya commit — never a moving "latest"
+    # ref and never a model-supplied string.
+    from model_forge.tools import engine_install_plan
+    strata = engine_install_plan("strata")
+    assert ("https://github.com/Niko1221/Strata/releases/download/v0.2.15/"
+            "install.sh") in strata["pipeline"]
+    assert "latest" not in strata["pipeline"] and "latest" not in strata["command"]
+    assert _STRATA_SHA in strata["pipeline"]
+    assert strata["pinned"]["sha256"] == _STRATA_SHA
+    maya = engine_install_plan("maya")
+    assert "git clone https://github.com/mw00/project-maya" in maya["pipeline"]
+    assert "setup.sh" in maya["command"]
+    assert maya["pinned"]["commit"] == "56b5216ab4464ac41c26b1be32eb63b98de53d0a"
+
+
+def test_engine_status_strings_advertise_no_unpinned_install(monkeypatch):
+    """No engine adapter's status detail advertises an unpinned install: no
+    ``releases/latest`` ref and no unpinned clone — the strings point at the
+    pinned install path instead."""
     monkeypatch.setattr("model_forge.engines.strata.shutil.which",
                         lambda _: None)
     monkeypatch.setattr("model_forge.engines.strata.served_models",
                         lambda base_url="": [])
+    monkeypatch.setattr("model_forge.engines.strata.strata_fingerprint",
+                        lambda base_url="": False)
     monkeypatch.setattr("model_forge.engines.maya.catalog",
                         lambda base_url="": None)
     from model_forge.engines import maya, strata
-    from model_forge.tools import engine_install_plan
-    assert engine_install_plan("strata")["command"] in strata.detect("").detail
-    detail = maya.detect("").detail
-    assert "git clone https://github.com/mw00/project-maya" in detail
-    assert "setup.sh" in detail
-    assert engine_install_plan("maya")["command"].startswith(
-        "git clone https://github.com/mw00/project-maya")
+    details = [strata.detect("").detail, strata.detect("http://x").detail,
+               maya.detect("").detail, maya.detect("http://x").detail]
+    for detail in details:
+        assert "releases/latest" not in detail
+        assert " && ./setup.sh" not in detail          # no unpinned clone+run
+        assert "install.sh | sh" not in detail         # no pipe-to-shell
+    # and the pinned provenance is named instead
+    assert "1fcfbab133880249b7a6eaefb643f25b29a9b8f45624d2d8673e35948c329eda" \
+        in strata.detect("").detail
+    assert "56b5216ab4464ac41c26b1be32eb63b98de53d0a" in maya.detect("").detail
 
 
 def test_engine_install_llamacpp_guides_to_core_runtime():

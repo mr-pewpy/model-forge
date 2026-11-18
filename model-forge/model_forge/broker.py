@@ -754,10 +754,78 @@ class ProcessHandle(Protocol):
     def wait(self, timeout: float | None = None) -> int: ...
 
 
-def _spawn_process(argv) -> ProcessHandle:
-    """Default process runner for llama-server: the one real spawn seam.
-    A handle answers ``poll()`` / ``terminate()`` / ``wait(timeout=…)``."""
-    return subprocess.Popen(list(argv))
+# The environment keys an engine server may inherit beyond the four base
+# keys: forwarded only when the caller names them AND the parent has them.
+# HF_HOME lets vLLM/llama.cpp reuse a downloaded-weights cache; the
+# CUDA/HIP visibility keys pin which devices the server may use.
+_ENGINE_ENV_EXTRAS = ("HF_HOME", "CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES")
+
+
+def _minimal_engine_env(extras=_ENGINE_ENV_EXTRAS) -> dict:
+    """The smallest environment an engine server child needs: PATH, HOME,
+    LANG and TMPDIR, plus any caller-named engine extras (see
+    ``_ENGINE_ENV_EXTRAS``) that are actually present in the parent.
+
+    Nothing else from the parent is forwarded. Credentials are deliberately
+    excluded — no HF_TOKEN and no provider API keys reach the child: a model
+    pull goes through the pull path (pull.py), never through a spawned
+    server's environment. ``tools.py`` keeps its own installer-side copy of
+    this helper (the import direction is tools -> broker, so broker never
+    imports tools).
+    """
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME") or os.path.expanduser("~"),
+        "LANG": os.environ.get("LANG", "C"),
+        "TMPDIR": os.environ.get("TMPDIR") or "/tmp",
+    }
+    for key in extras or ():
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    return env
+
+
+# Flags that (re)bind a server's listening address. A caller-supplied one of
+# these in extra_args must resolve to loopback or the lifecycle refuses to
+# start: an engine server is loopback-only by policy.
+_BIND_FLAGS = ("--host", "--host-ip", "--listen", "--bind", "--bind-address")
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "ip6-localhost")
+
+
+def _non_loopback_bind(extra_args) -> str:
+    """The first caller-supplied bind flag in ``extra_args`` whose value does
+    not resolve to loopback, as a shown token (``--host 0.0.0.0``), or ``''``
+    when every bind flag is loopback or none is present.
+
+    Covers both ``--host=value`` and ``--host value`` spellings. A bind flag
+    with a missing value is treated as non-loopback (fail closed)."""
+    args = list(extra_args or ())
+    i = 0
+    while i < len(args):
+        token = str(args[i])
+        flag, sep, inline = token.partition("=")
+        if flag in _BIND_FLAGS:
+            if sep:
+                value = inline
+                shown = token
+            else:
+                value = str(args[i + 1]) if i + 1 < len(args) else ""
+                shown = f"{flag} {value}".strip()
+                i += 1
+            if value not in _LOOPBACK_HOSTS:
+                return shown
+        i += 1
+    return ""
+
+
+def _spawn_process(argv, env) -> ProcessHandle:
+    """Default process runner for llama-server / vLLM: the one real spawn
+    seam. The child gets exactly ``env`` — never the parent's environment, so
+    no Hermes provider keys or tokens leak into the server (see
+    ``_minimal_engine_env``). A handle answers ``poll()`` / ``terminate()`` /
+    ``wait(timeout=…)``."""
+    return subprocess.Popen(list(argv), env=dict(env))
 
 
 class LlamaCppServerLifecycle(EngineLifecycle):
@@ -772,12 +840,14 @@ class LlamaCppServerLifecycle(EngineLifecycle):
                  "warm-swap surface)")
 
     def __init__(self, binary="llama-server", port=8080, extra_args=(),
-                 runner=None, which=None):
+                 runner=None, which=None, env_extras=None):
         self._binary = binary
         self._port = port
         self._extra_args = tuple(extra_args)
         self._runner = runner or _spawn_process
         self._which = which or shutil.which
+        self._env_extras = tuple(
+            _ENGINE_ENV_EXTRAS if env_extras is None else env_extras)
         self._handle: ProcessHandle | None = None
         self._serving: str | None = None
 
@@ -793,11 +863,20 @@ class LlamaCppServerLifecycle(EngineLifecycle):
             return {**row, "reason": f"llama.cpp binary {self._binary!r} not "
                                      f"found on PATH — refusing to start "
                                      f"(fail-closed)"}
+        extras = list(self._extra_args if extra_args is None else extra_args)
+        hostile = _non_loopback_bind(extras)
+        if hostile:
+            return {**row, "reason": f"llama.cpp extra_args {hostile!r} would "
+                                     f"rebind the server away from loopback — "
+                                     f"refusing to start (fail-closed; the "
+                                     f"server binds 127.0.0.1 only)"}
+        bound_port = str(self._port if port is None else port)
         argv = [found, "-m", str(weights_path),
-                "--port", str(self._port if port is None else port)]
-        argv += list(self._extra_args if extra_args is None else extra_args)
+                "--host", "127.0.0.1", "--port", bound_port]
+        argv += extras
+        env = _minimal_engine_env(self._env_extras)
         try:
-            handle = self._runner(argv)
+            handle = self._runner(argv, env)
         except Exception as exc:  # noqa: BLE001 — honest row, never a raise
             return {**row, "reason": f"llama-server start failed: "
                                      f"{type(exc).__name__}: {exc}"}
@@ -806,7 +885,7 @@ class LlamaCppServerLifecycle(EngineLifecycle):
         return {"ok": True, "engine": self.engine_id, "action": "load",
                 "model_id": model_id, "argv": argv,
                 "reason": f"started llama-server for {model_id} on port "
-                          f"{argv[3]}"}
+                          f"{bound_port} (binds 127.0.0.1 only)"}
 
     def release(self, model_id) -> dict:
         if self._handle is None:
@@ -972,13 +1051,15 @@ class VllmServerLifecycle(EngineLifecycle):
     LIFECYCLE = "process stop/start (engine sleep/wake is not used)"
 
     def __init__(self, binary="vllm", port=8000, extra_args=(),
-                 runner=None, which=None, exists=None):
+                 runner=None, which=None, exists=None, env_extras=None):
         self._binary = binary
         self._port = port
         self._extra_args = tuple(extra_args)
         self._runner = runner or _spawn_process
         self._which = which or shutil.which
         self._exists = exists or os.path.exists
+        self._env_extras = tuple(
+            _ENGINE_ENV_EXTRAS if env_extras is None else env_extras)
         self._handle: ProcessHandle | None = None
         self._serving: str | None = None
 
@@ -1000,11 +1081,20 @@ class VllmServerLifecycle(EngineLifecycle):
             return {**row, "reason": f"vLLM binary {self._binary!r} not "
                                      f"found on PATH — refusing to start "
                                      f"(fail-closed)"}
+        extras = list(self._extra_args if extra_args is None else extra_args)
+        hostile = _non_loopback_bind(extras)
+        if hostile:
+            return {**row, "reason": f"vLLM extra_args {hostile!r} would "
+                                     f"rebind the server away from loopback — "
+                                     f"refusing to start (fail-closed; the "
+                                     f"server binds 127.0.0.1 only)"}
+        bound_port = str(self._port if port is None else port)
         argv = [found, "serve", serve_target,
-                "--port", str(self._port if port is None else port)]
-        argv += list(self._extra_args if extra_args is None else extra_args)
+                "--host", "127.0.0.1", "--port", bound_port]
+        argv += extras
+        env = _minimal_engine_env(self._env_extras)
         try:
-            handle = self._runner(argv)
+            handle = self._runner(argv, env)
         except Exception as exc:  # noqa: BLE001 — honest row, never a raise
             return {**row, "reason": f"vLLM server start failed: "
                                      f"{type(exc).__name__}: {exc}"}
@@ -1014,9 +1104,9 @@ class VllmServerLifecycle(EngineLifecycle):
                 "model_id": model_id, "argv": argv,
                 "lifecycle": self.LIFECYCLE,
                 "reason": f"started the vLLM server for {model_id} on port "
-                          f"{argv[4]} (process stop/start — engine sleep/wake "
-                          f"is not used; process restart is the reliable "
-                          f"path)"}
+                          f"{bound_port} (binds 127.0.0.1 only) (process "
+                          f"stop/start — engine sleep/wake is not used; "
+                          f"process restart is the reliable path)"}
 
     def release(self, model_id) -> dict:
         if self._handle is None:
@@ -1589,7 +1679,6 @@ class Orchestrator:
                               f"no claimed scope {scope_id!r} — nothing to "
                               f"release (fail-closed)", "", None)
         target_id = scope["target_id"]
-        restore = scope["restore"]
         # The scope's own models: what its claim plan loaded. Step-down is
         # scoped to those — releasing one live scope must never step down a
         # model another still-open scope brought in.
@@ -1619,14 +1708,19 @@ class Orchestrator:
         # actually loaded — a restored model keeps its weights path and load
         # estimate even when the evicted model was itself mid-scope (its
         # request lives in another open scope the planner cannot see).
-        requests = []
-        for rec in restore:
-            spec = self._load_specs.get((target_id, rec.model_id), {})
-            requests.append(LoadRequest(
-                model_id=rec.model_id, engine=rec.engine, lane=rec.lane,
-                modality="restore", weights_path=spec.get("weights_path"),
-                estimated_s=spec.get("estimated_s")))
-        plan = self._planner.plan_load_many(target_id, requests)
+        #
+        # This release and the approval gate share the SAME construction code
+        # (``_restore_requests`` / ``restore_plan``), so both describe the
+        # restore the same way. They are still two SEPARATE evaluations over
+        # live ledger state: a concurrent claim that evicts a restored model
+        # in the window between the gate's inspection and this handler makes
+        # this recomputed plan start a server the gate did not see. That
+        # window is a known limit of pre-call gating (docs/deferred-work.md):
+        # it needs an interleaved concurrent state change, the restore set is
+        # fixed at claim time to models resident then (never model-chosen),
+        # and any started server binds 127.0.0.1 only.
+        plan = self.restore_plan(scope_id) or LoadPlan(
+            target_id, True, "nothing to restore", (), ())
         r2 = self._run_plan(plan, key=scope_id, scope_id=scope_id)
         if r2["ok"]:
             self._scopes.pop(scope_id, None)
@@ -1636,6 +1730,37 @@ class Orchestrator:
                 "progress": r2["progress"],
                 "reason": (r2["reason"] if r2["ok"]
                            else r2.get("reason", plan.reason))}
+
+    def _restore_requests(self, target_id, restore):
+        """LoadRequests to restore a scope's claim-time residents, carrying
+        the weights path and load estimate each model actually loaded with.
+        Shared by ``release`` and ``restore_plan`` so the two can never
+        diverge."""
+        requests = []
+        for rec in restore:
+            spec = self._load_specs.get((target_id, rec.model_id), {})
+            requests.append(LoadRequest(
+                model_id=rec.model_id, engine=rec.engine, lane=rec.lane,
+                modality="restore", weights_path=spec.get("weights_path"),
+                estimated_s=spec.get("estimated_s")))
+        return requests
+
+    def restore_plan(self, scope_id):
+        """What releasing ``scope_id`` WOULD load — the phase-2 restore plan,
+        computed WITHOUT executing anything (the planner is pure: nothing is
+        loaded, released or recorded).
+
+        ``None`` when the scope is unknown — a release of an unknown scope
+        fails closed and starts nothing, so there is nothing to inspect. The
+        returned plan's ``load_steps`` name the engines a release would
+        (re)start, so the approval gate can ask before a process-engine
+        server (llama.cpp, vLLM) is spawned."""
+        scope = self._scopes.get(scope_id)
+        if scope is None:
+            return None
+        target_id = scope["target_id"]
+        return self._planner.plan_load_many(
+            target_id, self._restore_requests(target_id, scope["restore"]))
 
     # -- pre-warm and progress --
 

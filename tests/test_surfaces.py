@@ -662,17 +662,31 @@ def test_readme_surface_parity_sections():
         assert "/model-forge" in text
 
 
-def test_surface_parity_swap_row_documents_no_gate_reason():
-    # The approval table documents swap as the same non-destructive class as
-    # claim/release, with the stated reason — verified against the handlers.
+def test_surface_parity_broker_server_start_rows_document_the_gate():
+    # The approval table documents that a claim / release / swap / media lane
+    # that would start or re-start a process-engine server rides the gate, and
+    # that a call which starts nothing needs none — verified against the
+    # handlers in tests/test_tools.py.
     doc = MATRIX_PATH.read_text()
     table = doc[doc.index("## Approval coverage"):]
-    swap_row = next(line for line in table.splitlines()
-                    if "`model_forge_broker` `swap`" in line)
-    assert "No gate" in swap_row
-    assert "moves only model weights" in swap_row
-    assert "same class as claim/release" in swap_row
-    assert "no data is destroyed" in swap_row
+
+    def row(marker):
+        return next(line for line in table.splitlines() if marker in line)
+
+    claim = row("`model_forge_broker` `claim`")
+    release = row("`model_forge_broker` `release`")
+    swap = row("`model_forge_broker` `swap`")
+    media = row("`model_forge_generate_media`")
+    for line in (claim, release, swap, media):
+        assert "model-forge:broker_server_start" in line
+        assert "starts a server process" in line or "re-start" in line
+    assert "already-resident model starts nothing" in claim
+    assert "restores nothing" in release and "already-resident" in release
+    assert "dry_run=true" in swap
+    # no row still claims an unconditional "No gate" reason for a server start
+    assert "No gate — documented reason" not in claim
+    assert "No gate — documented reason" not in release
+    assert "No gate — documented reason" not in swap
 
 
 def test_readme_names_hiccup_free_swaps():

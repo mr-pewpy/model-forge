@@ -29,6 +29,9 @@ from model_forge.broker import (
     ResidencyLedger,
     SWAP_HISTORY_LIMIT,
     VllmServerLifecycle,
+    _minimal_engine_env,
+    _non_loopback_bind,
+    _spawn_process,
     is_image_generation,
     loading_state,
 )
@@ -87,14 +90,16 @@ class FakeProcess:
 
 
 class FakeRunner:
-    """Injected process runner: records argv, returns one FakeProcess."""
+    """Injected process runner: records argv and env, returns one FakeProcess."""
 
     def __init__(self):
         self.argvs = []
+        self.envs = []
         self.proc = FakeProcess()
 
-    def __call__(self, argv):
+    def __call__(self, argv, env=None):
         self.argvs.append(list(argv))
+        self.envs.append(dict(env) if env is not None else None)
         return self.proc
 
 
@@ -288,7 +293,8 @@ def test_llamacpp_ensure_loaded_starts_process_with_argv():
     res = server.ensure_loaded("qwen", weights_path="/models/qwen.gguf")
     assert res["ok"] is True
     assert runner.argvs == [["/usr/bin/llama-server", "-m", "/models/qwen.gguf",
-                             "--port", "8080", "--threads", "4"]]
+                             "--host", "127.0.0.1", "--port", "8080",
+                             "--threads", "4"]]
     assert res["argv"] == runner.argvs[0]
 
 
@@ -454,7 +460,8 @@ def test_vllm_ensure_loaded_starts_process_with_argv():
     res = vllm.ensure_loaded("qwen", weights_path="/models/qwen")
     assert res["ok"] is True
     assert runner.argvs == [["/usr/bin/vllm", "serve", "/models/qwen",
-                             "--port", "8000", "--tensor-parallel-size", "2"]]
+                             "--host", "127.0.0.1", "--port", "8000",
+                             "--tensor-parallel-size", "2"]]
     assert res["argv"] == runner.argvs[0]
     # Process restart only — engine sleep/wake must NOT be used.
     assert "sleep/wake" in res["lifecycle"]
@@ -465,8 +472,8 @@ def test_vllm_ensure_loaded_starts_process_with_argv():
     res = vllm.ensure_loaded("meta/llama-3")
     assert res["ok"] is True
     assert runner.argvs[-1] == ["/usr/bin/vllm", "serve", "meta/llama-3",
-                                "--port", "8000", "--tensor-parallel-size",
-                                "2"]
+                                "--host", "127.0.0.1", "--port", "8000",
+                                "--tensor-parallel-size", "2"]
 
 
 def test_vllm_release_stops_the_process():
@@ -1346,7 +1353,8 @@ def test_image_generation_gesture_end_to_end_with_fake_seams():
                                      "stream": False, "keep_alive": 0}
     # the image model loaded as a process on the fake runner seam
     assert runner.argvs == [["/usr/bin/llama-server", "-m",
-                             "/models/image-x.safetensors", "--port", "8080"]]
+                             "/models/image-x.safetensors", "--host",
+                             "127.0.0.1", "--port", "8080"]]
     # honest progress states through the swap
     assert [r["state"] for r in orch.history("shot")] == [
         "queued", "loading (~40s)", "ready"]
@@ -1484,7 +1492,7 @@ def test_comfyui_vllm_and_maya_run_as_orchestrator_plan_steps():
     assert r2["ok"] is True
     assert r2["plan"].load_steps[0].engine == "vllm"
     assert runner.argvs == [["/usr/bin/vllm", "serve", "/models/qwen",
-                             "--port", "8000"]]
+                             "--host", "127.0.0.1", "--port", "8000"]]
 
     r3 = orch.prewarm("local", LoadRequest(
         model_id="glm-flash", engine="maya", lane="chat"))
@@ -1858,7 +1866,8 @@ def test_swap_warm_path_labels_warm_engine_vs_process_restart():
     assert row2["warm_path"].startswith("process restart")
     assert "no warm-swap surface" in row2["warm_path"]
     assert runner.argvs == [["/usr/bin/llama-server", "-m",
-                             "/models/image-y.gguf", "--port", "8080"]]
+                             "/models/image-y.gguf", "--host", "127.0.0.1",
+                             "--port", "8080"]]
     # the applied warm path is what lands in the measured history record
     assert ledger2.swap_history()[-1]["warm_path"] == row2["warm_path"]
 
@@ -1915,3 +1924,177 @@ def test_swap_ready_probe_failure_is_an_honest_row():
     assert row["timings"]["ready_seconds"] == 1.0
     assert row["phases"]["ready"]["ok"] is False
     assert ledger.swap_history()[-1]["ok"] is False
+
+
+# --- engine-server confinement: loopback bind + minimal child env -----------
+
+def test_llamacpp_server_binds_loopback_and_gets_minimal_env(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
+    monkeypatch.setenv("HF_TOKEN", "hf-secret")
+    monkeypatch.setenv("HF_HOME", "/srv/hf-cache")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    runner = FakeRunner()
+    server = LlamaCppServerLifecycle(
+        binary="llama-server", port=8080, extra_args=("--threads", "4"),
+        runner=runner, which=lambda name: f"/usr/bin/{name}")
+    res = server.ensure_loaded("qwen", weights_path="/models/qwen.gguf")
+    assert res["ok"] is True
+    # the bind is explicit and loopback-only, ahead of the extra args
+    assert runner.argvs[0] == ["/usr/bin/llama-server", "-m",
+                               "/models/qwen.gguf", "--host", "127.0.0.1",
+                               "--port", "8080", "--threads", "4"]
+    assert res["reason"].endswith("(binds 127.0.0.1 only)")
+    # the child sees exactly the minimal env — no provider keys, no tokens
+    env = runner.envs[0]
+    assert set(env) == {"PATH", "HOME", "LANG", "TMPDIR", "HF_HOME",
+                        "CUDA_VISIBLE_DEVICES"}
+    assert "OPENAI_API_KEY" not in env and "HF_TOKEN" not in env
+    assert env["HF_HOME"] == "/srv/hf-cache"
+    assert env["CUDA_VISIBLE_DEVICES"] == "0"
+
+
+def test_vllm_server_binds_loopback_and_gets_minimal_env(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "provider-secret")
+    monkeypatch.setenv("HF_TOKEN", "hf-secret")
+    monkeypatch.delenv("HF_HOME", raising=False)
+    runner = FakeRunner()
+    vllm = VllmServerLifecycle(
+        binary="vllm", port=8000, extra_args=("--tensor-parallel-size", "2"),
+        runner=runner, which=lambda name: f"/usr/bin/{name}",
+        exists=lambda p: True)
+    res = vllm.ensure_loaded("qwen", weights_path="/models/qwen")
+    assert res["ok"] is True
+    assert runner.argvs[0] == ["/usr/bin/vllm", "serve", "/models/qwen",
+                               "--host", "127.0.0.1", "--port", "8000",
+                               "--tensor-parallel-size", "2"]
+    assert res["reason"].startswith("started the vLLM server")
+    assert "(binds 127.0.0.1 only)" in res["reason"]
+    env = runner.envs[0]
+    assert set(env) == {"PATH", "HOME", "LANG", "TMPDIR"}
+    assert "ANTHROPIC_API_KEY" not in env and "HF_TOKEN" not in env
+
+
+def test_minimal_engine_env_forwards_only_named_extras(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "hf-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "1")
+    monkeypatch.delenv("HF_HOME", raising=False)
+    env = _minimal_engine_env()
+    assert set(env) == {"PATH", "HOME", "LANG", "TMPDIR",
+                        "HIP_VISIBLE_DEVICES"}
+    assert env["HIP_VISIBLE_DEVICES"] == "1"
+    # a caller that names no extras gets the four base keys only
+    assert set(_minimal_engine_env(extras=())) == {"PATH", "HOME", "LANG",
+                                                   "TMPDIR"}
+
+
+def test_llamacpp_hostile_extra_args_rebind_fails_closed():
+    runner = FakeRunner()
+    server = LlamaCppServerLifecycle(
+        extra_args=("--host", "0.0.0.0"), runner=runner,
+        which=lambda name: f"/usr/bin/{name}")
+    res = server.ensure_loaded("qwen", weights_path="/models/qwen.gguf")
+    assert res["ok"] is False
+    assert "fail-closed" in res["reason"]
+    assert "127.0.0.1 only" in res["reason"]
+    assert runner.argvs == []          # nothing was spawned
+    # per-call extra_args are inspected too, not just the constructor's
+    res = server.ensure_loaded("qwen", weights_path="/models/qwen.gguf",
+                               extra_args=("--host=0.0.0.0",))
+    assert res["ok"] is False and runner.argvs == []
+
+
+def test_vllm_hostile_extra_args_rebind_fails_closed():
+    runner = FakeRunner()
+    vllm = VllmServerLifecycle(runner=runner,
+                               which=lambda name: f"/usr/bin/{name}",
+                               exists=lambda p: True)
+    res = vllm.ensure_loaded("qwen", weights_path="/models/qwen",
+                             extra_args=("--listen", "::"))
+    assert res["ok"] is False
+    assert "fail-closed" in res["reason"]
+    assert "127.0.0.1 only" in res["reason"]
+    assert runner.argvs == []
+
+
+def test_loopback_extra_args_are_allowed():
+    # an explicit loopback bind never weakens the enforced loopback bind
+    assert _non_loopback_bind(("--host", "127.0.0.1")) == ""
+    assert _non_loopback_bind(("--host=localhost",)) == ""
+    assert _non_loopback_bind(("--host", "::1")) == ""
+    assert _non_loopback_bind(("--threads", "4")) == ""
+    assert _non_loopback_bind(("--host", "0.0.0.0")) == "--host 0.0.0.0"
+    assert _non_loopback_bind(("--host=::",)) == "--host=::"
+    assert _non_loopback_bind(("--host",)) == "--host"   # missing value
+
+
+def test_spawn_process_passes_env_to_popen(monkeypatch):
+    seen = {}
+
+    class _Popen:
+        def __init__(self, argv, env=None):
+            seen["argv"] = argv
+            seen["env"] = env
+
+    import model_forge.broker as broker_mod
+    monkeypatch.setattr(broker_mod.subprocess, "Popen", _Popen)
+    _spawn_process(["/usr/bin/llama-server", "--host", "127.0.0.1"],
+                   {"PATH": "/usr/bin"})
+    assert seen["argv"] == ["/usr/bin/llama-server", "--host", "127.0.0.1"]
+    assert seen["env"] == {"PATH": "/usr/bin"}
+
+
+# --- orchestrator.restore_plan: what a release WOULD load, without running --
+
+def test_restore_plan_names_the_process_load_without_spawning():
+    """The release's phase-2 restore plan can be inspected without executing:
+    a scope whose claim-time resident is a non-resident process-engine model
+    yields a llama.cpp load step — the exact signal the approval gate uses —
+    while the fake runner seam is never touched."""
+    clock = FakeClock()
+    ledger = ResidencyLedger(bookings={"chat-a": 18.0, "image-x": 20.0},
+                             clock=clock)
+    ledger.set_budget("local", 24.0)
+    runner = FakeRunner()
+    chat = LlamaCppServerLifecycle(runner=runner,
+                                   which=lambda name: f"/usr/bin/{name}")
+    image = RecordingLifecycle("comfyui")
+    orch = Orchestrator(ledger, EvictionPlanner(ledger, clock=clock),
+                        {"llamacpp": chat, "comfyui": image}, clock=clock)
+
+    assert orch.claim("s1", "local", LoadRequest(
+        "chat-a", "llamacpp", lane="chat",
+        weights_path="/models/chat-a.gguf", estimated_s=30.0))["ok"]
+    assert orch.claim("s2", "local", LoadRequest(
+        "image-x", "comfyui", lane="image", modality="image"))["ok"]
+    assert not ledger.is_resident("local", "chat-a")
+
+    before = len(runner.argvs)
+    plan = orch.restore_plan("s2")
+    assert plan is not None and plan.ok is True
+    assert [s.engine for s in plan.load_steps] == ["llamacpp"]
+    assert plan.load_steps[0].model_id == "chat-a"
+    assert plan.load_steps[0].weights_path == "/models/chat-a.gguf"
+    assert len(runner.argvs) == before        # planning spawned nothing
+    # an unknown scope has nothing to restore
+    assert orch.restore_plan("never-claimed") is None
+
+
+def test_restore_plan_is_none_for_an_http_only_restore():
+    clock = FakeClock()
+    ledger = ResidencyLedger(bookings={"chat-b": 6.0, "image-x": 20.0},
+                             clock=clock)
+    ledger.set_budget("local", 24.0)
+    http = FakeHttp()
+    chat = OllamaLifecycle(http=http)
+    image = RecordingLifecycle("comfyui")
+    orch = Orchestrator(ledger, EvictionPlanner(ledger, clock=clock),
+                        {"ollama": chat, "comfyui": image}, clock=clock)
+    assert orch.claim("s1", "local",
+                      LoadRequest("chat-b", "ollama", lane="chat"))["ok"]
+    assert orch.claim("s2", "local", LoadRequest(
+        "image-x", "comfyui", lane="image", modality="image"))["ok"]
+    assert not ledger.is_resident("local", "chat-b")
+    plan = orch.restore_plan("s2")
+    assert plan is not None
+    assert [s.engine for s in plan.load_steps] == ["ollama"]  # HTTP, no process
