@@ -808,3 +808,51 @@ only); no secrets printed; **no git commit**. Artifacts left in place:
 in-container backup `update-comfyui.sh.bak-pre-syntax-fix`,
 `/data/broker/comfy/custom_nodes/mf_video_bucket_fix.py` (+ scratch copy),
 `/data/broker/comfy/output/video/weightsbroker_h3_00011–00014_.mp4`.
+
+---
+
+## 12. Shim retirement — fixed collector proven live (2026-11-20, live on 192.168.1.62)
+
+**Model:** xiaomi/mimo-v2.6-pro
+**Scope:** retire the ComfyUI-side `mf_video_bucket_fix` shim (§11.5) and prove the
+redeployed facade's fixed output collector (`engines/comfyui.py`: video collection now
+scans the history `images` bucket for `metadata.kind == "video"` items) collects video
+outputs without it. **Result: ✅ PASS — one real `gen/h3-t2v` completed with exactly one
+real mp4 asset, shim retired, no rollback.**
+
+- **Shim retired (kept as the rollback):** `/data/broker/comfy/custom_nodes/mf_video_bucket_fix.py`
+  → `mf_video_bucket_fix.py.bak-retired-20261120` (rename 14:26:05Z; 2113 B, md5
+  `fedd0a666e308f405fa5d88ad72094f9`, contents untouched). Loader takes effect at the
+  next ComfyUI start — which was the h3 job's own boot (the dance starts
+  `weights-broker-comfyui-1`), so the run below was the first shim-free boot.
+- **h3 job `befe8932bd7f`** (`gen/h3-t2v`, `{"prompt":"a red ball bouncing on a wooden
+  floor","seconds":5,"_timeout":1800}`): submit 14:26:27Z → `completed` 14:42:15Z, wall
+  **15m48s** (ComfyUI `Prompt executed in 00:14:35`, sampling 20/20 steps @ ~40 s/it).
+  `GET /v1/videos/{id}` → `{"status":"completed","data":[{"url":"http://192.168.1.62:8080/assets/befe8932bd7f/weightsbroker_h3_00015_.mp4"}]}`
+  — exactly **one** data item. Asset `HTTP 200`, `Content-Type: video/mp4`,
+  `Content-Length: 1720304`, `ftyp` magic at offset 4; `GET /v1/videos/{id}/content`
+  byte-identical to the asset (sha256 `ddc4f3b9dddf5ba38c651f7521b13758b9a95c38def1a46fbbd68a4b2e307c67`).
+  Job row `status:"done"` with `assets` list length **1** (no duplicated assets); exactly
+  one new output file `…/output/video/weightsbroker_h3_00015_.mp4` (1720304 B). The
+  collector found the video-kind `images`-bucket item with no shim — the §11.5 fix is
+  effective.
+- **Boot clean (shim not loaded):** the job's boot (container start 14:26:29Z) imported
+  only `websocket_image_save.py`; the boot's own `Import times` block in
+  `/var/log/supervisor/comfyui.log` lists that single module and there are **no
+  IMPORT FAILED** lines in the current boot (the file's only `(IMPORT FAILED)` line and
+  the `Skip … lack of NODE_CLASS_MAPPINGS` warning are old shim-era boots, lines
+  34605/34609). **Pitfall:** raw `docker logs weights-broker-comfyui-1` is misleading —
+  the ai-dock relay tails the persistent `/var/log/supervisor/*.log` and **replays** old
+  content into the container log at boot (blocks timestamped 14:26:34Z listing
+  `mf_video_bucket_fix.py` are stale pre-rename lines, flushed under new timestamps);
+  additionally the custom-node loader skips any entry whose extension isn't `.py`
+  (`nodes.py` `init_external_custom_nodes`), so the `.bak` can never be imported. Check
+  the last `Import times` block of the supervisor log, not a raw log grep.
+- **End state (verified 14:44Z):** `vllm-server` **Up, healthy** (restored by the idle
+  release), `weights-broker-comfyui-1` **Exited(143)**, `gluetun` untouched (Up 7 days,
+  healthy), `weights-broker` stopped by design, `GET /health` → `{"llm":true,"comfy_args":"novram-ok","ok":true}`,
+  trivial chat `POST /v1/chat/completions` → **200** with a real completion
+  (`Qwen/Qwen3.8-27B-FP8`). Constraints held: no `docker rm`/prune, no manual
+  stop/restart of mf-facade/vllm-server/gluetun, no secrets printed, **no git commit**.
+  Rollback if ever needed: rename `mf_video_bucket_fix.py.bak-retired-20261120` back to
+  `mf_video_bucket_fix.py` (not needed — the collector fix works).
