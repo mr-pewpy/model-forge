@@ -2270,7 +2270,8 @@ class Orchestrator:
                 }
         return result
 
-    def release(self, scope_id, *, restore=True) -> dict:
+    def release(self, scope_id, *, restore=True, approved_restore=None,
+                gated_engines=()) -> dict:
         """Release a claimed scope.
 
         With ``restore=True`` (the default) the scope's own models are stepped
@@ -2282,7 +2283,21 @@ class Orchestrator:
         are NOT restored — the claim's target stays resident. This is the
         chat path's release: the waiter owns the wake, so after forwarding the
         request the LLM lane stays up (resident) until a gen entry evicts it,
-        instead of being stopped and immediately re-started."""
+        instead of being stopped and immediately re-started.
+
+        ``approved_restore`` (A20) is the exact model-id set the
+        human-approval gate inspected for this release, recorded by the
+        pre-call hook. When provided, the handler RE-VERIFIES its recomputed
+        restore plan against that set and fails closed — the restore is
+        refused, nothing is loaded — if the plan would (re)start a gated
+        engine server (``gated_engines``: the process-based engines whose
+        load spawns a server) for a model the gate never saw. This consumes
+        the gate's decision instead of re-deriving it, closing the pre-call
+        TOCTOU window where a concurrent claim/eviction between the gate's
+        inspection and this handler could grow the restore plan (A20).
+        ``approved_restore=None`` (programmatic use, no gate in the path)
+        keeps the pre-A20 behavior.
+        """
         with self._scopes_lock:
             scope = self._scopes.get(scope_id)
         if scope is None:
@@ -2340,16 +2355,30 @@ class Orchestrator:
         #
         # This release and the approval gate share the SAME construction code
         # (``_restore_requests`` / ``restore_plan``), so both describe the
-        # restore the same way. They are still two SEPARATE evaluations over
-        # live ledger state: a concurrent claim that evicts a restored model
-        # in the window between the gate's inspection and this handler makes
-        # this recomputed plan start a server the gate did not see. That
-        # window is a known limit of pre-call gating (docs/deferred-work.md):
-        # it needs an interleaved concurrent state change, the restore set is
-        # fixed at claim time to models resident then (never model-chosen),
-        # and any started server binds 127.0.0.1 only.
+        # restore the same way. A20 closes the remaining pre-call TOCTOU: the
+        # recomputed plan is re-verified against the EXACT set the gate
+        # approved (``approved_restore``) before anything loads — a plan that
+        # grew (a concurrent claim/eviction in the gate-to-handler window)
+        # is refused, not silently executed.
         plan = self.restore_plan(scope_id) or LoadPlan(
             target_id, True, "nothing to restore", (), ())
+        if approved_restore is not None:
+            approved = set(approved_restore)
+            gate_engines = set(gated_engines)
+            unapproved = sorted(
+                {s.model_id for s in plan.load_steps
+                 if s.engine in gate_engines and s.model_id not in approved})
+            if unapproved:
+                return self._fail(
+                    scope_id, scope_id,
+                    "the restore plan changed after the approval gate "
+                    f"inspected it — the recomputed restore would (re)start "
+                    f"a server for {unapproved}, which the gate never saw; "
+                    "the restore is refused and nothing was loaded "
+                    "(fail-closed). The scope's own models were already "
+                    "stepped down; re-run the release to approve the new "
+                    "restore plan",
+                    target_id, plan)
         r2 = self._run_plan(plan, key=scope_id, scope_id=scope_id)
         if r2["ok"]:
             with self._scopes_lock:

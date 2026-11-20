@@ -80,12 +80,29 @@ TARGET_ADD = {
     "description": (
         "Register a compute target: a machine with GPUs where inference can "
         "run — this machine, a remote server, a rented cloud GPU "
-        "box. Persists so future sessions know about it. Use when the user "
-        "says their GPU lives somewhere else or wants to add a server."
+        "box. Persists so future sessions know about it. Also manages "
+        "registered targets: 'preview' probes a candidate address read-only "
+        "BEFORE any approval prompt (guided pointing), 'edit' corrects a "
+        "registration, 'remove' forgets one, 'retest' re-probes it. Writes "
+        "(add/edit/remove) ride the human-approval gate and fail closed on "
+        "denial. Use when the user says their GPU lives somewhere else, "
+        "wants to add a server, fix a wrong address, or drop one."
     ),
     "parameters": {
         "type": "object",
         "properties": {
+            "action": {
+                "type": "string",
+                "description": (
+                    "'add' (default; registers — approval-gated), "
+                    "'preview' (read-only probe of a candidate before "
+                    "registering), 'edit' (approval-gated update of a "
+                    "registered target), 'remove' (approval-gated removal; "
+                    "the local target is permanent), 'retest' (read-only "
+                    "re-probe)."
+                ),
+                "enum": ["add", "preview", "edit", "remove", "retest"],
+            },
             "id": {
                 "type": "string",
                 "description": "Short unique id, e.g. 'gpu-box' or 'lambda-a100'.",
@@ -105,11 +122,31 @@ TARGET_ADD = {
             },
             "vram_gb": {
                 "type": "number",
-                "description": "Total GPU VRAM on that machine (for fit verdicts).",
+                "description": (
+                    "Total GPU VRAM on that machine (for fit verdicts). "
+                    "Pass the value action='preview' suggests to confirm it."
+                ),
             },
             "ram_gb": {
                 "type": "number",
-                "description": "System RAM on that machine (for fit verdicts).",
+                "description": (
+                    "System RAM on that machine (for fit verdicts). Pass the "
+                    "value action='preview' suggests to confirm it."
+                ),
+            },
+            "vram_source": {
+                "type": "string",
+                "description": (
+                    "Budget provenance: 'declared' (user typed it, default) "
+                    "or 'suggested' (confirming the read-only value the "
+                    "preview probe reported). Labeled in every listing."
+                ),
+                "enum": ["declared", "suggested", "detected"],
+            },
+            "ram_source": {
+                "type": "string",
+                "description": "Same as vram_source, for the RAM budget.",
+                "enum": ["declared", "suggested", "detected"],
             },
             "note": {
                 "type": "string",

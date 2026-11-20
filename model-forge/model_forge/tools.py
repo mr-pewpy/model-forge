@@ -39,7 +39,9 @@ from .registry import (
     MODALITIES, MODALITY_LABELS, PHANTOM_ENGINE_NOTE, PHANTOM_ENGINES,
     ModelEntry, fit_report, fit_verdict, models_for,
 )
-from .targets import ComputeTarget, add_target, get_target, load_targets
+from .targets import (SOURCE_DECLARED, ComputeTarget, add_target, budget_label,
+                      get_target, load_targets, remove_target,
+                      update_target, validate_target_fields)
 
 _CHAT_MODALITIES = ("chat", "vision")
 # model_forge_generate_media joins a model-supplied job id into a /jobs/ URL
@@ -467,6 +469,49 @@ def policy_hook(tool_name: str, args: dict | None = None, task_id: str = "",
             "rule_key": "model-forge:storage_delete",
         }
     if tool_name == "model_forge_target_add":
+        action = str(args.get("action") or "add").strip() or "add"
+        if action in ("preview", "retest"):
+            return None    # read-only probes: no gate, no write
+        if action == "remove":
+            tid = str(args.get("id") or "")
+            try:
+                row = get_target(tid)
+                current = (_dump(_target_registration_row(row))
+                           if row is not None else "")
+            except Exception:  # noqa: BLE001 — uncertainty -> escalate text
+                current = ""
+            return {
+                "action": "approve",
+                "message": (
+                    "Model Forge wants to REMOVE a registered compute "
+                    "target. Engine probes and model fit no longer cover "
+                    "this machine; nothing on it is touched or deleted:\n"
+                    f"  id: {args.get('id')}\n"
+                    + (f"  registration: {current}\n" if current else "") +
+                    "Removing only forgets the registration. Approve to "
+                    "remove it; denying or letting this prompt time out "
+                    "changes nothing."),
+                "rule_key": "model-forge:target_remove",
+            }
+        if action == "edit":
+            tid = str(args.get("id") or "")
+            try:
+                current = get_target(tid)
+                before = (_target_registration_row(current)
+                          if current is not None else "(unknown target)")
+            except Exception:  # noqa: BLE001 — uncertainty -> escalate text
+                before = "(could not read the current registration)"
+            return {
+                "action": "approve",
+                "message": (
+                    "Model Forge wants to EDIT a registered compute target. "
+                    "Engine probes, media jobs (including image data) and "
+                    "downloads may then go to the changed address:\n"
+                    f"  id: {args.get('id')}\n"
+                    f"  before: {before}\n"
+                    f"  changes: {json.dumps({k: v for k, v in args.items() if k not in ('action', 'id')})}"),
+                "rule_key": "model-forge:target_edit",
+            }
         return {
             "action": "approve",
             "message": (
@@ -1345,6 +1390,12 @@ def _target_rows(targets) -> list[dict]:
             "label": t.label,
             "kind": t.kind,
             "base_url": t.base_url,
+            "budgets": {
+                "vram_gb": t.vram_gb,
+                "ram_gb": t.ram_gb,
+                "vram_source": budget_label(t.vram_source, t.vram_gb),
+                "ram_source": budget_label(t.ram_source, t.ram_gb),
+            },
             "hardware": {
                 "platform": hw.platform,
                 "gpus": list(hw.gpus),
@@ -1482,28 +1533,264 @@ def _fresh_section(args: dict, entries: list[ModelEntry]) -> dict:
     }
 
 
+def _target_engine_rows(base_url: str) -> list[dict]:
+    """Engine probe rows for a target base URL (the preview/retest read path
+    — probes only, never writes)."""
+    return [
+        {
+            "id": e.id,
+            "name": e.display_name,
+            "available": e.available,
+            "endpoint": e.endpoint,
+            "detail": e.detail,
+            "modalities": list(e.modalities),
+            "models_loaded": list(e.models_loaded),
+            "source": getattr(e, "source", "") or "auto-detected",
+        }
+        for e in _detect(base_url)
+    ]
+
+
+def _suggest_budgets(base_url: str) -> dict:
+    """Read-only budget discovery (W1.3): ask the target's own engine APIs
+    what memory it reports, and SUGGEST values the user confirms. Never
+    writes a budget. One honest source today: ComfyUI /system_stats exposes
+    device VRAM totals and system RAM. Anything else — no suggestion, never a
+    guess."""
+    root = root_url(base_url)
+    if not root:
+        return {"suggested": False,
+                "note": "no base_url to probe — declare budgets yourself"}
+    try:
+        raw = _fetch_url(root + "/system_stats", timeout=5.0)
+        stats = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 — no data is an honest outcome
+        return {"suggested": False,
+                "note": ("no engine endpoint on this address reported memory "
+                         "totals read-only — declare vram_gb/ram_gb yourself "
+                         "(the values are labeled 'declared by the user')")}
+    out = {"suggested": True,
+           "source": "engine-reported (ComfyUI /system_stats)",
+           "note": ("suggested values — pass them back as vram_gb/ram_gb to "
+                    "confirm; nothing is written until you do")}
+    try:
+        vram = sum(float(d.get("vram_total") or 0)
+                   for d in stats.get("devices") or ())
+        if vram > 0:
+            out["vram_gb"] = round(vram / (1024 ** 3), 2)
+    except (TypeError, ValueError):
+        pass
+    try:
+        ram = float((stats.get("system") or {}).get("ram_total") or 0)
+        if ram > 0:
+            out["ram_gb"] = round(ram / (1024 ** 3), 2)
+    except (TypeError, ValueError):
+        pass
+    if "vram_gb" not in out and "ram_gb" not in out:
+        return {"suggested": False,
+                "note": ("the endpoint answered but reported no memory "
+                         "totals — declare vram_gb/ram_gb yourself")}
+    return out
+
+
+def _target_registration_row(t: ComputeTarget) -> dict:
+    """One target's registration row with honest budget provenance (W1.3)."""
+    return {
+        "id": t.id, "label": t.label, "kind": t.kind,
+        "base_url": t.base_url,
+        "vram_gb": t.vram_gb, "ram_gb": t.ram_gb, "note": t.note,
+        "vram_source": budget_label(t.vram_source, t.vram_gb),
+        "ram_source": budget_label(t.ram_source, t.ram_gb),
+    }
+
+
+def _target_preview(args: dict) -> dict:
+    """action=preview — the guided-pointing probe preview (W1.1): validate
+    the candidate address, probe it read-only, show exactly what answered and
+    what a registration would store, and suggest budgets the user confirms.
+    Writes nothing and never reaches the approval gate — the gate prompt
+    comes later, on the action=add call."""
+    tid = str(args.get("id", "")).strip()
+    base_url = str(args.get("base_url", "")).strip()
+    kind = str(args.get("kind", "")).strip() or "lan"
+    if not tid or tid == "local":
+        return {"ok": False, "action": "preview",
+                "error": "id is required and cannot be 'local'"}
+    err = validate_target_fields(base_url=base_url, kind=kind,
+                                 vram_gb=args.get("vram_gb"),
+                                 ram_gb=args.get("ram_gb"))
+    if err:
+        return {"ok": False, "action": "preview", "error": err}
+    existing = get_target(tid)
+    registration = {
+        "id": tid,
+        "label": str(args.get("label", "")).strip() or tid,
+        "base_url": base_url, "kind": kind,
+        "vram_gb": float(args.get("vram_gb") or 0.0),
+        "ram_gb": float(args.get("ram_gb") or 0.0),
+        "note": str(args.get("note", "")),
+    }
+    rows = _target_engine_rows(base_url)
+    answered = [r for r in rows if r["available"]]
+    return {
+        "ok": True,
+        "action": "preview",
+        "writes": False,
+        "registration": registration,
+        "already_registered": existing is not None,
+        "id_conflict_hint": (
+            "" if existing is None or existing.base_url == base_url else
+            f"id {tid!r} is already registered at {existing.base_url} — "
+            f"action='add' would replace it with {base_url}; prefer "
+            "action='edit' to correct the existing registration"),
+        "probe": {
+            "probed": base_url,
+            "engines_answered": [r["id"] for r in answered],
+            "engines": rows,
+            "detail": (f"{len(answered)} engine endpoint(s) answered at "
+                       f"{base_url}" if answered else
+                       f"no known engine answered at {base_url} yet — the "
+                       "registration is still valid (engines can start "
+                       "later; every probe degrades to a stated reason)"),
+        },
+        "suggested_budgets": _suggest_budgets(base_url),
+        "next": ("to register, re-run with action='add' and the same "
+                 "fields; the human-approval gate shows the exact address "
+                 "first, and denial registers nothing"),
+    }
+
+
+def _target_retest(args: dict) -> dict:
+    """action=retest — read-only re-probe of a REGISTERED target's engines
+    plus its recorded budgets (nothing is written)."""
+    tid = str(args.get("id", "")).strip()
+    t = get_target(tid or None) if tid else get_target(args.get("target"))
+    if t is None:
+        return {"ok": False, "action": "retest",
+                "error": f"unknown target: {tid or args.get('target')!r} "
+                         "(see model_forge_status)"}
+    rows = _target_engine_rows("" if t.kind == "local" else t.base_url)
+    return {
+        "ok": True, "action": "retest", "writes": False,
+        "target": _target_registration_row(t),
+        "engines_answered": [r["id"] for r in rows if r["available"]],
+        "engines": rows,
+        "detail": ("read-only probe — budgets are unchanged; edit them with "
+                   "action='edit' (the approval gate runs first)"),
+    }
+
+
+def _target_edit(args: dict) -> dict:
+    """action=edit — correct a REGISTERED target (W1.2). policy_hook routed
+    this exact call through the human-approval gate (rule_key
+    model-forge:target_edit) BEFORE this runs; denial or timeout blocks it,
+    so nothing changes without approval. The local target and
+    settings-declared rows are refused with the honest reason."""
+    tid = str(args.get("id", "")).strip()
+    if not tid:
+        return {"ok": False, "action": "edit", "error": "id is required"}
+    current = get_target(tid)
+    if current is None:
+        return {"ok": False, "action": "edit",
+                "error": f"unknown target: {tid!r} (see model_forge_status)"}
+    changes = {}
+    for key in ("label", "base_url", "kind", "note"):
+        if key in args and args.get(key) is not None:
+            changes[key] = str(args.get(key)).strip()
+    for key in ("vram_gb", "ram_gb"):
+        raw = args.get(key)
+        if raw is not None:
+            changes[key] = float(raw)
+            src_key = key.replace("_gb", "_source")
+            changes[src_key] = (str(args.get(src_key) or "").strip()
+                                or SOURCE_DECLARED)
+    updated, err = update_target(tid, changes)
+    if updated is None:
+        return {"ok": False, "action": "edit", "error": err}
+    with _BROKER_LOCK:
+        _BROKER_STACKS.pop(tid, None)   # rebuild with the new budgets
+    return {
+        "ok": True, "action": "edit", "edited": updated.id,
+        "before": _target_registration_row(current),
+        "after": _target_registration_row(updated),
+        "detail": ("updated — engines are re-probed everywhere targets are "
+                   "listed; if this target has a cached broker stack it is "
+                   "rebuilt with the new budgets"),
+    }
+
+
+def _target_remove(args: dict) -> dict:
+    """action=remove — drop a REGISTERED target (W1.2). policy_hook routed
+    this exact call through the human-approval gate (rule_key
+    model-forge:target_remove) BEFORE this runs; denial or timeout blocks it.
+    The local target is permanent; settings-declared rows are refused with
+    the honest reason (remove them in settings)."""
+    tid = str(args.get("id", "")).strip()
+    if not tid:
+        return {"ok": False, "action": "remove", "error": "id is required"}
+    ok, err = remove_target(tid)
+    if not ok:
+        return {"ok": False, "action": "remove", "error": err}
+    with _BROKER_LOCK:
+        _BROKER_STACKS.pop(tid, None)   # drop the removed target's stack
+    return {
+        "ok": True, "action": "remove", "removed": tid,
+        "targets": [{"id": x.id, "label": x.label, "kind": x.kind,
+                     "base_url": x.base_url} for x in load_targets()],
+        "detail": ("removed — nothing was probed, downloaded or deleted; "
+                   "this only forgets the registration"),
+    }
+
+
 def model_forge_target_add(args: dict | None = None, **kwargs) -> str:
-    """Register a compute target (this machine, a remote host, a cloud GPU box)."""
+    """Register a compute target (this machine, a remote host, a cloud GPU
+    box), and manage registered ones. Actions: 'add' (default; rides the
+    human-approval gate), 'preview' (read-only probe preview of a candidate —
+    W1.1), 'edit' and 'remove' (registered targets; both ride the approval
+    gate), 'retest' (read-only re-probe). Every write is fail-closed: denial
+    or timeout at the gate changes nothing."""
     args = args or {}
     try:
+        action = str(args.get("action") or "add").strip() or "add"
+        if action == "preview":
+            return _dump(_target_preview(args))
+        if action == "retest":
+            return _dump(_target_retest(args))
+        if action == "edit":
+            return _dump(_target_edit(args))
+        if action == "remove":
+            return _dump(_target_remove(args))
+        if action != "add":
+            return _dump({"error": f"unknown action: {action!r}; valid "
+                                   f"actions: ['add', 'preview', 'edit', "
+                                   f"'remove', 'retest']"})
         tid = str(args.get("id", "")).strip()
         label = str(args.get("label", "")).strip() or tid
         base_url = str(args.get("base_url", "")).strip()
         kind = str(args.get("kind", "")).strip() or "lan"
         if not tid or tid == "local":
             return _dump({"error": "id is required and cannot be 'local'"})
-        if not (base_url.startswith("http://") or base_url.startswith("https://")):
-            return _dump({"error": "base_url must be http(s), e.g. "
-                                   "http://gpu-box.example.com:8080"})
+        err = validate_target_fields(base_url=base_url, kind=kind,
+                                     vram_gb=args.get("vram_gb"),
+                                     ram_gb=args.get("ram_gb"))
+        if err:
+            return _dump({"error": err})
         t = ComputeTarget(
             id=tid, label=label, base_url=base_url, kind=kind,
             vram_gb=float(args.get("vram_gb") or 0.0),
             ram_gb=float(args.get("ram_gb") or 0.0),
             note=str(args.get("note", "")),
+            vram_source=(str(args.get("vram_source") or "").strip()
+                         or (SOURCE_DECLARED
+                             if args.get("vram_gb") is not None else "")),
+            ram_source=(str(args.get("ram_source") or "").strip()
+                        or (SOURCE_DECLARED
+                            if args.get("ram_gb") is not None else "")),
         )
         add_target(t)
         return _dump({
             "added": t.id,
+            "target": _target_registration_row(t),
             "targets": [
                 {"id": x.id, "label": x.label, "kind": x.kind,
                  "base_url": x.base_url}
@@ -2674,6 +2961,33 @@ _MEDIA_SCOPE_JOBS: dict = {}
 # Every open workflow scope (scope id -> record), for the read-only summary.
 _ACTIVE_SCOPES: dict = {}
 
+# A20: the exact restore set the human-approval gate saw for a pending
+# release — keyed by scope id, or "*{target_id}" for a media call's inline
+# release (its scope id is generated after the hook runs). Written by
+# policy_hook's *_would_start_server helpers the moment they inspect a
+# restore plan (or find none to inspect); consumed (popped) by the release
+# handler, which passes it to Orchestrator.release for re-verification
+# against the recomputed plan. Consume-on-read bounds memory and prevents
+# replay; a missing entry means no gate ran on this path and the handler
+# keeps its pre-A20 behavior.
+_APPROVED_RESTORES: dict = {}
+_APPROVED_RESTORES_LOCK = threading.Lock()
+
+
+def _record_approved_restore(key, model_ids) -> None:
+    with _APPROVED_RESTORES_LOCK:
+        _APPROVED_RESTORES[key] = frozenset(model_ids)
+
+
+def _consume_approved_restore(key):
+    with _APPROVED_RESTORES_LOCK:
+        return _APPROVED_RESTORES.pop(key, None)
+
+
+def _drop_approved_restore(key) -> None:
+    with _APPROVED_RESTORES_LOCK:
+        _APPROVED_RESTORES.pop(key, None)
+
 
 def _build_broker_stack(target, *, http=None, runner=None, which=None,
                         clock=None, adapters=None) -> dict:
@@ -2841,6 +3155,13 @@ def _release_would_start_server(args) -> dict | None:
                 "port": "its default"}
     if plan is None:
         return None    # unknown scope: release fails closed, starts nothing
+    # A20: freeze what this gate inspection SAW. The release handler
+    # re-verifies its recomputed plan against exactly this set and fails
+    # closed on anything new (a plan that grew in the gate-to-handler
+    # window). Recorded for every inspected plan — including an empty one —
+    # because growth is the thing being caught.
+    _record_approved_restore(scope_id,
+                             [s.model_id for s in plan.load_steps])
     steps = [step for step in plan.load_steps
              if step.engine in _PROCESS_ENGINE_PORTS]
     if not steps:
@@ -2912,6 +3233,10 @@ def _media_would_start_server(args) -> dict | None:
             return unresolved(held.get("model_id") or "")
         if plan is None:
             return None
+        # A20: freeze what this gate inspection saw (see the release-verb
+        # path) — the handler re-verifies the recomputed plan against it.
+        _record_approved_restore(held["scope_id"],
+                                 [s.model_id for s in plan.load_steps])
         steps = [step for step in plan.load_steps
                  if step.engine in _PROCESS_ENGINE_PORTS]
         if not steps:
@@ -2932,6 +3257,12 @@ def _media_would_start_server(args) -> dict | None:
         return unresolved(str(args.get("model") or ""))
     process = [rec for rec in residents
                if rec.engine in _PROCESS_ENGINE_PORTS]
+    # A20: the gate approves (or, with no process resident, certifies there
+    # is nothing to approve) the restore this call's inline release may run.
+    # The scope id does not exist yet at hook time, so the manifest is keyed
+    # per target for this call's inline release to consume.
+    _record_approved_restore(f"*{target.id}",
+                             [r.model_id for r in process])
     if not process:
         return None    # release restores nothing that starts a process
     rec = process[0]
@@ -3099,7 +3430,12 @@ def _broker_claim(stack: dict, target, request, scope_id: str = "") -> dict:
 
 def _broker_release(stack: dict, scope_id: str) -> dict:
     orchestrator = stack["orchestrator"]
-    result = orchestrator.release(scope_id)
+    # A20: consume what the approval gate saw for this release (None = no
+    # gate ran on this path; pre-A20 behavior).
+    approved = _consume_approved_restore(scope_id)
+    result = orchestrator.release(
+        scope_id, approved_restore=approved,
+        gated_engines=tuple(_PROCESS_ENGINE_PORTS))
     ok = bool(result.get("ok"))
     _ACTIVE_SCOPES.pop(scope_id, None)
     out = {
@@ -3452,7 +3788,16 @@ def _claim_media_lane(target, modality: str, model: str) -> dict:
 
 def _release_media_lane(target, scope_id: str) -> dict:
     stack = broker_stack(target)
-    result = stack["orchestrator"].release(scope_id)
+    # A20: consume what the approval gate saw for this release — the
+    # scope-keyed manifest (poll/release-verb paths) or this call's
+    # "*{target}" inline manifest (submit path). None means no gate ran on
+    # this path (programmatic use) and the pre-A20 behavior applies.
+    approved = _consume_approved_restore(scope_id)
+    if approved is None:
+        approved = _consume_approved_restore(f"*{target.id}")
+    result = stack["orchestrator"].release(
+        scope_id, approved_restore=approved,
+        gated_engines=tuple(_PROCESS_ENGINE_PORTS))
     _ACTIVE_SCOPES.pop(scope_id, None)
     out = {"ok": bool(result.get("ok")), "scope_id": scope_id,
            "steps": _step_rows(result.get("steps")),
