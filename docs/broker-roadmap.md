@@ -269,6 +269,11 @@ Three workstreams, each an acceptance gate:
   next. **Acceptance:** all consumers green on Model Forge; the broker
   container stopped and its repo archived; freed resources reported.
 
+**Status: COMPLETE (2026-11-20).** All three acceptance gates passed on the
+real lanes (record: `docs/tasks/p5-integration.md` — shadow acceptance a–f,
+real cutover acceptance A–E, consumer flips). The broker container is
+stopped and the Gitea repo `charles/weights-broker` is archived.
+
 Operational guardrails (from the broker skills): never `git reset --hard`
 in `~/work/weights-broker` (a stash holds an old vLLM-Omni experiment);
 infra ops through Gitea, product code through GitHub; commit with explicit
