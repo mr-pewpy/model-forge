@@ -4385,6 +4385,7 @@ def cockpit_data() -> dict:
         "declared_engines": [dict(row) for row in declared],
         "models": cockpit_models().get("models", []),
         "storage": _storage_listing(),
+        "residency": cockpit_residency(),
         "delete_note": DELETE_VERB_NOTE,
     }
     local = next((t for t in targets if t.id == "local"), targets[0])
@@ -4393,6 +4394,26 @@ def cockpit_data() -> dict:
     if invitation is not None:
         out["invitation"] = invitation
     return out
+
+
+def cockpit_residency() -> dict:
+    """The broker's read-only weight-residency rows for the local compute
+    target — pulled (with sizes + provenance), resident, booked (with honest
+    ``measured peak`` / ``published footprint`` labels), unbooked catalog
+    entries, and current budget usage. This is the data behind
+    ``model_forge_broker action=status``, surfaced for the Desktop cockpit
+    pane and the dashboard tab to render (B2). Read-only and bounded: it
+    reuses the same honest shape as the broker status verb and never raises
+    (a failure is a stated reason)."""
+    try:
+        targets = load_targets()
+        local = next((t for t in targets if t.id == "local"), targets[0])
+        stack = broker_stack(local)
+        return _broker_status(stack, local)
+    except Exception as exc:  # noqa: BLE001 — fail soft: the reason is payload
+        return {"ok": False, "target": "local",
+                "error": f"residency snapshot unavailable: "
+                         f"{type(exc).__name__}: {exc}"}
 
 
 def cockpit_storage() -> dict:

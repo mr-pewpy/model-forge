@@ -340,9 +340,13 @@ The list is grouped as:
   capability matrix marks it "not on the tab yet").
 - **What exists today:** residency is chat-only through the command
   (`/model-forge broker`) and the `model_forge_broker` tool, with the same
-  honest state vocabulary everywhere.
-- **What would unblock it:** adding the residency section to the pane and
-  tab renderers (the data shape already exists).
+  honest state vocabulary everywhere. The data door for the surfaces is now
+  built: `cockpit_data()["residency"]` and the dashboard `/residency` API
+  route carry the pulled / resident / booked / unbooked / budget rows (B2
+  foundation, tested).
+- **What would unblock it:** the remaining work is the renderers — adding the
+  residency section to the Desktop pane and the dashboard tab (the data shape
+  is now exposed on both surfaces' data doors).
 
 ### B3. Bench sampling of remote compute targets
 

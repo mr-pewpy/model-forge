@@ -71,6 +71,35 @@ def _resources() -> dict:
                          f"{type(exc).__name__}: {exc}"}
 
 
+def _residency() -> dict:
+    try:
+        from model_forge import tools
+        return tools.cockpit_residency()
+    except Exception as exc:  # fail soft: the reason is the payload
+        return {"ok": False,
+                "error": f"residency snapshot unavailable: "
+                         f"{type(exc).__name__}: {exc}"}
+
+
+@router.get("/residency")
+async def residency():
+    """The read-only weight-residency rows (pulled / resident / booked /
+    unbooked / budget) for the local compute target — the broker status data
+    the cockpit surfaces render. Read-only and bounded."""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_residency), timeout=_SNAPSHOT_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return {"ok": False,
+                "error": f"residency snapshot timed out after "
+                         f"{_SNAPSHOT_TIMEOUT_S:g} s; nothing was changed — "
+                         "refresh to retry"}
+    except Exception as exc:  # fail soft: the reason is the payload
+        return {"ok": False,
+                "error": f"residency snapshot failed: "
+                         f"{type(exc).__name__}: {exc}"}
+
+
 @router.get("/resources")
 async def resources():
     """The on-demand resource snapshot (memory usage rows, resident model

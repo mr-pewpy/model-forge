@@ -2604,6 +2604,56 @@ def test_cockpit_command_snapshot_shapes(tmp_path, monkeypatch):
     assert "approval" in out["delete_note"]
 
 
+def test_cockpit_residency_carries_broker_weight_residency_rows(
+        tmp_path, monkeypatch):
+    # B2: the residency data door carries the broker's honest weight
+    # residency rows (pulled / resident / booked / unbooked / budget) — the
+    # data the Desktop pane and dashboard tab render.
+    no_gpu, _ = _profiles()
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    downloads = tmp_path / "model-forge" / "downloads"
+    model_dir = downloads / "model-a"
+    model_dir.mkdir(parents=True)
+    (model_dir / "w.bin").write_bytes(b"1" * 7)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "probe_hardware", lambda: no_gpu)
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
+    res = tools.cockpit_residency()
+    assert res["ok"] is True
+    assert {"pulled", "resident", "booked", "unbooked", "budget"} <= set(res)
+    assert isinstance(res["pulled"], list)
+    assert isinstance(res["resident"], list)
+    assert isinstance(res["booked"], list)
+    assert isinstance(res["unbooked"], list)
+    assert {"nominal_gb", "booked_now_gb", "headroom_gb"} <= set(res["budget"])
+    # booked rows carry an honest provenance label (measured vs published)
+    for row in res["booked"]:
+        assert {"model_id", "vram_gb", "source", "label"} <= set(row)
+    # the cockpit snapshot exposes the same residency for the surfaces
+    out = tools.cockpit_data()
+    assert "residency" in out
+    assert {"pulled", "resident", "booked", "unbooked",
+            "budget"} <= set(out["residency"])
+
+
+def test_cockpit_residency_fails_soft_with_a_stated_reason(tmp_path,
+                                                          monkeypatch):
+    # a broken broker stack degrades to a stated reason, never a raise
+    no_gpu, _ = _profiles()
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "probe_hardware", lambda: no_gpu)
+
+    def _boom(_target, **_kw):
+        raise RuntimeError("stack down")
+
+    monkeypatch.setattr(tools, "broker_stack", _boom)
+    res = tools.cockpit_residency()
+    assert res["ok"] is False
+    assert "residency snapshot unavailable" in res["error"]
+    assert "stack down" in res["error"]
+
+
 def test_cockpit_command_models_and_storage_subcommands(tmp_path, monkeypatch):
     no_gpu, _ = _profiles()
     _stub_hermes_modules(monkeypatch, tmp_path)
