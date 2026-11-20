@@ -17,7 +17,10 @@ when a task needs a different model. Four pieces:
   readiness + cache-free contract, never a weights pin), vLLM (process
   start/stop of the server with the model as a launch argument — engine
   sleep/wake is deliberately not used; wake endpoints are unreliable
-  upstream and process restart is the reliable path), Maya (engine-native
+  upstream and process restart is the reliable path), container engines (the
+  docker dance: start the container and wait on its health endpoint within a
+  caller-passed cold-boot budget, stop it to free the GPU instantly — the
+  production ComfyUI sidecar pattern), Maya (engine-native
   readiness over its model-management API — Maya exposes no unload
   primitive, so release is a ledger-side acknowledgment and never fakes an
   unload), and Exo (engine-native instance placement — ``POST
@@ -77,6 +80,7 @@ __all__ = [
     "Booking",
     "ComfyUILifecycle",
     "ComfyUiLifecycle",
+    "DockerContainerLifecycle",
     "EngineLifecycle",
     "EvictionPlanner",
     "ExoLifecycle",
@@ -89,13 +93,16 @@ __all__ = [
     "OllamaLifecycle",
     "Orchestrator",
     "PlanStep",
+    "ProcessHandle",
     "PullRecord",
     "ResidencyLedger",
     "ResidentRecord",
+    "RuntimeHandle",
     "VllmLifecycle",
     "VllmServerLifecycle",
     "is_image_generation",
     "loading_state",
+    "runtime_lifecycle_for",
 ]
 
 # Policy proven under production load: models used within roughly the last ten minutes stay
@@ -745,13 +752,27 @@ class LlamaSwapLifecycle(EngineLifecycle):
                 "reason": self.NO_CONTROL}
 
 
-class ProcessHandle(Protocol):
-    """The injectable process-handle contract: ``poll`` / ``terminate`` /
-    ``wait`` — what a started llama-server answers to."""
+class RuntimeHandle(Protocol):
+    """The injectable runtime-handle contract — what a started engine answers
+    to, whether it runs as a bare process (llama-server, the vLLM server) or
+    as a container.
 
+    ``kind`` names the runtime honestly ('process' | 'container') so a caller
+    reading a handle knows what it holds; the three methods are the whole
+    contract — ``poll`` for liveness, ``terminate`` to stop, ``wait`` to join.
+    The process adapters below only ever call the three methods, so a handle
+    that carries no ``kind`` still satisfies this contract structurally."""
+
+    kind: str
     def poll(self) -> int | None: ...
     def terminate(self) -> None: ...
     def wait(self, timeout: float | None = None) -> int: ...
+
+
+# Back-compat alias: ProcessHandle WAS this contract (poll/terminate/wait),
+# so the llama.cpp and vLLM adapters — and their fake-handle tests, which use
+# handles with no ``kind`` — keep working unchanged.
+ProcessHandle = RuntimeHandle
 
 
 # The environment keys an engine server may inherit beyond the four base
@@ -824,8 +845,10 @@ def _spawn_process(argv, env) -> ProcessHandle:
     seam. The child gets exactly ``env`` — never the parent's environment, so
     no Hermes provider keys or tokens leak into the server (see
     ``_minimal_engine_env``). A handle answers ``poll()`` / ``terminate()`` /
-    ``wait(timeout=…)``."""
-    return subprocess.Popen(list(argv), env=dict(env))
+    ``wait(timeout=…)``. A real ``Popen`` satisfies those three methods but
+    carries no ``kind`` label — hence the ignore: the adapters only ever call
+    the three methods, never ``kind`` (see ``RuntimeHandle``)."""
+    return subprocess.Popen(list(argv), env=dict(env))  # type: ignore[return-value]
 
 
 class LlamaCppServerLifecycle(EngineLifecycle):
@@ -1142,6 +1165,289 @@ class VllmServerLifecycle(EngineLifecycle):
 
 # Spelling alias matching the llama.cpp adapter's naming shape.
 VllmLifecycle = VllmServerLifecycle
+
+
+# --- container engines (the docker dance) ------------------------------------
+
+def _docker_argv(args: list) -> list:
+    return ["docker", *[str(a) for a in args]]
+
+
+def _minimal_docker_env() -> dict:
+    """The trimmed environment for the host ``docker`` CLI: PATH, HOME and
+    TMPDIR it needs to find the binary, locate its config and use a writable
+    temp dir, plus ``DOCKER_HOST`` when the parent explicitly points the client
+    at a socket/host. Nothing else from the parent rides along — in particular
+    the Hermes provider keys in the parent environment must NOT leak into the
+    docker client (same hygiene as ``_minimal_engine_env``)."""
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME") or os.path.expanduser("~"),
+        "TMPDIR": os.environ.get("TMPDIR") or "/tmp",
+    }
+    docker_host = os.environ.get("DOCKER_HOST")
+    if docker_host:
+        env["DOCKER_HOST"] = docker_host
+    return env
+
+
+def _run_docker(args):
+    """Default docker runner: ``subprocess ['docker', <args>]`` — the one real
+    docker seam. The facade runs on the .62 inference host, where the host
+    docker CLI is available; unit tests inject a fake and touch no docker.
+
+    stdout/stderr are captured (PIPE) so the ``docker inspect`` path can read
+    the container's state from the child; start/stop emit a few bytes at most,
+    so the unread pipe never fills. The child gets the trimmed docker
+    environment (``_minimal_docker_env``), never the full parent env."""
+    return subprocess.Popen(_docker_argv(args), stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=_minimal_docker_env())
+
+
+def _docker_state(runner, container) -> bool | None:
+    """Best-effort container running state from ``docker inspect``: ``True`` /
+    ``False`` when the output is readable, ``None`` when it is not.
+
+    Raises ONLY what the runner itself raises — the caller decides how to
+    degrade. ``probe`` reports a raised runner fail-soft, and otherwise falls
+    back to the adapter's last tracked state when the output is unreadable.
+    Reading the child's stdout is optional because an injected fake runner
+    may return an opaque handle with no ``communicate``."""
+    proc = runner(["inspect", "-f", "{{.State.Running}}", container])
+    communicate = getattr(proc, "communicate", None)
+    if not callable(communicate):
+        return None
+    try:
+        stdout, _ = communicate(timeout=5.0)
+    except Exception:  # noqa: BLE001 — no readable output, not an error here
+        return None
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", "replace")
+    token = (stdout or "").strip().lower()
+    if token == "true":
+        return True
+    if token == "false":
+        return False
+    return None
+
+
+def _http_healthy(url, timeout: float = 2.0) -> bool:
+    """Default health probe: a plain urllib GET, HTTP 200 means healthy.
+    Any failure (connection refused while the engine is still booting, a
+    timeout, a non-200) reads as not-yet-healthy, never an exception — the
+    caller polls until the cold-boot budget expires."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return int(resp.getcode()) == 200
+    except Exception:  # noqa: BLE001 — not-yet-up is a normal poll answer
+        return False
+
+
+class DockerContainerLifecycle(EngineLifecycle):
+    """A containerized engine: start the container, wait for its health
+    endpoint, stop the container to evict.
+
+    Production parity (weights-broker ``ContainerControl``): a side model
+    (ComfyUI) runs as a container so the broker can stop it before a bigger
+    lane wakes — a resident side model OOMs the waking lane (vLLM TP2 books
+    ~22.8 GB/GPU at 0.95 utilization). ``docker stop`` frees the GPU
+    instantly, which is the whole reason to containerize the engine.
+
+    ``ensure_loaded`` starts the container only when it is not already
+    running, then polls ``health_url`` until it answers 200 or the cold-boot
+    budget expires. ``release`` issues ``docker stop``. Both drive the host
+    docker CLI through the injectable ``runner``; tests inject fakes and
+    NEVER call real docker.
+
+    ``boot_budget_s`` is the cold-boot allowance the CALLER passes (vLLM
+    ~90-170 s warm / ~8 min cold, ComfyUI minutes): this adapter never
+    hardcodes a per-engine number, and a boot that overruns the budget is an
+    honest failure, never a hang. ``sleep`` / ``clock`` are injected so the
+    budget tests run instantly. ``gpu_count`` is carried honestly in the rows
+    (the container is pinned to that many devices) — it is not a fit number.
+    """
+
+    WARM_PATH = ("container stop/start (docker stop frees the GPU instantly; "
+                 "cold boot waits for the health endpoint)")
+    LIFECYCLE = "container stop/start (docker stop frees the GPU instantly)"
+    POLL_INTERVAL_S = 2.0
+
+    def __init__(self, engine_id, *, container: str, health_url: str,
+                 boot_budget_s: float, gpu_count: int = 1, runner=None,
+                 sleep=None, clock=None):
+        self.engine_id = str(engine_id)
+        self._container = str(container)
+        self._health_url = str(health_url)
+        self._boot_budget_s = float(boot_budget_s)
+        self._gpu_count = int(gpu_count)
+        self._runner = runner or _run_docker
+        self._sleep = sleep or time.sleep
+        self._clock = clock or time.monotonic
+        # The last state this adapter observed. ``docker start`` against an
+        # already-running container is the engine's own no-op, so tracking is
+        # safe; ``probe`` still asks docker when it can, and resets this flag
+        # from whatever docker reports. ``_booting`` is the honest distinct
+        # state for a container that STARTED but never answered healthy: it is
+        # up (possibly holding partial VRAM), so it is never reported stopped.
+        self._running = False
+        self._booting = False
+        self._serving: str | None = None
+
+    def ensure_loaded(self, model_id, **_ignored) -> dict:
+        row = {"ok": False, "engine": self.engine_id, "action": "load",
+               "model_id": model_id, "container": self._container,
+               "lifecycle": self.LIFECYCLE,
+               # honest loading label while the container cold-boots
+               "loading_state": loading_state(self._boot_budget_s)}
+        if self._running and not self._booting:
+            self._serving = model_id
+            return {**row, "ok": True, "state": "ready",
+                    "gpu_count": self._gpu_count,
+                    "reason": f"container {self._container!r} is already "
+                              f"running — nothing to start"}
+        # A container left ``_booting`` from a prior overrun is already up:
+        # re-issue no start, just retry readiness against the health endpoint.
+        did_start = False
+        if not self._running:
+            try:
+                self._runner(["start", self._container])
+            except Exception as exc:  # noqa: BLE001 — honest row, never a raise
+                return {**row, "reason": f"docker start {self._container!r} "
+                                         f"failed: {type(exc).__name__}: {exc}"}
+            self._running = True
+            did_start = True
+        start = self._clock()
+        # Poll the health endpoint until it answers 200 or the cold-boot
+        # budget expires. The budget is the caller's; overrunning it is an
+        # honest failure, never a hang.
+        while True:
+            if _http_healthy(self._health_url):
+                self._running = True
+                self._booting = False
+                self._serving = model_id
+                started = ("started container" if did_start
+                           else "container already up")
+                return {**row, "ok": True, "state": "ready",
+                        "gpu_count": self._gpu_count,
+                        "reason": f"{started} {self._container!r} and it "
+                                  f"answered healthy at {self._health_url} — "
+                                  f"the engine is ready"}
+            elapsed = self._clock() - start
+            if elapsed >= self._boot_budget_s:
+                # ``docker start`` succeeded: the container runs (and may hold
+                # partial VRAM) even though it never answered healthy. Keep an
+                # honest distinct state — never assert it stopped.
+                self._running = True
+                self._booting = True
+                self._serving = model_id
+                return {**row, "state": "booting", "reason":
+                        f"cold-boot budget {self._boot_budget_s:g}s expired "
+                        f"after {elapsed:g}s waiting for {self._health_url} "
+                        f"— container {self._container!r} is up but never "
+                        f"became healthy (may hold partial VRAM; the caller "
+                        f"passes the real budget: vLLM warm ~90-170s / cold "
+                        f"~8min, ComfyUI minutes)"}
+            self._sleep(self.POLL_INTERVAL_S)
+
+    def release(self, model_id) -> dict:
+        base = {"engine": self.engine_id, "action": "release",
+                "model_id": model_id, "container": self._container,
+                "lifecycle": self.LIFECYCLE}
+        try:
+            self._runner(["stop", self._container])
+        except Exception as exc:  # noqa: BLE001 — honest row, never a raise
+            return {**base, "ok": False, "state": "running",
+                    "reason": f"docker stop {self._container!r} failed: "
+                              f"{type(exc).__name__}: {exc} — the container "
+                              f"may still hold VRAM"}
+        self._running = False
+        self._booting = False
+        self._serving = None
+        return {**base, "ok": True, "state": "released",
+                "reason": f"stopped container {self._container!r} (docker "
+                          f"stop) — its VRAM is freed instantly"}
+
+    def probe(self) -> dict:
+        try:
+            observed = _docker_state(self._runner, self._container)
+        except Exception as exc:  # noqa: BLE001 — probes fail soft
+            # Sibling adapters (ollama/llama-swap/comfyui) return ok False on
+            # a failed probe; match that convention here.
+            return {"ok": False, "engine": self.engine_id, "state": "unknown",
+                    "resident": [], "container": self._container,
+                    "reason": f"container {self._container!r} state probe "
+                              f"failed: {type(exc).__name__}: {exc} — "
+                              f"residency unknown (fail-soft)"}
+        if observed is None:
+            observed = self._running
+            source = "tracked state — docker inspect unreadable"
+        else:
+            # Docker is authoritative: reset the in-memory flag from what it
+            # actually reports, so a side container started/stopped outside
+            # this adapter is reflected honestly.
+            self._running = observed
+            source = "docker inspect"
+            if not observed:
+                self._booting = False
+        if not observed:
+            state = "stopped"
+        elif self._booting:
+            state = "booting"
+        else:
+            state = "running"
+        return {"ok": True, "engine": self.engine_id, "state": state,
+                "resident": [self._serving] if (observed and self._serving)
+                           else [],
+                "container": self._container, "gpu_count": self._gpu_count,
+                "reason": f"container {self._container!r} is {state} "
+                          f"({source})"}
+
+
+def runtime_lifecycle_for(entry, **seams):
+    """Build the runtime lifecycle a registry entry declares, or ``None``.
+
+    ``entry.runtime`` is the ModelEntry runtime dict: ``{"kind": "container",
+    "name": …, "health_url": …, "boot_budget_s": …, "gpu_count": …}`` builds a
+    ``DockerContainerLifecycle``; anything else (no runtime, or a
+    ``kind="process"`` entry) returns ``None`` so process engines keep using
+    the existing adapters (llama.cpp, vLLM).
+
+    ``seams`` (``runner`` / ``sleep`` / ``clock``, plus an optional
+    ``engine_id`` override — default: the entry's first engine id) pass
+    straight through to the adapter. Fail closed: a container entry with no
+    boot budget raises — this factory never invents a per-engine number, so a
+    malformed registry surfaces loudly rather than at a guessed boot wait.
+    """
+    runtime = getattr(entry, "runtime", None)
+    if runtime is None:
+        return None
+    if not isinstance(runtime, dict):
+        raise ValueError(
+            f"registry entry {getattr(entry, 'id', '?')!r}: runtime must be a "
+            f"dict to build a lifecycle, got {type(runtime).__name__} — "
+            f"refusing to guess (fail-closed)")
+    kind = runtime.get("kind")
+    if kind == "process":
+        return None
+    if kind != "container":
+        raise ValueError(
+            f"registry entry {getattr(entry, 'id', '?')!r}: runtime.kind must "
+            f"be 'container' or 'process' to build a lifecycle, got {kind!r} "
+            f"(fail-closed)")
+    engine_id = seams.pop("engine_id", None)
+    if not engine_id:
+        engines = getattr(entry, "engines", ()) or ()
+        engine_id = engines[0] if engines else runtime.get("name", "")
+    budget = runtime.get("boot_budget_s")
+    if budget is None:
+        raise ValueError(
+            f"container runtime for {getattr(entry, 'id', '?')!r} declares no "
+            f"boot_budget_s — refusing to invent a cold-boot budget "
+            f"(fail-closed)")
+    return DockerContainerLifecycle(
+        engine_id, container=runtime["name"],
+        health_url=runtime["health_url"], boot_budget_s=float(budget),
+        gpu_count=int(runtime.get("gpu_count", 1)), **seams)
 
 
 class MayaLifecycle(EngineLifecycle):

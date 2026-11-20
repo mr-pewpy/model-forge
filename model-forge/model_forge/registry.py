@@ -75,6 +75,70 @@ class ModelEntry:
     note: str = ""
     engine_models: dict = field(default_factory=dict)  # engine id -> engine-native model id
     released: str = ""              # release date (YYYY-MM-DD) where known; "" = unknown
+    runtime: dict | None = None     # how the engine runs: {"kind": "process" | "container", ...}
+
+    def __post_init__(self):
+        # Fail closed at parse: a malformed runtime shape is refused here, with
+        # a clear error, rather than surfacing as a half-built lifecycle later.
+        _validate_runtime(self.runtime, self.id)
+
+
+_RUNTIME_KINDS: tuple[str, ...] = ("process", "container")
+
+
+def _validate_runtime(runtime, entry_id="?"):
+    """Validate an entry's optional ``runtime`` dict, failing closed.
+
+    Shape: ``{"kind": "process" | "container", "name": str,
+    "health_url": str, "boot_budget_s": number > 0, "gpu_count": int >= 1}``.
+    A container runtime must name the container and its health URL and carry
+    a positive cold-boot budget — the lifecycle cannot boot without them, so a
+    missing or malformed shape is refused HERE at parse with a clear error,
+    never patched with a guessed default. Used by ``ModelEntry.__post_init__``.
+    """
+    if runtime is None:
+        return
+    if not isinstance(runtime, dict):
+        raise ValueError(
+            f"registry entry {entry_id!r}: runtime must be a dict, got "
+            f"{type(runtime).__name__}")
+    kind = runtime.get("kind")
+    if kind not in _RUNTIME_KINDS:
+        raise ValueError(
+            f"registry entry {entry_id!r}: runtime.kind must be one of "
+            f"{_RUNTIME_KINDS}, got {kind!r}")
+    if kind == "container":
+        for key in ("name", "health_url"):
+            value = runtime.get(key)
+            if not (isinstance(value, str) and value.strip()):
+                raise ValueError(
+                    f"registry entry {entry_id!r}: runtime kind 'container' "
+                    f"requires a non-empty {key!r} (got {value!r})")
+        if "boot_budget_s" not in runtime:
+            raise ValueError(
+                f"registry entry {entry_id!r}: runtime kind 'container' "
+                f"requires a positive boot_budget_s (the cold-boot budget the "
+                f"caller passes — never guessed)")
+    if "boot_budget_s" in runtime:
+        raw = runtime["boot_budget_s"]
+        if isinstance(raw, bool):
+            raise ValueError(
+                f"registry entry {entry_id!r}: runtime.boot_budget_s must be a "
+                f"number > 0 (got {raw!r} — a bool is not a budget)")
+        try:
+            budget = float(raw)
+        except (TypeError, ValueError):
+            budget = None
+        if budget is None or not math.isfinite(budget) or budget <= 0.0:
+            raise ValueError(
+                f"registry entry {entry_id!r}: runtime.boot_budget_s must be a "
+                f"number > 0 (got {raw!r})")
+    if "gpu_count" in runtime:
+        g = runtime["gpu_count"]
+        if isinstance(g, bool) or not isinstance(g, int) or g < 1:
+            raise ValueError(
+                f"registry entry {entry_id!r}: runtime.gpu_count must be an "
+                f"int >= 1 (got {g!r})")
 
 
 @dataclass(frozen=True)
