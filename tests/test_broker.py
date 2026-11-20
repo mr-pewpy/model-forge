@@ -616,7 +616,8 @@ def test_exo_ensure_loaded_places_instance_or_observes_resident():
     assert res["deployment_id"] == "dpl-1"
     assert "asynchronously" in res["reason"]
     assert "instance/await" in res["reason"]
-    place = http.calls[-1]
+    place = [c for c in http.calls
+             if c["url"].endswith("/place_instance")][-1]
     assert place["method"] == "POST"
     assert place["url"].endswith("/place_instance")
     # server-side placement: only the model id is sent, nothing invented
@@ -678,6 +679,76 @@ def test_exo_release_nothing_running_is_an_honest_noop():
     assert "nothing to stop" in res["reason"]
     # nothing deleted, nothing faked — the only call was the /state check
     assert [c["method"] for c in http.calls] == ["GET"]
+
+
+def test_exo_await_confirms_ready_when_engine_says_so():
+    # A16: the readiness wait is CONSUMED — a positively-confirming
+    # GET /instance/await answer yields state "ready", never before.
+    http = FakeHttp(responses={
+        "/state": {"instances": {}},
+        "/place_instance": {"message": "Command received.",
+                            "command_id": "cmd-1", "deployment_id": "dpl-1"},
+        "instance/await?model_id=m": {"instance_id": "inst-1",
+                                      "deployment_id": "dpl-1",
+                                      "shard_assignments": {"model_id": "m"}},
+    })
+    exo = ExoLifecycle(http=http)
+    res = exo.ensure_loaded("m")
+    assert res["state"] == "ready"
+    assert res["instance_id"] == "dpl-1"
+    assert "confirmed readiness" in res["reason"]
+    await_call = [c for c in http.calls
+                  if "/instance/await" in c["url"]][-1]
+    assert await_call["method"] == "GET"
+    assert "model_id=m" in await_call["url"]
+    # the bounded wait is the call's timeout — never an unbounded block
+    assert await_call["timeout"] == ExoLifecycle.AWAIT_S
+
+
+def test_exo_await_unconfirmed_stays_placement_requested():
+    # an empty / ambiguous await answer confirms NOTHING (the state
+    # vocabulary promises 'ready' only when the engine says so)
+    http = FakeHttp(responses={
+        "/state": {"instances": {}},
+        "/place_instance": {"deployment_id": "dpl-1"},
+        "instance/await?model_id=m": {},
+    })
+    exo = ExoLifecycle(http=http)
+    res = exo.ensure_loaded("m")
+    assert res["state"] == "placement-requested"
+    assert "without confirming readiness" in res["reason"]
+    # a pending status is equally unconfirmed
+    http2 = FakeHttp(responses={
+        "/state": {"instances": {}},
+        "/place_instance": {"deployment_id": "dpl-2"},
+        "instance/await?model_id=m": {"status": "pending"},
+    })
+    res = ExoLifecycle(http=http2).ensure_loaded("m")
+    assert res["state"] == "placement-requested"
+
+
+def test_exo_await_timeout_or_skip_is_honest():
+    # a timing-out / unreachable await degrades to placement-requested with
+    # the reason naming the wait — never a raise, never a fake 'ready'
+    http = FakeHttp(responses={
+        "/state": {"instances": {}},
+        "/place_instance": {"deployment_id": "dpl-1"},
+        "instance/await?model_id=m": TimeoutError("timed out"),
+    })
+    exo = ExoLifecycle(http=http)
+    res = exo.ensure_loaded("m")
+    assert res["state"] == "placement-requested"
+    assert "did not confirm readiness" in res["reason"]
+    # await_s=0 skips the wait entirely (no await call is made)
+    http2 = FakeHttp(responses={
+        "/state": {"instances": {}},
+        "/place_instance": {"deployment_id": "dpl-1"},
+    })
+    exo2 = ExoLifecycle(http=http2)
+    res = exo2.ensure_loaded("m", await_s=0)
+    assert res["state"] == "placement-requested"
+    assert "skipped" in res["reason"]
+    assert all("/instance/await" not in c["url"] for c in http2.calls)
 
 
 def test_exo_failures_are_honest_rows_not_raises():

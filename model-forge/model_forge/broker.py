@@ -78,6 +78,7 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Protocol
@@ -1709,6 +1710,54 @@ class ExoLifecycle(EngineLifecycle):
         # DELETE /instance/{id} stops by, even before placement finishes.
         self._deployments: dict[str, str] = {}
 
+    # Readiness wait (A16): after placement the adapter CONSUMES the
+    # engine's readiness route (GET /instance/await) with this bounded wait,
+    # so ensure_loaded can report "ready" when the engine actually confirms
+    # it — and honestly stays "placement-requested" when the wait times out
+    # or does not confirm. await_s=0 skips the wait entirely.
+    AWAIT_S = 120.0
+
+    @staticmethod
+    def _await_confirms(resp) -> bool:
+        """True only when the await answer POSITIVELY indicates readiness —
+        an instance record or an explicit ready flag/status. An empty or
+        ambiguous body confirms nothing: the state vocabulary promises
+        ``ready`` only when the engine says so."""
+        if not isinstance(resp, dict) or not resp:
+            return False
+        if resp.get("ready") is True:
+            return True
+        if resp.get("ready") is False:
+            return False
+        status = str(resp.get("status") or "").strip().lower()
+        if status in ("pending", "queued", "loading"):
+            return False
+        if status in ("ready", "done", "completed", "running", "ok"):
+            return True
+        return bool(resp.get("instance_id") or resp.get("deployment_id")
+                    or isinstance(resp.get("shard_assignments"), dict)
+                    or resp.get("model_id"))
+
+    def _await_ready(self, model_id: str, await_s: float) -> tuple[bool, str]:
+        """Consume GET /instance/await (A16). Returns (confirmed, reason)."""
+        if await_s <= 0:
+            return False, ("readiness wait skipped (await_s=0) — the state "
+                           "stays placement-requested")
+        url = (f"{self._root}/instance/await?model_id="
+               + urllib.parse.quote(str(model_id), safe=""))
+        try:
+            resp = self._http("GET", url, None, await_s)
+        except Exception as exc:  # noqa: BLE001 — not confirmed is honest
+            return False, (f"GET /instance/await did not confirm readiness "
+                           f"within {await_s:g} s: {type(exc).__name__}: "
+                           f"{exc}")
+        if self._await_confirms(resp):
+            return True, (f"GET /instance/await confirmed readiness for "
+                          f"{model_id}")
+        return False, (f"GET /instance/await answered without confirming "
+                       f"readiness for {model_id} — the state stays "
+                       f"placement-requested")
+
     @staticmethod
     def _instances(data) -> list[dict]:
         raw = data.get("instances") or {} if isinstance(data, dict) else {}
@@ -1728,7 +1777,7 @@ class ExoLifecycle(EngineLifecycle):
         return str(inst.get("instance_id") or inst.get("deployment_id")
                    or "")
 
-    def ensure_loaded(self, model_id, **_ignored) -> dict:
+    def ensure_loaded(self, model_id, await_s=None, **_ignored) -> dict:
         row = {"ok": False, "engine": self.engine_id, "action": "load",
                "model_id": model_id, "load_control": self.LOAD_CONTROL}
         try:
@@ -1761,6 +1810,20 @@ class ExoLifecycle(EngineLifecycle):
         deployment_id = str(ack.get("deployment_id") or "")
         if deployment_id:
             self._deployments[model_id] = deployment_id
+        # A16: consume the readiness wait — the state is "ready" only when
+        # the engine's await route positively confirms it.
+        wait_s = self.AWAIT_S if await_s is None else float(await_s)
+        confirmed, await_reason = self._await_ready(model_id, wait_s)
+        instance_id = self._deployments.get(model_id, "")
+        if confirmed:
+            return {"ok": True, "engine": self.engine_id, "action": "load",
+                    "model_id": model_id, "state": "ready",
+                    "instance_id": instance_id,
+                    "deployment_id": deployment_id,
+                    "load_control": self.LOAD_CONTROL,
+                    "reason": f"placement requested for {model_id} (command "
+                              f"{ack.get('command_id') or 'accepted'}) — "
+                              f"{await_reason}; the model is loaded"}
         return {"ok": True, "engine": self.engine_id, "action": "load",
                 "model_id": model_id, "state": "placement-requested",
                 "deployment_id": deployment_id,
@@ -1768,9 +1831,8 @@ class ExoLifecycle(EngineLifecycle):
                 "reason": f"placement requested for {model_id} (command "
                           f"{ack.get('command_id') or 'accepted'}) — exo "
                           f"downloads and loads the model engine-natively "
-                          f"and asynchronously; it is NOT loaded yet: wait "
-                          f"via GET /instance/await?model_id={model_id} "
-                          f"before inference"}
+                          f"and asynchronously; it is NOT loaded yet: "
+                          f"{await_reason}"}
 
     def release(self, model_id) -> dict:
         base = {"engine": self.engine_id, "action": "release",
