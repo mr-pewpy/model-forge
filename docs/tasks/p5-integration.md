@@ -477,3 +477,169 @@ flipped and verified in §8.1.
   stopped/restarted/removed by this phase (the facade's *own* gen dance stopped+started `vllm-server` and
   `weights-broker-comfyui-1` as designed; both left healthy afterward). No `docker rm`/prune.
 - Throwaway scratch (probe script, tiny test PNGs, fetched asset) removed from `cache/scratch`.
+
+---
+
+## 9. Lane parity — image lanes (2026-11-20, live on 192.168.1.62)
+
+**Model:** xiaomi/mimo-v2.6-pro
+**Scope:** the three remaining IMAGE gen lanes, one real end-to-end run each through
+`POST http://192.168.1.62:8080/v1/images/generations` (sync, curl `--max-time 600`),
+strictly sequential (each ran the full GPU dance: `vllm-server` evicted →
+`weights-broker-comfyui-1` up → job → idle release restores vllm).
+
+**Shared input image** (edit/cutout lanes): a 1885-byte 512×512 RGB PNG hand-built on
+.62 with stdlib `zlib`/`struct` (two-tone blue/green), sent as `"image":
+"data:image/png;base64,…"` (the facade maps `image_url`→`image` and uploads data-URLs
+to ComfyUI's input dir per `engines/comfyui.py:_normalize_image_refs`).
+
+### 9.1 Per lane
+
+| lane | request (abridged) | verdict | output evidence |
+|---|---|---|---|
+| `gen/qwen-image-2.1-edit` | `{"model":"gen/qwen-image-2.1-edit","prompt":"make the sky purple","size":"1024x1024","image":"data:image/png;base64,<1885B PNG>"}` | **PASS** | response `{"created":1795150028,"data":[{"url":"http://192.168.1.62:8080/assets/d8d3685793f6/qwen_image_21_edit_00007_.png"}]}` — today's consumer shape. Asset `HTTP=200 CT=image/png bytes=164687`, `PNG 512×512 RGBA` (colortype 6), magic ok. Wall **164 s**. |
+| `gen/qwen-image-2.1-cutout` | `{"model":"gen/qwen-image-2.1-cutout","prompt":"Remove the background, and output a PNG image","size":"1024x1024","image":"data:image/png;base64,<same PNG>"}` | **PASS** | response `{"created":1795150169,"data":[{"url":"http://192.168.1.62:8080/assets/a67e8bafde7c/qwen_image_21_edit_00008_.png"}]}`. Asset `HTTP=200 CT=image/png bytes=176583`, `PNG 512×512 RGBA` (colortype 6), magic ok. **Real alpha matte confirmed:** stdlib PNG decode shows the alpha channel varies (values include 0 and 1 — genuine transparency, not a flat opaque alpha). Wall **112 s**. |
+| `gen/moss-image` | `{"model":"gen/moss-image","prompt":"a red circle on a white background","size":"1024x1024"}` | **PASS** | response `{"created":1795150479,"data":[{"url":"http://192.168.1.62:8080/assets/f732b0148567/moss_00298_.png"}]}`. Asset `HTTP=200 CT=image/png bytes=2245088`, `PNG 1024×1024 RGB` (colortype 2), magic ok. Wall **282 s**. |
+
+All three response shapes are the same `{"created", "data":[{"url"}]}` envelope check C
+(§7.4) accepted — today's consumers parse these unchanged.
+
+### 9.2 Lane state after
+
+After the third lane's idle release: `weights-broker-comfyui-1` **Exited(143)**,
+`vllm-server` **Up, healthy**; `gluetun` untouched (Up 7 days); `weights-broker` still
+stopped by design. Trivial chat through the facade:
+`POST /v1/chat/completions {"model":"Qwen/Qwen3.8-27B-FP8",…,"max_tokens":8}` →
+**200**, real completion, `model:"Qwen/Qwen3.8-27B-FP8"`, `finish_reason:"length"` —
+restored lane verified.
+
+### 9.3 Triage
+
+None needed — all three lanes PASS; no model-forge bridge issue and no ComfyUI-stack
+failure. No service stopped/restarted/removed by hand, no `docker rm`/prune, no git
+commit, no secrets printed.
+
+---
+
+## 10. Lane parity — video lanes (2026-11-20, live on 192.168.1.62)
+
+**Model:** xiaomi/mimo-v2.6-pro
+**Scope:** the three h3 VIDEO lanes (`gen/h3-t2v`, `gen/h3-i2v`, `gen/h3-r2v`) via the
+async job API `POST /v1/videos` → `GET /v1/videos/{id}` → `/content`, one lane at a time
+(no concurrent gens). **Result: FAIL — `gen/h3-t2v` ran twice and failed twice, both
+failures inside ComfyUI execution (not the bridge); `gen/h3-i2v` and `gen/h3-r2v` NOT
+RUN — blocked on the h3 stack diagnosis** (same stack, same expected fate; per the ops
+steer, one honest stack-level finding covers all three lanes instead of burning two more
+30-min cycles).
+
+### 10.1 API-shape parity (verified before/around the runs)
+
+Today's shapes were first matched against the old broker source
+(`/root/docker/weights-broker/broker/main.py:1682-1712,1753-1770`):
+
+| surface | broker (today) | facade (observed) | match |
+|---|---|---|---|
+| `POST /v1/videos` | `{"id", "status":"queued", "model": <raw_id minus "gen/">}` (`main.py:1682-1696`) | `{"id": "9404b4a3e212", "status": "queued", "model": "h3-t2v"}` | ✅ (submit echo strips `gen/` exactly as the broker's `removeprefix("gen/")`) |
+| `GET /v1/videos/{id}` | `in_progress` → `{"id","status":"completed","data":[{"url"}]}` / `failed`+`error` | `{"id","status":"in_progress"}` while running; `failed` + `error` string on failure | ✅ |
+| `GET /jobs/{id}` | `{"id","kind","model","status","error","created","updated","params"}` (+`assets` on output); `params` decoded to object (`main.py:112`); row vocabulary `queued/running/done/failed` (`main.py:86,1237,1248`) | identical keys/values: `{"id":"36b49df203bb","kind":"gen","model":"h3-t2v","status":"running","error":null,"created":…,"updated":…,"params":{"prompt":…,"seconds":5.0}}` | ✅ |
+
+Request bodies were the consumer shapes: `{"model":"gen/h3-t2v","prompt":"a red ball
+bouncing on a wooden floor","seconds":5}` — **no `image` field** (t2v contract).
+
+### 10.2 Per lane
+
+| lane | verdict | evidence | wall time |
+|---|---|---|---|
+| `gen/h3-t2v` attempt 1 (job `9404b4a3e212`) | **FAIL** | poll1 at +90 s: `{"id","status":"failed","error":"comfyui execution error for 'h3-t2v': […execution_error node_id '14' node_type 'SamplerCustomAdvanced' … exception_message 'Allocation on device…'"}`. ComfyUI log: `torch.OutOfMemoryError: Allocation on device` inside `comfy_kitchen` `int8_linear` (`torch.cat(scaled_parts)`); memory summary device 0 **Allocated 22542 MiB / peak 22789 MiB, GPU reserved 23776 MiB of 24124 MB**; `[ERROR] Got an OOM, unloading all loaded models`; `Prompt executed in 42.80 seconds`. Boot log line: `Set vram state to: NORMAL_VRAM` | 90 s (job terminal at +57 s) |
+| `gen/h3-t2v` attempt 2 (job `36b49df203bb`) — ONE retry after the fix below | **FAIL — stalled** | submit 05:10:47Z → `{"id":"36b49df203bb","status":"queued","model":"h3-t2v"}`; `Set vram state to: NO_VRAM` this boot; model loads with offload (`loaded partially … 19996.14 MB offloaded`, `Using RAM pressure cache`; h3 = **MiniMaxH3** — `minimax_h3_fl2va_pruned_int8_convrot.safetensors`, Qwen3VL-32B `nvfp4_awq` TE, `minimax_h3_video/audio` VAEs). GPU samples: 05:12–05:14Z GPU1 8190 MiB @ **100%** (load/TE phase), then 05:38Z and 05:52Z **GPU0 1 MiB 0% / GPU1 468 MiB 0%, container CPU 1.2%, no new ComfyUI log lines for minutes**; `GET /v1/videos/{id}` still `{"id","status":"in_progress"}` at +2430 s (27 polls). Expected ~16 min; observed **27–39 min with zero GPU/CPU activity = stalled execution**, declared FAIL per ops steer | ≥39 min (job row still `running`; see §10.5) |
+| `gen/h3-i2v` | **NOT RUN — blocked on the h3 stack diagnosis** | same ComfyUI stack / same H3 workflow family as t2v; skipped to avoid burning 2 more 30-min cycles after the t2v stall | — |
+| `gen/h3-r2v` | **NOT RUN — blocked on the h3 stack diagnosis** | same as i2v | — |
+
+### 10.3 The fix applied before attempt 2 (stack config, not code)
+
+Diagnosis of the attempt-1 OOM found the **VRAM-mode drift**, not a bridge fault:
+
+- Launch chain: supervisor → `/opt/ai-dock/bin/supervisor-comfyui.sh` →
+  `python main.py --disable-auto-launch $(cat /etc/comfyui_args.conf)`.
+- `/etc/comfyui_args.conf` is a **`:ro` bind mount of host `/data/broker/comfy_args.conf`**
+  (`RW=false` per `docker inspect`); the ai-dock preflight rewrite
+  (`preflight.d/10-default.sh`: `printf "%s" "${COMFYUI_ARGS}" > /etc/comfyui_args.conf`)
+  is **inert** against the ro mount, so the host file is authoritative across boots.
+- Boot history (`docker logs -t`): `Set vram state to: NO_VRAM` on every boot
+  Aug 25 → Sep 22 20:02Z; **`NORMAL_VRAM` from Sep 22 21:20:57Z on**. The host file was
+  emptied **Sep 22 21:20:51** (now 0 bytes; a sibling `/data/broker/comfy_args.conf.novram.bak`,
+  9 bytes, same minute, preserves the historical `--novram` content). Who emptied it is
+  unidentified (no broker/facade code writes it — grep clean).
+- H3 on 24 GB requires `--novram` (registry note, `registry.py:317`: *"1024x576 @ 24 fps
+  fits 24 GB with --novram"*); the image lanes were unaffected because they fit in
+  NORMAL_VRAM — the drift was latent until the first h3 run since August.
+- **Fix (deployed host config only, no repo diff):** backed up the empty file to
+  `/data/broker/comfy_args.conf.bak-pre-novram-restore-20261120`, then
+  `printf "%s" "--novram" > /data/broker/comfy_args.conf`. Verified `Set vram state to:
+  NO_VRAM` on attempt 2's boot. Nothing else changed: no service stopped/restarted by
+  hand, no `docker rm`/prune, `gluetun` untouched, no git commit.
+
+### 10.4 Triage — ComfyUI stack (H3 on current ComfyUI master), NOT a bridge regression
+
+**Bridge hypothesis (VRAM fight / release-at-submit) ruled out with evidence.** Docker
+events for job `9404b4a3e212` (attempt 1) reconstruct the claim/evict/release timeline:
+`04:58:33Z vllm-server kill → die 04:58:34` → `weights-broker-comfyui-1 start 04:58:35`
+→ (ComfyUI executes 04:58:46–04:59:29) → `comfy die 04:59:30` → `vllm-server start
+04:59:34` → `health: healthy 05:00:55`. **vLLM was down for the job's entire life**; the
+restore landed only after the job went terminal. 5 × 20 s live samples during attempt 2
+confirmed the same discipline (`vllm-server` absent throughout; GPU0 1 MiB idle, GPU1
+8.2 GB @ 100% during the active phase). This matches the code path
+(`facade.py:_run_gen_job`: admit → claim → run → **release in `finally`**; the async
+`/v1/videos` submit holds the claim for the whole background run). Bridge lifecycle
+behaviour is correct in both attempts.
+
+**Stack-side facts.** The failure is inside ComfyUI execution in both modes: with the
+drifted NORMAL_VRAM it is a hard OOM at `SamplerCustomAdvanced` (22.5 GB allocated on
+device — the known "H3 without `--novram`" failure), and with the restored known-good
+`--novram` it becomes a **silent stall** (idle GPU/CPU, no error, no output). The H3
+workflow is MiniMaxH3 with `comfy_kitchen` quantized ops (int8/nvfp4) — an upstream
+ComfyUI-master stack. Current checkout `master @ bdb0816a292d`; the venv runs
+`torch 2.7.1+cu128` and ComfyUI logs `Unsupported Pytorch detected. DynamicVRAM support
+requires Pytorch version 2.8 or later … Falling back to legacy ModelPatcher` — i.e. the
+tree and its torch are mid-transition upstream. Templates are byte-identical to the old
+broker's (md5: `h3_t2v 5ad145407d3f1097289d587568a5e94c`,
+`h3_i2v 7b3f9afb40ae893cc93bd726dbfbcc3d`, `h3_r2v b40f2a06e4ba43c5345138c77e3d5cbe`
+vs `/root/docker/weights-broker/workflows/`) and the submitted params match the broker's
+stored shape (`{"prompt","seconds":5.0}`). Honest caveat: this boot's ai-dock self-update
+was **blocked** (`error: Your local changes to the following files would be overwritten
+by merge`; `update-comfyui.sh: line 34: syntax error`), so the tree predates today — the
+regression point (ComfyUI-tree update vs the Sep 22 args drift) cannot be narrowed
+further without running H3 against a pinned older ComfyUI. The last successful h3 outputs
+on record are `weightsbroker_h3_00001–00009_.mp4` (Aug 5–18, previous container
+incarnation); **no h3 run is recorded against the current tree**, so the *lane's*
+last-known-good state predates both suspects.
+
+### 10.5 Lane state after / blockers
+
+- At §10 write time: `weights-broker-comfyui-1` **Up (holding the stalled job)**,
+  `vllm-server` **Exited** (evicted by the claim), `gluetun` untouched (Up 7 days),
+  `weights-broker` stopped by design. Stalled job `36b49df203bb` holds the gen claim;
+  the facade's runner history budget is `history_timeout_s=3600`
+  (`engines/comfyui.py`), so the row fails and the claim releases by **~06:11Z**, after
+  which the normal restore runs. **Verified after that point (06:13Z):** the runner's
+  history poll timed out at 3600 s — job `36b49df203bb` →
+  `{"id":"36b49df203bb","status":"failed","error":"history poll timed out after 3600s for c4be4e15-…"}`,
+  the claim released on schedule, `weights-broker-comfyui-1` **Exited(143)**,
+  `vllm-server` **Up, healthy**, `gluetun` untouched (Up 7 days), `weights-broker`
+  stopped by design. Trivial chat through the facade:
+  `POST /v1/chat/completions {"model":"Qwen/Qwen3.8-27B-FP8",…,"max_tokens":8}` →
+  **200**, real completion `"OK"`, `model:"Qwen/Qwen3.8-27B-FP8"` — restored lane
+  verified. (Note the stalled job did pin the gen lane for the full 3600 s window, as
+  flagged in blocker 3 below.)
+- **Blockers for the three h3 video lanes:** (1) MiniMaxH3 must be made to run again on
+  the current ComfyUI master + torch 2.7.1 (pin an older tree, upgrade torch to ≥2.8,
+  or fix the upstream nodes) — this is a **ComfyUI-stack** work item, not model-forge;
+  (2) guard `/data/broker/comfy_args.conf` (whoever emptied it on Sep 22 is still
+  unidentified; the preflight `${COMFYUI_ARGS}` rewrite being inert means a host-side
+  write is the only mutator);
+  (3) the facade's async-video default has **no caller-supplied budget** —
+  `handle_video_submit` never passes `timeout_s`, so a stalled ComfyUI job pins the gen
+  lane for the runner's full 3600 s history window (worth a follow-up knob, cosmetic
+  here).
+- No service stopped/restarted/removed by hand during this phase, no `docker rm`/prune,
+  no git commit, no secrets printed.
