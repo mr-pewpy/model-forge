@@ -1831,7 +1831,7 @@ def test_broker_status_report_shape_with_fakes(tmp_path, monkeypatch):
     assert out["ok"] is True and out["action"] == "status"
     assert out["pulled"] == [{"model_id": "krea-2-turbo",
                               "path": "/models/krea.safetensors",
-                              "size_bytes": 1234}]
+                              "size_bytes": 1234, "source": ""}]
     assert out["resident"] == [{"model_id": "chat-a", "engine": "ollama",
                                 "lane": "chat"}]
     booked = {row["model_id"]: row for row in out["booked"]}

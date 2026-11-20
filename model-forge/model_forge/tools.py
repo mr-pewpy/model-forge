@@ -1840,11 +1840,67 @@ def _engine_install_action(args: dict) -> dict:
     return plan
 
 
+def _install_mark_installed(args: dict) -> dict:
+    """action=mark_installed — record that a model's weights are present on a
+    compute target (B10), so swap pre-flights trust them there.
+
+    A remote machine cannot be scanned over an engine API, so the record
+    carries honest provenance: ``observed`` when the target's engine reports
+    its pull slot complete (Maya /api/pull/status says done), else
+    ``user_confirmed`` — the user's attestation that the exact on-target
+    install step finished. A wrong record is not destructive: the swap's
+    measured LOAD phase reports the real outcome and nothing on disk is
+    touched by a record. No approval gate: this records a fact the user
+    asserts; it redirects no traffic and deletes nothing."""
+    from . import pull
+    model_id = str(args.get("model_id") or "").strip()
+    if not model_id:
+        return {"ok": False, "action": "mark_installed",
+                "error": "model_id is required"}
+    target = get_target(args.get("target"))
+    if target is None:
+        return {"ok": False, "action": "mark_installed",
+                "error": f"unknown target: {args.get('target')!r} "
+                         "(see model_forge_status)"}
+    source = pull.RECORD_USER_CONFIRMED
+    try:
+        status = maya_adapter.pull_status(base_url=target.base_url)
+    except Exception:  # noqa: BLE001 — no observation is an honest outcome
+        status = None
+    observed = (isinstance(status, dict)
+                and str(status.get("state") or "").strip().lower()
+                in ("done", "completed", "finished"))
+    if observed:
+        source = pull.RECORD_OBSERVED
+    row = pull.record_pull_entry(
+        target.id, model_id,
+        path=str(args.get("path") or ""),
+        size_bytes=args.get("size_bytes"), source=source)
+    row["action"] = "mark_installed"
+    if target.kind == "local":
+        row["detail"] = (
+            "recorded; note the local target's swap pre-flight reads the "
+            "on-disk storage scan, not records — this entry is "
+            "informational")
+        return row
+    row["detail"] = (
+        ("the engine reports its pull slot complete — recorded as "
+         "observed" if observed else
+         "the engine did not report a completed pull for this model — "
+         "recorded as YOUR confirmation that the install step finished")
+        + f"; swap pre-flights on {target.id!r} now trust these weights "
+          "(the measured LOAD phase reports the real outcome if they are "
+          "not actually there)")
+    return row
+
+
 def model_forge_install(args: dict | None = None, **kwargs) -> str:
     """Pull a model on a compute target (Maya: HTTP pull; HF download: job;
     Strata: CLI), or provision an engine (action='engine_install': plan the
     vendor's official install command first; execute=true runs it behind the
-    human-approval gate). Pass job_id to poll a download or engine install."""
+    human-approval gate). Pass job_id to poll a download or engine install.
+    action='mark_installed' records weights present on a remote target (B10)
+    — engine-observed or user-confirmed — so swaps there are not refused."""
     args = args or {}
     try:
         from . import pull
@@ -1853,10 +1909,12 @@ def model_forge_install(args: dict | None = None, **kwargs) -> str:
         action = str(args.get("action") or "model_install").strip()
         if action == "engine_install":
             return _dump(_engine_install_action(args))
+        if action == "mark_installed":
+            return _dump(_install_mark_installed(args))
         if action != "model_install":
             return _dump({"error": f"unknown action: {action!r}; valid "
                                    f"actions: ['model_install', "
-                                   f"'engine_install']"})
+                                   f"'engine_install', 'mark_installed']"})
         model_id = str(args.get("model_id") or "").strip()
         if not model_id:
             return _dump({"error": "model_id required (or job_id to poll a "
@@ -1913,6 +1971,16 @@ def model_forge_install(args: dict | None = None, **kwargs) -> str:
                                           sha256=str(args.get("sha256", "")))
             plan.update(started)
             plan["dest"] = dest
+        if (target.kind != "local"
+                and plan.get("action") in ("run_on_target",
+                                           "run_cli_on_target", "maya_pull")):
+            plan["record_hint"] = (
+                "when the files land on " + target.label + ", record them "
+                "with model_forge_install action='mark_installed', "
+                f"model_id={model_id!r}, target={target.id!r} — recorded "
+                "pulls are what the swap pre-flight trusts on remote "
+                "targets (recorded as your confirmation unless the engine "
+                "reports the pull complete)")
         return _dump(plan)
     except Exception as exc:
         return _err(exc)
@@ -3315,12 +3383,37 @@ def _seed_local_pulls(stack: dict, target) -> None:
                                path, row.get("size_bytes"))
 
 
+def _seed_remote_pulls(stack: dict, target) -> None:
+    """Recorded pulls for a REMOTE target (B10) in the residency summary —
+    the persistent pull-records store: engine-observed completions and
+    user-confirmed on-target installs. A remote machine cannot be scanned
+    over an engine API, so these records are what the swap pre-flight
+    trusts; the local target never uses them (its weights are scanned from
+    disk)."""
+    if target.kind == "local" or stack.get("remote_pulls_seeded"):
+        return
+    stack["remote_pulls_seeded"] = True
+    try:
+        from . import pull
+        rows = pull.pull_entries(target.id)
+    except Exception:  # noqa: BLE001 — the summary degrades, never crashes
+        return
+    ledger = stack["ledger"]
+    for row in rows:
+        if row.get("model_id"):
+            ledger.record_pull(target.id, str(row["model_id"]),
+                               str(row.get("path") or ""),
+                               row.get("size_bytes"),
+                               source=str(row.get("source") or ""))
+
+
 def _broker_status(stack: dict, target) -> dict:
     """Honest read-only residency summary: pulled weights with sizes, what is
     resident now, booked ceilings with provenance labels, catalog entries
     that stay unbooked until benched, and current budget usage."""
     ledger = stack["ledger"]
     _seed_local_pulls(stack, target)
+    _seed_remote_pulls(stack, target)
     budget = ledger.budget_gb(target.id)
     booked_now = ledger.booked_total_gb(target.id)
     report = ledger.booking_report()
@@ -3338,7 +3431,7 @@ def _broker_status(stack: dict, target) -> dict:
         "action": "status",
         "target": target.id,
         "pulled": [{"model_id": r.model_id, "path": r.path,
-                    "size_bytes": r.size_bytes}
+                    "size_bytes": r.size_bytes, "source": r.source}
                    for r in ledger.pulled(target.id)],
         "resident": [{"model_id": r.model_id, "engine": r.engine,
                       "lane": r.lane} for r in ledger.residents(target.id)],
@@ -3492,6 +3585,7 @@ def _broker_swap(stack: dict, target, request, release, dry_run: bool) -> dict:
     untouched, and dry_run=True returns the preflight plan rows and changes
     nothing."""
     _seed_local_pulls(stack, target)
+    _seed_remote_pulls(stack, target)
     orchestrator = stack["orchestrator"]
     result = orchestrator.swap(target.id, request, release=release,
                                dry_run=dry_run)

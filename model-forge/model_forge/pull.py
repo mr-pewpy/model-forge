@@ -14,6 +14,7 @@ import hashlib
 import json
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -171,3 +172,90 @@ def start_download(url: str, dest: str, sha256: str = "") -> dict:
                      daemon=True).start()
     return {"ok": True, "job_id": job_id, "poll": "model_forge_install with "
             f"job_id={job_id}"}
+
+
+# --- pull records (B10): what weights are known present where ---------------
+#
+# The local target's weights are read from the storage scan every time. A
+# REMOTE target cannot be scanned over an engine API, so installs RECORD what
+# landed there: an engine-observed completion (Maya's /api/pull/status) or the
+# user's own attestation after running the exact on-target command. The
+# swap pre-flight reads these records instead of refusing every remote swap;
+# a wrong record degrades to an honest load failure during the measured LOAD
+# phase — it never destroys anything (fail-closed lives in the planner, not
+# in a guess about remote disk state).
+
+_RECORDS_FILE = "pull-records.json"
+RECORD_OBSERVED = "observed"
+RECORD_USER_CONFIRMED = "user_confirmed"
+
+
+def _records_path() -> Path:
+    from plugins.plugin_storage import plugin_data_dir
+    return plugin_data_dir("model-forge") / _RECORDS_FILE
+
+
+def _read_records() -> dict:
+    try:
+        raw = json.loads(_records_path().read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _write_records(records: dict) -> None:
+    path = _records_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(records, indent=1, sort_keys=True),
+                    encoding="utf-8")
+
+
+def record_pull_entry(target_id: str, model_id: str, *, path: str = "",
+                      size_bytes=None,
+                      source: str = RECORD_USER_CONFIRMED) -> dict:
+    """Record weights present on a compute target (B10). ``source`` is the
+    honest provenance: ``observed`` (an engine reported the pull done) or
+    ``user_confirmed`` (the user attested the on-target install finished).
+    Records never claim more than that — they say the weights are believed
+    present, and the swap's LOAD phase states the real outcome."""
+    target_id = str(target_id or "").strip()
+    model_id = str(model_id or "").strip()
+    if not target_id or not model_id:
+        return {"ok": False, "error": "target_id and model_id are required"}
+    try:
+        size = int(size_bytes) if size_bytes is not None else None
+    except (TypeError, ValueError):
+        size = None
+    row = {"target_id": target_id, "model_id": model_id,
+           "path": str(path or "") or "(path not recorded)",
+           "size_bytes": size,
+           "source": (source if source in (RECORD_OBSERVED,
+                                           RECORD_USER_CONFIRMED)
+                      else RECORD_USER_CONFIRMED),
+           "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                        time.gmtime())}
+    records = _read_records()
+    records[f"{target_id}:{model_id}"] = row
+    _write_records(records)
+    return {"ok": True, **row}
+
+
+def pull_entries(target_id: str | None = None) -> list[dict]:
+    """Recorded pulls — for one target when ``target_id`` is given, else all.
+    Newest key order stable (sorted)."""
+    rows = [r for r in _read_records().values() if isinstance(r, dict)]
+    if target_id is not None:
+        rows = [r for r in rows if r.get("target_id") == target_id]
+    return sorted(rows, key=lambda r: (str(r.get("target_id")),
+                                       str(r.get("model_id"))))
+
+
+def forget_pull_entry(target_id: str, model_id: str) -> dict:
+    """Drop one record (e.g. after the user says the weights are gone)."""
+    key = f"{str(target_id).strip()}:{str(model_id).strip()}"
+    records = _read_records()
+    if key not in records:
+        return {"ok": False, "error": f"no recorded pull for {key!r}"}
+    records.pop(key, None)
+    _write_records(records)
+    return {"ok": True, "forgotten": key}

@@ -251,10 +251,15 @@ class Booking:
 
 @dataclass(frozen=True)
 class PullRecord:
-    """Weights on disk at a compute target, with size where known."""
+    """Weights on disk at a compute target, with size where known.
+
+    ``source`` is honest provenance: "" (the local storage scan),
+    ``observed`` (an engine reported the pull done) or ``user_confirmed``
+    (the user attested the on-target install finished)."""
     model_id: str
     path: str
     size_bytes: int | None = None
+    source: str = ""
 
 
 @dataclass(frozen=True)
@@ -378,7 +383,8 @@ class ResidencyLedger:
 
     # -- pulls (weights on disk) --
 
-    def record_pull(self, target_id, model_id, path, size_bytes=None) -> dict:
+    def record_pull(self, target_id, model_id, path, size_bytes=None,
+                    source="") -> dict:
         if not str(path or "").strip():
             return {"ok": False, "model_id": model_id,
                     "error": "path must be a non-empty string"}
@@ -386,7 +392,8 @@ class ResidencyLedger:
             size = int(size_bytes) if size_bytes is not None else None
         except (TypeError, ValueError):
             size = None
-        rec = PullRecord(model_id=model_id, path=str(path), size_bytes=size)
+        rec = PullRecord(model_id=model_id, path=str(path), size_bytes=size,
+                         source=str(source or ""))
         with self._lock:
             self._pulls.setdefault(target_id, {})[model_id] = rec
         return {"ok": True, "target_id": target_id, "model_id": model_id,

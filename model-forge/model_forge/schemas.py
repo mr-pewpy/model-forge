@@ -168,21 +168,30 @@ INSTALL = {
         "official install command (Ollama, Strata, Project Maya) and it "
         "runs as a background job only after the human-approval gate "
         "approves it; llama.cpp is never installed — it defers to Hermes "
-        "core's managed runtime. Use when the user wants a model from "
-        "model_forge_browse downloaded, or an engine installed."
+        "core's managed runtime. action='mark_installed' records weights "
+        "present on a remote target (engine-observed or user-confirmed) so "
+        "the swap pre-flight trusts them there. Use when the user wants a "
+        "model from model_forge_browse downloaded, an engine installed, or "
+        "a remote install acknowledged."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["model_install", "engine_install"],
+                "enum": ["model_install", "engine_install",
+                         "mark_installed"],
                 "description": (
                     "'model_install' (default) pulls a model. "
                     "'engine_install' provisions an inference engine: plan "
                     "first (the vendor's exact install command), then "
                     "execute=true runs it after the human-approval gate "
-                    "approves — denial or timeout runs nothing."
+                    "approves — denial or timeout runs nothing. "
+                    "'mark_installed' records that model_id's weights are "
+                    "present on target (after you ran the on-target command "
+                    "or watched the pull finish) — recorded as your "
+                    "confirmation unless the engine reports the pull "
+                    "complete."
                 ),
             },
             "model_id": {
