@@ -402,6 +402,46 @@ def test_history_timeout_is_ok_false():
     assert sleep.sleeps.count(1.0) == 3    # poll_interval each of the 3 polls
 
 
+def test_run_request_timeout_clamps_below_history_budget():
+    # a small request budget (the OpenAI _timeout) must cap the poll loop
+    # WITHOUT waiting the instance's own history budget.
+    http = FakeHTTP()
+    http.history = {}                     # never completes
+    sleep = FakeSleep()
+    r = make_runner(http, sleep, poll_interval_s=1.0, history_timeout_s=3600.0)
+    res = r.run("moss-image", {}, assets_dir="/tmp/a", job_id="j",
+                timeout_s=3.0)
+    assert res["ok"] is False and res["files"] == []
+    assert "timed out" in res["reason"]
+    # 3 polls at 1 s, not 3600 — the request budget won.
+    assert len(http.calls_to("/history/pid-default")) == 3
+    assert sleep.sleeps.count(1.0) == 3
+
+
+def test_run_request_timeout_cannot_exceed_history_budget():
+    # a budget larger than the instance ceiling is clamped to the ceiling.
+    http = FakeHTTP()
+    http.history = {}                     # never completes
+    sleep = FakeSleep()
+    r = make_runner(http, sleep, poll_interval_s=1.0, history_timeout_s=2.0)
+    res = r.run("moss-image", {}, assets_dir="/tmp/a", job_id="j",
+                timeout_s=9999.0)
+    assert res["ok"] is False and "timed out" in res["reason"]
+    assert len(http.calls_to("/history/pid-default")) == 2
+
+
+def test_run_without_timeout_uses_history_budget():
+    # timeout_s defaults to None -> the historical history_timeout_s budget is
+    # unchanged (backward compatible).
+    http = FakeHTTP()
+    http.history = {}
+    sleep = FakeSleep()
+    r = make_runner(http, sleep, poll_interval_s=1.0, history_timeout_s=4.0)
+    res = r.run("moss-image", {}, assets_dir="/tmp/a", job_id="j")
+    assert res["ok"] is False and "timed out" in res["reason"]
+    assert len(http.calls_to("/history/pid-default")) == 4
+
+
 def test_history_error_status_is_ok_false():
     http = FakeHTTP()
     http.history = {"pid-default": {"status": {
@@ -562,3 +602,50 @@ def test_history_item_without_filename_does_not_count_as_done(tmp_path):
     r = make_runner(http, poll_interval_s=1.0, history_timeout_s=5.0)
     res = r.run("moss-image", {}, assets_dir=str(tmp_path), job_id="j")
     assert res["ok"] is True and res["files"] == ["/output/real.png"]
+
+
+# --- video-param parity (P5b-B2) -------------------------------------------
+
+def test_prepare_params_video_coerces_seconds_and_maps_size(tmp_path):
+    # _openai_video_params parity: seconds -> float, size -> resolution, and
+    # crucially NOT the image expansion (no width/height/aspect_ratio).
+    r = make_runner(FakeHTTP())
+    out = r._prepare_params(
+        {"model": "h3-t2v", "seconds": "5", "size": "1024x576",
+         "prompt": "p"}, str(tmp_path), "video")
+    assert out["seconds"] == 5.0 and isinstance(out["seconds"], float)
+    assert out["resolution"] == "1024x576"
+    assert "width" not in out and "height" not in out
+    assert "aspect_ratio" not in out
+    assert "model" not in out
+    assert out["prompt"] == "p"
+
+
+def test_prepare_params_video_keeps_n_and_timeout(tmp_path):
+    # video prep drops ONLY model (broker parity); n/_timeout ride through and
+    # are simply unmapped by injection.
+    r = make_runner(FakeHTTP())
+    out = r._prepare_params({"model": "x", "n": 1, "_timeout": 5},
+                            str(tmp_path), "video")
+    assert "model" not in out and out.get("n") == 1 and out.get("_timeout") == 5
+
+
+def test_prepare_params_image_default_kind_still_expands_size(tmp_path):
+    # the default output_kind stays "image" — existing callers unchanged.
+    r = make_runner(FakeHTTP())
+    out = r._prepare_params({"size": "1024x576"}, str(tmp_path))
+    assert out["aspect_ratio"] == "16:9"
+    assert out["width"] == 1024 and out["height"] == 576
+
+
+def test_run_video_lane_injects_seconds_onto_value_node(tmp_path):
+    http = FakeHTTP()
+    http.history = _image_entry(filename="clip.mp4", bucket="videos", node="92")
+    r = make_runner(http)
+    res = r.run("h3-t2v", {"prompt": "x", "seconds": "4", "size": "1024x576"},
+                assets_dir=str(tmp_path), job_id="j")
+    assert res["ok"] is True and res["output_kind"] == "video"
+    graph = http.calls_to("/prompt")[0]["body"]["prompt"]
+    # seconds -> node 111 value (the lane's PrimitiveFloat), prompt -> node 104
+    assert graph["111"]["inputs"]["value"] == 4.0
+    assert graph["104"]["inputs"]["prompt"] == "x"

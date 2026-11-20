@@ -33,7 +33,7 @@ from .engines import maya as maya_adapter
 from .engines import strata as strata_adapter
 from .engines.base import route_exists, root_url
 from .hardware import probe_hardware
-from .media import media_plan
+from .media import media_plan, runner_plan
 from .registry import (
     MODALITIES, MODALITY_LABELS, PHANTOM_ENGINE_NOTE, PHANTOM_ENGINES,
     ModelEntry, fit_report, fit_verdict, models_for,
@@ -1579,13 +1579,279 @@ def model_forge_storage(args: dict | None = None, **kwargs) -> str:
         return _err(exc)
 
 
+# --- local ComfyUI workflow-runner wiring (image / video lanes) --------------
+
+# Local ComfyUI-runner media jobs keyed by job id. The runner is synchronous,
+# so a video job runs in a daemon thread while the tool returns immediately and
+# the caller keeps the existing job_id polling contract.
+_COMFY_MEDIA_JOBS: dict = {}
+_COMFY_JOBS_LOCK = threading.Lock()
+# The workflow inputs a local lane may consume; everything else in the tool
+# args (modality/target/model/job_id) is control data, never a workflow input.
+_LOCAL_GEN_PARAM_KEYS = ("prompt", "seed", "steps", "seconds", "size", "cfg",
+                         "image", "image_url", "resolution",
+                         "negative_prompt")
+
+
+def _local_workflow_runner(target, *, http=None, **seams):
+    """The local ComfyUI workflow runner for *target*, or None when the active
+    stack does not provide one.
+
+    A runner exists only for a LOCAL target whose detected engines include a
+    live ComfyUI: the ported workflow templates drive a ComfyUI this process
+    can reach directly, and there is no remote-template transport, so a remote
+    media-gateway target keeps its HTTP path. Read-only detection; a failure or
+    no ComfyUI is an honest None, never a raise. Injectable — tests replace
+    this module attribute so no probe runs:
+    ``monkeypatch.setattr(tools, "_local_workflow_runner", lambda t, **k: fake)``.
+    """
+    if target is None or getattr(target, "kind", "") != "local":
+        return None
+    try:
+        from .engines.comfyui import ComfyWorkflowRunner
+        for e in _detect(""):
+            if e.id == "comfyui" and getattr(e, "available", False):
+                return ComfyWorkflowRunner(getattr(e, "endpoint", "") or "",
+                                           http=http, **seams)
+    except Exception:  # noqa: BLE001 — no runner is an honest fallback
+        return None
+    return None
+
+
+def _local_assets_dir() -> str:
+    """Dir the runner stashes uploaded image references under (``uploads/``).
+    The plugin data dir, with an honest temp fallback when it is unavailable."""
+    try:
+        from plugins.plugin_storage import plugin_data_dir
+        d = plugin_data_dir("model-forge") / "media"
+        d.mkdir(parents=True, exist_ok=True)
+        return str(d)
+    except Exception:  # noqa: BLE001 — a temp dir keeps the job going
+        import tempfile
+        return tempfile.mkdtemp(prefix="model-forge-media-")
+
+
+def _media_asset_url(path, *, embed: bool = True) -> str:
+    """A reference for a runner output file: a ``data:`` URL when the file is
+    readable locally and ``embed`` is set (images), else the absolute path the
+    runner reported. Never raises — an unreadable file falls back to its path."""
+    from pathlib import Path
+    try:
+        p = Path(str(path))
+        if embed and p.is_file():
+            import base64
+            mime = _IMAGE_MIME_BY_SUFFIX.get(p.suffix.lower(),
+                                             "application/octet-stream")
+            return (f"data:{mime};base64,"
+                    + base64.b64encode(p.read_bytes()).decode())
+    except OSError:
+        pass
+    return str(path)
+
+
+def _local_gen_params(args: dict) -> dict:
+    """The workflow inputs to forward from the tool args (whitelisted so the
+    control keys — modality/target/model/job_id — never reach a lane)."""
+    return {k: args[k] for k in _LOCAL_GEN_PARAM_KEYS
+            if args.get(k) is not None}
+
+
+def _generate_media_local(args: dict, target, modality: str, runner) -> dict:
+    """Run one media job through the local ComfyUI workflow runner, inside the
+    same claim/release scope the media-gateway path uses.
+
+    Image lanes run synchronously (the caller waits; each output is a data:
+    URL). Video lanes keep the job_id polling contract: the synchronous runner
+    runs in a daemon thread and the lane stays claimed until the job settles.
+    Either way the lane is claimed before submit and released on completion or
+    failure — the existing scope semantics, preserved. A job_id argument is
+    handled as a poll.
+    """
+    if args.get("job_id"):
+        return _poll_local_media_job(args, target)
+    model = str(args.get("model", "")).strip()
+    if not model:
+        return {"ok": False, "action": "needs_args",
+                "detail": f"{modality} needs model (e.g. gen/qwen-image-2.1 "
+                          "or a bare lane id)"}
+    plan = runner_plan(modality, model, runner)
+    if not plan.get("ok"):
+        return plan
+    workflow_id = plan["workflow_id"]
+    params = _local_gen_params(args)
+    if modality == "image":
+        return _run_local_image(target, runner, workflow_id, model, params)
+    return _submit_local_video(target, runner, workflow_id, model, params)
+
+
+def _run_local_image(target, runner, workflow_id, model, params) -> dict:
+    """Synchronous image lane: claim the scope, run the lane, release, and
+    return the OpenAI images shape (``data: [{"url": ...}]``)."""
+    claim = _claim_media_lane(target, "image", model)
+    if not claim.get("ok"):
+        return {"ok": False, "action": "claim_failed",
+                "error": claim.get("error") or "the lane claim was refused",
+                "lane_claim": _lane_block(claim),
+                "detail": "the GPU lane claim was refused (fail closed) — "
+                          "nothing was submitted"}
+    settled: list = []
+
+    def _settle(note):
+        # Mark the scope settled BEFORE releasing: if the release itself
+        # raises, the finally must not issue a second release for the same
+        # scope (release idempotency is not assumed).
+        settled.append(True)
+        rel = _release_media_lane(target, claim["scope_id"])
+        return _lane_block(claim, released=rel, note=note)
+
+    try:
+        job_id = "img-" + uuid.uuid4().hex[:10]
+        result = runner.run(workflow_id, params,
+                            assets_dir=_local_assets_dir(), job_id=job_id)
+        ok = bool(result.get("ok"))
+        lane = _settle(
+            "the render completed — the lane scope was released and what was "
+            "resident at claim time is restored" if ok else
+            "the job failed — the lane scope was released and what was "
+            "resident at claim time is restored")
+        if not ok:
+            return {"ok": False, "action": "submit_failed",
+                    "output_kind": "image", "workflow_id": workflow_id,
+                    "error": result.get("reason")
+                             or "the local ComfyUI job failed",
+                    "lane_claim": lane}
+        files = result.get("files") or []
+        return {"ok": True, "action": "done", "output_kind": "image",
+                "data": [{"url": _media_asset_url(f)} for f in files],
+                "files": files, "model": model, "workflow_id": workflow_id,
+                "lane_claim": lane,
+                "note": "ran the local ComfyUI image lane; each output is a "
+                        "data: URL (or the runner's absolute path when the "
+                        "file was not readable here)"}
+    finally:
+        if not settled:
+            _release_media_lane(target, claim["scope_id"])
+
+
+def _submit_local_video(target, runner, workflow_id, model, params) -> dict:
+    """Async video lane: claim the scope, start the synchronous runner in a
+    daemon thread, and return the OpenAI video-job submit shape (``{id,
+    status}``). The lane stays claimed until the poller sees a terminal state."""
+    claim = _claim_media_lane(target, "video", model)
+    if not claim.get("ok"):
+        return {"ok": False, "action": "claim_failed",
+                "error": claim.get("error") or "the lane claim was refused",
+                "lane_claim": _lane_block(claim),
+                "detail": "the GPU lane claim was refused (fail closed) — "
+                          "nothing was submitted"}
+    job_id = "vid-" + uuid.uuid4().hex[:10]
+    record = {"id": job_id, "status": "queued",
+              "scope_id": claim["scope_id"], "model_id": model,
+              "modality": "video", "workflow_id": workflow_id,
+              "files": [], "data": [], "error": ""}
+    with _COMFY_JOBS_LOCK:
+        _COMFY_MEDIA_JOBS[job_id] = record
+    _MEDIA_SCOPE_JOBS[job_id] = {"scope_id": claim["scope_id"],
+                                 "target_id": target.id, "model_id": model,
+                                 "modality": "video"}
+
+    def _worker():
+        try:
+            res = runner.run(workflow_id, params,
+                             assets_dir=_local_assets_dir(), job_id=job_id)
+        except Exception as exc:  # noqa: BLE001 — the record carries it
+            res = {"ok": False, "files": [],
+                   "reason": f"{type(exc).__name__}: {exc}"}
+        with _COMFY_JOBS_LOCK:
+            rec = _COMFY_MEDIA_JOBS.get(job_id)
+            if rec is None:
+                return
+            if res.get("ok"):
+                files = res.get("files") or []
+                rec["status"] = "completed"
+                rec["files"] = files
+                rec["data"] = [{"url": _media_asset_url(f, embed=False)}
+                               for f in files]
+            else:
+                rec["status"] = "failed"
+                rec["error"] = (res.get("reason")
+                                or "the local ComfyUI job failed")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    lane = _lane_block(claim, note="the lane stays claimed until the job "
+                                   f"completes; poll with job_id={job_id} — "
+                                   "the scope releases and what was resident "
+                                   "at claim time is restored when the job "
+                                   "finishes")
+    return {"ok": True, "action": "submitted", "output_kind": "video",
+            "submitted": {"id": job_id, "status": "queued",
+                          "model": workflow_id},
+            "lane_claim": lane,
+            "poll": f"model_forge_generate_media with modality=video, "
+                    f"target={target.id}, job_id={job_id}"}
+
+
+def _poll_local_media_job(args: dict, target) -> dict:
+    """Poll a local ComfyUI-runner job by job_id, in the OpenAI video-job shape
+    (``{status, data: [{url}]}``). A terminal job releases its lane scope; a
+    non-local job_id is an honest ``unknown_job``."""
+    job_id = str(args.get("job_id") or "")
+    if not _JOB_TOKEN_RE.fullmatch(job_id):
+        return {"ok": False, "action": "invalid_job_id",
+                "error": "job_id must be 1-128 ASCII letters, digits, '_' or "
+                         f"'-' (got {job_id!r})"}
+    with _COMFY_JOBS_LOCK:
+        rec = _COMFY_MEDIA_JOBS.get(job_id)
+        snapshot = dict(rec) if rec is not None else None
+    if snapshot is None:
+        return {"ok": False, "action": "unknown_job",
+                "error": f"no local ComfyUI job {job_id!r} — it may have "
+                         "already been collected, or it is not a local job"}
+    status = snapshot["status"]
+    terminal = status in ("completed", "failed")
+    job = {"id": job_id, "model": snapshot.get("workflow_id"),
+           "status": ("completed" if status == "completed"
+                      else "failed" if status == "failed" else "in_progress")}
+    if snapshot.get("error"):
+        job["error"] = snapshot["error"]
+    if status == "completed":
+        job["data"] = snapshot.get("data") or []
+    claim = {"scope_id": snapshot["scope_id"],
+             "model_id": snapshot.get("model_id"), "modality": "video",
+             "progress": []}
+    out = {"ok": True, "output_kind": "video", "job": job}
+    if terminal:
+        with _COMFY_JOBS_LOCK:
+            _COMFY_MEDIA_JOBS.pop(job_id, None)
+        _MEDIA_SCOPE_JOBS.pop(job_id, None)
+        rel = _release_media_lane(target, snapshot["scope_id"])
+        note = ("job complete — the lane scope was released and what was "
+                "resident at claim time is restored")
+        if status == "completed":
+            # Honest divergence from the facade: a finished LOCAL video job
+            # reports the runner's filesystem paths, not HTTP asset URLs.
+            note += (" Each job.data[].url is the runner's local filesystem "
+                     "path, NOT an HTTP-fetchable asset URL (the remote "
+                     "facade's /assets URLs differ); read it on the runner "
+                     "host.")
+        out["lane_claim"] = _lane_block(claim, released=rel, note=note)
+    else:
+        out["lane_claim"] = _lane_block(
+            claim,
+            note="the job is still running — the lane stays claimed; poll "
+                 "again and the scope releases when the job finishes")
+    return out
+
+
 def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
-    """Generate 3D models / music / SFX through a compute target's
-    media-gateway endpoint. 3d submits a job (poll with job_id); music/sfx
-    run synchronously and return audio (JSON result bodies are passed
-    through). The GPU lane is claimed as one workflow scope before the job
-    is submitted and released when the job completes or fails; a refused
-    claim fails closed with an honest error and submits nothing."""
+    """Generate media through a compute target. 3d/music/sfx ride the target's
+    media-gateway endpoint; image/video run through the local ComfyUI workflow
+    runner when one is available (a local target with ComfyUI detected), else
+    image falls back to the gateway route and video is reported as a facade
+    job-API lane. 3d and local video submit a job (poll with job_id); image and
+    music/sfx run synchronously. The GPU lane is claimed as one workflow scope
+    before the job is submitted and released when the job completes or fails; a
+    refused claim fails closed with an honest error and submits nothing."""
     args = args or {}
     try:
         import json as _json
@@ -1593,6 +1859,21 @@ def model_forge_generate_media(args: dict | None = None, **kwargs) -> str:
         target = get_target(args.get("target"))
         if target is None:
             return _dump({"error": f"unknown target: {args.get('target')}"})
+        # A LOCAL target whose stack provides a ComfyUI workflow runner serves
+        # the image/video lanes directly through the ported templates — inside
+        # the same claim/release scope as the gateway path. A remote
+        # media-gateway target has no runner and keeps its HTTP path.
+        runner = _local_workflow_runner(target)
+        if runner is not None and modality in ("image", "video"):
+            return _dump(_generate_media_local(args, target, modality, runner))
+        if modality == "video":
+            return _dump({
+                "ok": False, "action": "no_local_runner",
+                "detail": "video lanes run through the Model Forge facade "
+                          "video job API (POST /v1/videos); point the "
+                          "model-forge-video provider at the facade endpoint, "
+                          "or run this tool on a local target with ComfyUI "
+                          "detected"})
         plan = media_plan(modality, target.base_url)
         if not plan.get("ok"):
             return _dump(plan)

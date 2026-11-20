@@ -200,6 +200,27 @@ def _expand_size(params: dict) -> dict:
     return params
 
 
+def _expand_video_params(params: dict) -> dict:
+    """Port of the broker's ``_openai_video_params`` (broker/main.py): video
+    lanes do NOT expand ``size`` into an aspect label + width/height — they
+    coerce ``seconds`` to a float and map the OpenAI ``size`` to the lane's
+    ``resolution`` input. This is deliberately different from the image prep
+    (``_expand_size``/``_openai_image_params``): the H3 video lanes take a
+    ``resolution`` string, not a width/height pair, so matching the broker here
+    is what keeps ``size``/``seconds`` landing on the right nodes.
+
+    ``seconds`` coerces to ``float`` because an OpenAI/Sora client may send it
+    as a string ("5"); the lane's ``value`` input wants a number. A
+    non-numeric value still raises, and ``run`` turns that into an honest
+    ``ok=False`` row (never a blind submit).
+    """
+    if params.get("seconds") is not None:
+        params["seconds"] = float(params["seconds"])
+    if params.get("size"):
+        params["resolution"] = params["size"]
+    return params
+
+
 def _coerce_numeric(value):
     """Coerce a numeric string (e.g. ``"42"``) to ``int`` for seed/steps.
 
@@ -402,14 +423,28 @@ class ComfyWorkflowRunner:
             params[key] = {"upload": {"path": comfy_name or name}}
         return params
 
-    def _prepare_params(self, params: dict, assets_dir) -> dict:
-        """Port of ``_openai_image_params``: drop ``model``/``n``/``_timeout``,
-        expand ``size`` -> width/height (+ aspect label), map ``image_url`` ->
-        ``image``, then normalise/upload image references."""
-        p = {k: v for k, v in (params or {}).items()
-             if k not in ("model", "n", "_timeout")}
-        if p.get("size"):
-            _expand_size(p)
+    def _prepare_params(self, params: dict, assets_dir,
+                        output_kind: str = "image") -> dict:
+        """Normalise request params for a lane, matching the broker's OpenAI
+        param handling *by output kind*.
+
+        Image lanes follow ``_openai_image_params``: drop ``model``/``n``/
+        ``_timeout``, expand ``size`` -> width/height (+ aspect label). Video
+        lanes follow ``_openai_video_params``: drop ``model`` only, coerce
+        ``seconds`` to float, map ``size`` -> ``resolution``. Both then map
+        ``image_url`` -> ``image`` and normalise/upload image references. The
+        kind split is the review item — a video request must not be handed
+        width/height, and an image request must not be handed a resolution
+        label.
+        """
+        if output_kind == "video":
+            p = {k: v for k, v in (params or {}).items() if k != "model"}
+            _expand_video_params(p)
+        else:
+            p = {k: v for k, v in (params or {}).items()
+                 if k not in ("model", "n", "_timeout")}
+            if p.get("size"):
+                _expand_size(p)
         if p.get("image_url"):
             p["image"] = p["image_url"]
         p.pop("image_url", None)
@@ -531,14 +566,23 @@ class ComfyWorkflowRunner:
 
     # -- entry point ------------------------------------------------------
 
-    def run(self, workflow_id: str, params: dict, *, assets_dir, job_id: str) -> dict:
+    def run(self, workflow_id: str, params: dict, *, assets_dir, job_id: str,
+            timeout_s: float | None = None) -> dict:
         """Run one job end to end on ``workflow_id``.
 
         Returns ``{"ok", "output_kind", "files", "reason", "meta"}``.
         ``files`` are absolute paths under ComfyUI's output dir (the caller
         fetches them); ``meta`` carries the prompt id, node ids per output and
         the resolved output dir. Never raises: any failure is an honest
-        ``ok=False`` with a ``reason``."""
+        ``ok=False`` with a ``reason``.
+
+        ``timeout_s`` is an optional request budget (the OpenAI ``_timeout``
+        the sync image route honours, broker main.py ~1670): the history poll
+        deadline becomes ``min(timeout_s, history_timeout_s)`` so a short
+        client budget is respected while the instance's own ceiling is still
+        enforced. ``None`` keeps the historical ``history_timeout_s`` budget,
+        so the parameter is fully backward compatible. An expired budget is an
+        honest ``ok=False`` 'timed out' row, never a hang."""
         cfg = self.workflows.get(workflow_id)
         if cfg is None:
             return self._empty("", f"unknown workflow_id {workflow_id!r}; "
@@ -551,7 +595,8 @@ class ComfyWorkflowRunner:
                                f"cannot read template for {workflow_id!r}: "
                                f"{type(exc).__name__}: {exc}")
         try:
-            prepared = self._prepare_params(params, assets_dir)
+            prepared = self._prepare_params(params, assets_dir,
+                                            cfg.output_kind)
         except Exception as exc:  # noqa: BLE001
             return self._empty(cfg.output_kind,
                                f"invalid request params for {workflow_id!r}: "
@@ -572,7 +617,13 @@ class ComfyWorkflowRunner:
             return self._empty(cfg.output_kind, err)
 
         poll_interval = self._poll_interval_s or 1.0
-        max_polls = max(1, int(self._history_timeout_s / poll_interval))
+        budget = self._history_timeout_s
+        if timeout_s is not None:
+            try:
+                budget = min(float(timeout_s), float(self._history_timeout_s))
+            except (TypeError, ValueError):
+                budget = self._history_timeout_s
+        max_polls = max(1, int(budget / poll_interval))
         for _ in range(max_polls):
             self._sleep(self._poll_interval_s)
             status, payload = self._poll_once(prompt_id, cfg.output_kind)

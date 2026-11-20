@@ -56,3 +56,26 @@ def resolve(model_id: str, aliases: dict[str, str] | None = None) -> str:
     """
     table = DEFAULT_ALIASES if aliases is None else aliases
     return table.get(model_id, model_id)
+
+
+def workflow_id_for(model_id: str,
+                    aliases: dict[str, str] | None = None) -> str:
+    """The ComfyUI-workflow-runner lane id for a requested model id.
+
+    Two-step seam pinned for the facade's gen routes (sibling wave imports this
+    EXACTLY):
+
+    1. canonicalize through :func:`resolve` — so a pre-rename id
+       (``gen/krea2``) lands on its canonical gen id (``gen/qwen-image-2.1``);
+    2. strip ONE leading ``gen/`` — so a facade-facing canonical id
+       (``gen/qwen-image-2.1``) maps to the bare runner workflow_id
+       (``qwen-image-2.1``) the lane registry is keyed on.
+
+    Idempotent: a bare workflow id already passes through unchanged
+    (``workflow_id_for("qwen-image-2.1") == "qwen-image-2.1"``) and a canonical
+    gen id maps exactly once (never ``image-2.1`` or a re-stripped id). Only the
+    ``gen/`` namespace is unwrapped; any other prefix is left intact because it
+    is not this seam's contract.
+    """
+    canonical = resolve(model_id, aliases)
+    return canonical.removeprefix("gen/")

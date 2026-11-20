@@ -343,3 +343,751 @@ def test_post_valid_content_length_forwards_with_explicit_content_type():
     assert body == up.body
     assert sent["Content-Type"] == "application/json"
     assert len(up.calls) == 1
+
+
+# ===========================================================================
+# P5c-C1b — generation routes + job API
+#
+# Same discipline as above: every effect is a seam. A fake orchestrator records
+# claim/release + waiter/admission order, a fake runner records workflow ids +
+# free() calls, and the real in-memory JobStore backs the routes (it is stdlib
+# and carries no external effect). ``dispatch`` runs the async video job body
+# inline so the lifecycle is deterministic and no thread races the assertions.
+# ===========================================================================
+
+import os  # noqa: E402
+import pytest  # noqa: E402
+
+from model_forge.facade import FacadeService  # noqa: E402
+
+
+class _Cfg:
+    """Stand-in for a workflow registry entry (``.output_kind`` is all the
+    routes read)."""
+
+    def __init__(self, output_kind):
+        self.output_kind = output_kind
+
+
+def _workflows():
+    return {
+        "qwen-image-2.1": _Cfg("image"),
+        "qwen-image-2.1-edit": _Cfg("image"),
+        "h3-t2v": _Cfg("video"),
+        "h3-i2v": _Cfg("video"),
+    }
+
+
+class FakeOrchestrator:
+    """Records claim/release + waiter/admission calls; outcomes configurable."""
+
+    def __init__(self, *, claim_ok=True, claim_reason="", admit_ok=True,
+                 admit_reason="", waiter_ok=True, waiter_reason="",
+                 waiter_token: str | None = "tok-1", log=None):
+        self.claim_ok = claim_ok
+        self.claim_reason = claim_reason
+        self.admit_ok = admit_ok
+        self.admit_reason = admit_reason
+        self.waiter_ok = waiter_ok
+        self.waiter_reason = waiter_reason
+        self.waiter_token = waiter_token
+        self.log = log
+        self.claims = []
+        self.releases = []
+        self.admits = []
+        self.waiter_exits = []
+
+    def _rec(self, event):
+        if self.log is not None:
+            self.log.append(event)
+
+    def claim(self, scope_id, target_id, request):
+        self.claims.append((scope_id, target_id, request))
+        self._rec("claim")
+        return {"ok": self.claim_ok, "reason": self.claim_reason}
+
+    def release(self, scope_id):
+        self.releases.append(scope_id)
+        self._rec("release")
+        return {"ok": True}
+
+    def admit_gen(self, model_id=""):
+        self.admits.append(model_id)
+        self._rec("admit_gen")
+        return {"ok": self.admit_ok, "reason": self.admit_reason}
+
+    def waiter_enter(self):
+        self._rec("waiter_enter")
+        return {"ok": self.waiter_ok, "reason": self.waiter_reason,
+                "token": self.waiter_token if self.waiter_ok else None}
+
+    def waiter_exit(self, token):
+        self.waiter_exits.append(token)
+        self._rec("waiter_exit")
+
+    @property
+    def llm_waiters(self):
+        return 0
+
+
+class FakeRunner:
+    """Records runner calls; returns a fixed result; counts free() calls."""
+
+    def __init__(self, files=None, ok=True, reason="", log=None,
+                 workflows=None):
+        self.workflows = _workflows() if workflows is None else workflows
+        self.files = list(files or [])
+        self.ok = ok
+        self.reason = reason
+        self.log = log
+        self.run_calls = []
+        self.run_inputs = []   # kwargs the facade passed (incl. timeout_s)
+        self.free_calls = 0
+
+    def run(self, workflow_id, params, *, assets_dir, job_id,
+            timeout_s=None):
+        self.run_calls.append((workflow_id, params, assets_dir, job_id))
+        self.run_inputs.append({"workflow_id": workflow_id, "params": params,
+                                "assets_dir": assets_dir, "job_id": job_id,
+                                "timeout_s": timeout_s})
+        if self.log is not None:
+            self.log.append("run")
+        if not self.ok:
+            return {"ok": False, "output_kind": "", "files": [],
+                    "reason": self.reason, "meta": {}}
+        return {"ok": True, "output_kind": "", "files": list(self.files),
+                "reason": "", "meta": {}}
+
+    def free(self):
+        self.free_calls += 1
+        if self.log is not None:
+            self.log.append("free")
+        return {"ok": True}
+
+
+def _gen_service(tmp_path, *, orchestrator=None, runner=None, dispatch=None,
+                 **cfg):
+    config = FacadeConfig(assets_dir=str(tmp_path), **cfg)
+    return FacadeService(config, orchestrator=orchestrator, runner=runner,
+                         dispatch=dispatch)
+
+
+def _inline(fn):
+    """Deterministic dispatch: run the job body inline (no thread races)."""
+    fn()
+
+
+def _write(path, data=b"\x89PNG\r\n"):
+    path.write_bytes(data)
+    return str(path)
+
+
+# --- image sync -------------------------------------------------------------
+
+def test_image_sync_happy_path_order_shape(tmp_path):
+    log = []
+    out = _write(tmp_path / "shot.png")
+    orch = FakeOrchestrator(log=log)
+    runner = FakeRunner(files=[out], log=log)
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+
+    raw = json.dumps({"model": "gen/qwen-image-2.1", "prompt": "a cat"}).encode()
+    status, body = svc.handle_image_generations(raw)
+
+    assert status == 200
+    payload = json.loads(body)
+    assert "created" in payload
+    (item,) = payload["data"]
+    jid = orch.claims[0][0]
+    assert item["url"] == f"http://127.0.0.1:8080/assets/{jid}/shot.png"
+
+    # Ordering contract (roadmap §3 LLM-waiter rule): admit_gen FIRST, then
+    # claim -> run -> release, and free after (see facade docstrings). The
+    # gen job must be admitted before claim executes any lane-wake side effect.
+    assert log[:4] == ["admit_gen", "claim", "run", "release"]
+    assert log.index("free") > log.index("run")
+    # The claim targeted the configured gen target and the workflow id.
+    scope, target, request = orch.claims[0]
+    assert target == "comfy"
+    assert request.model_id == "qwen-image-2.1"
+    assert orch.admits == ["qwen-image-2.1"]
+
+
+def test_image_sync_passes_alias_resolved_bare_workflow_id(tmp_path):
+    out = _write(tmp_path / "a.png")
+    orch = FakeOrchestrator()
+    runner = FakeRunner(files=[out])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+
+    # gen/krea2 -> (alias) gen/qwen-image-2.1 -> (strip gen/) qwen-image-2.1
+    raw = json.dumps({"model": "gen/krea2", "prompt": "x"}).encode()
+    status, _ = svc.handle_image_generations(raw)
+
+    assert status == 200
+    assert runner.run_calls[0][0] == "qwen-image-2.1"  # bare workflow id
+    assert orch.admits == ["qwen-image-2.1"]
+
+
+def test_image_sync_admit_refusal_is_503_with_reason(tmp_path):
+    log = []
+    orch = FakeOrchestrator(
+        admit_ok=False,
+        admit_reason="chat waiter owns the lane wake; retry shortly",
+        log=log)
+    runner = FakeRunner(files=[str(tmp_path / "x.png")])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+
+    status, body = svc.handle_image_generations(
+        json.dumps({"model": "gen/qwen-image-2.1"}).encode())
+
+    assert status == 503
+    err = json.loads(body)["error"]
+    assert err["type"] == "busy"
+    assert "chat waiter owns the lane wake" in err["message"]
+    # Admit FIRST: a refused admission must NOT claim (no lane-wake side
+    # effect) and must never reach the runner.
+    assert orch.claims == []              # no claim side effect
+    assert orch.releases == []            # nothing claimed -> nothing released
+    assert runner.run_calls == []         # never reached the runner
+    assert log == ["admit_gen"]           # admission checked before any claim
+
+
+def test_image_sync_claim_refusal_is_503(tmp_path):
+    orch = FakeOrchestrator(claim_ok=False, claim_reason="no free VRAM")
+    runner = FakeRunner(files=[])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+    status, body = svc.handle_image_generations(
+        json.dumps({"model": "gen/qwen-image-2.1"}).encode())
+    assert status == 503
+    assert json.loads(body)["error"]["type"] == "busy"
+    assert orch.releases == []  # nothing was claimed -> nothing to release
+
+
+def test_image_sync_run_failure_is_504(tmp_path):
+    orch = FakeOrchestrator()
+    runner = FakeRunner(ok=False, reason="history poll timed out")
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+    status, body = svc.handle_image_generations(
+        json.dumps({"model": "gen/qwen-image-2.1"}).encode())
+    assert status == 504
+    assert json.loads(body)["error"]["type"] == "generation_error"
+    assert "history poll timed out" in json.loads(body)["error"]["message"]
+
+
+# --- request budget parity: body._timeout -> runner poll deadline -----------
+
+def test_image_sync_forwards_request_budget_to_runner(tmp_path):
+    # the sync image route honours the client's _timeout (broker ~1670) by
+    # handing it to the runner as the poll budget.
+    orch = FakeOrchestrator()
+    runner = FakeRunner(files=[_write(tmp_path / "o.png")])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+    svc.handle_image_generations(
+        json.dumps({"model": "gen/qwen-image-2.1", "_timeout": 30}).encode())
+    assert runner.run_inputs[0]["timeout_s"] == 30.0
+
+
+def test_image_sync_default_budget_is_1200_when_unset(tmp_path):
+    orch = FakeOrchestrator()
+    runner = FakeRunner(files=[_write(tmp_path / "o.png")])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+    svc.handle_image_generations(
+        json.dumps({"model": "gen/qwen-image-2.1"}).encode())
+    assert runner.run_inputs[0]["timeout_s"] == 1200.0
+
+
+def test_image_sync_short_budget_is_honest_504(tmp_path):
+    # a small _timeout yields an honest 504 (the runner reports the timeout),
+    # not a request that outlives its budget.
+    orch = FakeOrchestrator()
+    runner = FakeRunner(ok=False,
+                        reason="history poll timed out after 3.0s for pid")
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+    status, body = svc.handle_image_generations(
+        json.dumps({"model": "gen/qwen-image-2.1", "_timeout": 3}).encode())
+    assert status == 504
+    assert runner.run_inputs[0]["timeout_s"] == 3.0
+    assert "timed out" in json.loads(body)["error"]["message"]
+
+
+def test_image_sync_short_timeout_with_real_runner_is_504(tmp_path):
+    # end-to-end with the REAL runner + a fake clock: body._timeout caps the
+    # poll loop, so a tiny budget returns an honest 504 without waiting the
+    # runner's 3600 s history budget.
+    from model_forge.engines.comfyui import ComfyWorkflowRunner
+
+    hits = {"history": 0}
+
+    def http(method, url, body=None, *, files=None, raw=False, timeout=10.0):
+        if "/history/" in url:
+            hits["history"] += 1
+            return {}                 # never completes
+        if url.endswith("/prompt"):
+            return {"prompt_id": "pid1"}
+        return {}                     # /free and anything else
+
+    runner = ComfyWorkflowRunner("http://comfy:18188", http=http,
+                                 sleep=lambda _s: None,
+                                 poll_interval_s=1.0,
+                                 history_timeout_s=3600.0)
+    orch = FakeOrchestrator()
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+    status, body = svc.handle_image_generations(
+        json.dumps({"model": "gen/qwen-image-2.1", "_timeout": 3}).encode())
+    assert status == 504
+    assert hits["history"] == 3       # request budget, not the 3600 s ceiling
+    assert "timed out" in json.loads(body)["error"]["message"]
+
+
+# --- normalized params on the job record (broker parity) --------------------
+
+def test_image_job_record_params_are_normalized(tmp_path):
+    orch = FakeOrchestrator()
+    runner = FakeRunner(files=[_write(tmp_path / "o.png")])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+    svc.handle_image_generations(json.dumps(
+        {"model": "gen/qwen-image-2.1", "prompt": "p", "n": 1, "_timeout": 5,
+         "size": "1024x576"}).encode())
+    jid = orch.claims[0][0]
+    params = json.loads(svc.handle_job(jid)[1])["params"]
+    assert "model" not in params and "n" not in params
+    assert "_timeout" not in params
+    assert params["size"] == "1024x576"
+    assert params["width"] == 1024 and params["height"] == 576
+    assert params["aspect_ratio"] == "16:9"
+
+
+def test_video_job_record_params_are_normalized(tmp_path):
+    orch = FakeOrchestrator()
+    runner = FakeRunner(files=[str(tmp_path / "v.mp4")])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner,
+                       dispatch=_inline)
+    raw = json.dumps({"model": "gen/h3-t2v", "seconds": "5",
+                      "size": "1024x576"}).encode()
+    jid = json.loads(svc.handle_video_submit(raw)[1])["id"]
+    params = json.loads(svc.handle_job(jid)[1])["params"]
+    assert "model" not in params
+    assert params["seconds"] == 5.0
+    assert params["resolution"] == "1024x576"
+    assert "width" not in params and "height" not in params
+
+
+def test_job_record_note_flags_deferred_image_upload(tmp_path):
+    # a deferred image ref is a known divergence from the broker's stored shape
+    # (upload at run time, not route time) — the row carries a visible note.
+    orch = FakeOrchestrator()
+    runner = FakeRunner(files=[_write(tmp_path / "o.png")])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+    svc.handle_image_generations(json.dumps(
+        {"model": "gen/qwen-image-2.1-edit",
+         "image_url": "http://ex.test/a.png"}).encode())
+    jid = orch.claims[0][0]
+    row = svc._jobs.get(jid)
+    assert row["note"] and "run time" in row["note"]
+    # image_url is mapped to image in the stored params
+    assert row["params"]["image"] == "http://ex.test/a.png"
+    assert "image_url" not in row["params"]
+
+
+def test_job_record_note_absent_without_image_ref(tmp_path):
+    orch = FakeOrchestrator()
+    runner = FakeRunner(files=[_write(tmp_path / "o.png")])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+    svc.handle_image_generations(
+        json.dumps({"model": "gen/qwen-image-2.1", "prompt": "p"}).encode())
+    jid = orch.claims[0][0]
+    assert svc._jobs.get(jid)["note"] is None
+
+
+# --- video job lifecycle ----------------------------------------------------
+
+def test_video_job_lifecycle_submit_status_content_jobs(tmp_path):
+    orch = FakeOrchestrator()
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    runner = FakeRunner(files=[str(video)])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner,
+                       dispatch=_inline)
+
+    raw = json.dumps({"model": "gen/h3-t2v", "prompt": "sunset",
+                      "seconds": 5, "size": "1024x576"}).encode()
+    status, body = svc.handle_video_submit(raw)
+
+    assert status == 200
+    submitted = json.loads(body)
+    assert submitted["status"] == "queued"
+    assert submitted["model"] == "h3-t2v"
+    jid = submitted["id"]
+    # Inline dispatch: the job ran to completion during submit.
+    assert orch.admits == ["h3-t2v"]
+    # Video param normalization (broker _openai_video_params).
+    assert runner.run_calls[0][1]["seconds"] == 5.0
+    assert runner.run_calls[0][1]["resolution"] == "1024x576"
+
+    # GET /v1/videos/{jid} -> completed with a data url.
+    st, b = svc.handle_video_status(jid)
+    assert st == 200
+    done = json.loads(b)
+    assert done["status"] == "completed"
+    assert done["data"] == [{"url": f"http://127.0.0.1:8080/assets/{jid}/clip.mp4"}]
+
+    # GET /v1/videos/{jid}/content -> raw bytes + sane content-type.
+    st, b, ctype = svc.handle_video_content(jid)
+    assert st == 200
+    assert b == b"\x00\x00\x00\x18ftypmp42"
+    assert ctype == "video/mp4"
+
+    # GET /jobs/{jid} -> broker-shaped record.
+    st, b = svc.handle_job(jid)
+    assert st == 200
+    rec = json.loads(b)
+    assert rec["id"] == jid and rec["kind"] == "gen"
+    assert rec["model"] == "h3-t2v" and rec["status"] == "done"
+    assert rec["params"]["seconds"] == 5.0
+    assert rec["assets"] == [f"/assets/{jid}/clip.mp4"]
+
+
+def test_video_status_not_found_is_404(tmp_path):
+    svc = _gen_service(tmp_path, orchestrator=FakeOrchestrator(),
+                       runner=FakeRunner(), dispatch=_inline)
+    status, body = svc.handle_video_status("deadbeef")
+    assert status == 404
+    assert json.loads(body)["error"]["type"] == "not_found"
+
+
+def test_video_submit_wrong_kind_is_400(tmp_path):
+    orch = FakeOrchestrator()
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=FakeRunner(),
+                       dispatch=_inline)
+    # an image workflow submitted to the video route
+    status, body = svc.handle_video_submit(
+        json.dumps({"model": "gen/qwen-image-2.1"}).encode())
+    assert status == 400
+    assert "not video" in json.loads(body)["error"]["message"]
+    assert orch.claims == []  # refused before any job/claim
+
+
+def test_video_generations_generic_shape(tmp_path):
+    orch = FakeOrchestrator()
+    runner = FakeRunner(files=[str(tmp_path / "v.mp4")])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner,
+                       dispatch=_inline)
+    status, body = svc.handle_video_generations(
+        json.dumps({"model": "gen/h3-i2v", "prompt": "x"}).encode())
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["status"] == "queued"
+    assert payload["model"] == "h3-i2v"
+    assert payload["poll"] == f"/jobs/{payload['id']}"
+    assert payload["asset"] == f"/assets/{payload['id']}"
+
+
+# --- back-to-back free() and runner requirement -----------------------------
+
+def test_runner_free_called_between_back_to_back_jobs(tmp_path):
+    orch = FakeOrchestrator()
+    runner = FakeRunner(files=[str(tmp_path / "o.png")])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+    raw = json.dumps({"model": "gen/qwen-image-2.1"}).encode()
+    svc.handle_image_generations(raw)
+    svc.handle_image_generations(raw)
+    assert len(runner.run_calls) == 2
+    assert runner.free_calls == 2  # one cache free per job (broker behavior)
+
+
+def test_gen_without_runner_is_503(tmp_path):
+    svc = _gen_service(tmp_path, orchestrator=FakeOrchestrator())
+    status, body = svc.handle_image_generations(
+        json.dumps({"model": "gen/qwen-image-2.1"}).encode())
+    assert status == 503
+    assert json.loads(body)["error"]["type"] == "busy"
+
+
+# --- bad input --------------------------------------------------------------
+
+def test_image_unknown_model_is_404(tmp_path):
+    svc = _gen_service(tmp_path, orchestrator=FakeOrchestrator(),
+                       runner=FakeRunner())
+    status, body = svc.handle_image_generations(
+        json.dumps({"model": "gen/nope"}).encode())
+    assert status == 404
+    assert json.loads(body)["error"]["type"] == "invalid_request_error"
+
+
+def test_image_wrong_kind_is_400(tmp_path):
+    svc = _gen_service(tmp_path, orchestrator=FakeOrchestrator(),
+                       runner=FakeRunner())
+    status, body = svc.handle_image_generations(
+        json.dumps({"model": "gen/h3-t2v"}).encode())
+    assert status == 400
+    assert "not image" in json.loads(body)["error"]["message"]
+
+
+def test_gen_invalid_json_is_400_and_touches_no_job(tmp_path):
+    orch = FakeOrchestrator()
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=FakeRunner())
+    status, body = svc.handle_image_generations(b"{not json")
+    assert status == 400
+    assert orch.claims == []
+    st2, _ = svc.handle_video_submit(b"[]")  # non-object JSON body
+    assert st2 == 400
+
+
+# --- raising gen-path seams are honest 5xx, never dropped connections -------
+
+class _RaisingOrchestrator(FakeOrchestrator):
+    """A seam that raises (vs. returning ok=False) for one method."""
+
+    def __init__(self, which, **kw):
+        super().__init__(**kw)
+        self.which = which
+
+    def admit_gen(self, *a, **k):
+        if self.which == "admit_gen":
+            raise RuntimeError("admit_gen exploded")
+        return super().admit_gen(*a, **k)
+
+    def claim(self, *a, **k):
+        if self.which == "claim":
+            raise RuntimeError("claim exploded")
+        return super().claim(*a, **k)
+
+
+class _RaisingRunner(FakeRunner):
+    def run(self, *a, **k):
+        raise RuntimeError("runner exploded")
+
+
+@pytest.mark.parametrize("which", ["claim", "admit_gen"])
+def test_image_sync_raising_orchestrator_seam_is_honest_5xx(tmp_path, which):
+    orch = _RaisingOrchestrator(which)
+    runner = FakeRunner(files=[str(tmp_path / "o.png")])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+    status, body = svc.handle_image_generations(
+        json.dumps({"model": "gen/qwen-image-2.1"}).encode())
+    assert status == 500
+    err = json.loads(body)["error"]
+    assert err["type"] == "generation_error"
+    assert "exploded" in err["message"]
+
+
+def test_image_sync_raising_runner_is_honest_5xx(tmp_path):
+    orch = FakeOrchestrator()
+    runner = _RaisingRunner(files=[])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+    status, body = svc.handle_image_generations(
+        json.dumps({"model": "gen/qwen-image-2.1"}).encode())
+    assert status == 500
+    err = json.loads(body)["error"]
+    assert err["type"] == "generation_error"
+    assert "runner exploded" in err["message"]
+
+
+def test_image_sync_raising_seam_keeps_the_connection(tmp_path):
+    # the route method returns an honest 500 JSON; the handler writes it out
+    # (no exception escapes to drop the connection) — driven through do_POST.
+    orch = _RaisingOrchestrator("admit_gen")
+    runner = FakeRunner(files=[])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+    payload = json.dumps({"model": "gen/qwen-image-2.1"}).encode()
+    status, body, _ = _drive_post(
+        svc, "/v1/images/generations",
+        {"Content-Length": str(len(payload))}, body=payload)
+    assert status == 500
+    assert json.loads(body)["error"]["type"] == "generation_error"
+
+
+# --- upload + assets serving ------------------------------------------------
+
+def _multipart(filename, data, field="file", boundary="BOUNDARY123"):
+    b = boundary.encode()
+    body = (b"--" + b + b"\r\n"
+            + b'Content-Disposition: form-data; name="' + field.encode()
+            + b'"; filename="' + filename.encode() + b'"\r\n'
+            + b"Content-Type: image/png\r\n\r\n" + data + b"\r\n"
+            + b"--" + b + b"--\r\n")
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def test_upload_stores_file_and_returns_broker_shape(tmp_path):
+    svc = _gen_service(tmp_path, orchestrator=FakeOrchestrator(),
+                       runner=FakeRunner())
+    body, ctype = _multipart("ref.png", b"\x89PNGdata")
+    status, resp = svc.handle_upload(body, ctype)
+    assert status == 200
+    payload = json.loads(resp)
+    assert payload["name"].endswith("_ref.png")
+    assert payload["path"] == os.path.join(str(tmp_path), "uploads", payload["name"])
+    assert os.path.exists(payload["path"])
+    assert open(payload["path"], "rb").read() == b"\x89PNGdata"
+
+
+def test_upload_without_file_is_400(tmp_path):
+    svc = _gen_service(tmp_path, orchestrator=FakeOrchestrator(),
+                       runner=FakeRunner())
+    status, body = svc.handle_upload(b"not multipart", "")
+    assert status == 400
+    assert json.loads(body)["error"]["type"] == "invalid_request_error"
+
+
+def test_asset_serves_bytes_with_content_type(tmp_path):
+    orch = FakeOrchestrator()
+    out = tmp_path / "pic.png"
+    out.write_bytes(b"\x89PNG\x00")
+    runner = FakeRunner(files=[str(out)])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+    svc.handle_image_generations(json.dumps({"model": "gen/qwen-image-2.1"}).encode())
+    jid = orch.claims[0][0]
+    status, body, ctype = svc.handle_asset(jid, "pic.png")
+    assert status == 200
+    assert body == b"\x89PNG\x00"
+    assert ctype == "image/png"
+    st2, _, _ = svc.handle_asset(jid, "missing.png")
+    assert st2 == 404
+
+
+def test_asset_outside_assets_dir_is_not_served(tmp_path):
+    # confinement: a job whose recorded file resolves OUTSIDE assets_dir must
+    # not be served, even when the recorded name matches (defence in depth).
+    outside = tmp_path.parent / "escape.png"
+    outside.write_bytes(b"secret")
+    orch = FakeOrchestrator()
+    runner = FakeRunner(files=[str(outside)])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+    svc.handle_image_generations(json.dumps({"model": "gen/qwen-image-2.1"}).encode())
+    jid = orch.claims[0][0]
+    status, _, _ = svc.handle_asset(jid, "escape.png")
+    assert status == 404        # resolves outside assets_dir -> refused
+
+
+# --- chat waiter accounting -------------------------------------------------
+
+def test_chat_waiter_enter_before_upstream_and_exit_after(tmp_path):
+    log = []
+
+    class _Upstream:
+        def __call__(self, raw, headers):
+            log.append("upstream")
+            return 200, b'{"ok":true}'
+
+    orch = FakeOrchestrator(log=log)
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=FakeRunner())
+    svc._upstream = _Upstream()  # inject chat upstream (gen routes unused here)
+
+    status, _ = svc.handle_chat(json.dumps({"model": CHAT_MODEL_ID}).encode())
+    assert status == 200
+    assert log == ["waiter_enter", "upstream", "waiter_exit"]
+    assert orch.waiter_exits == [orch.waiter_token]
+
+
+def test_chat_waiter_exit_in_finally_when_upstream_raises(tmp_path):
+    log = []
+
+    class _Boom:
+        def __call__(self, raw, headers):
+            log.append("upstream")
+            raise RuntimeError("vllm died mid-request")
+
+    orch = FakeOrchestrator(log=log)
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=FakeRunner())
+    svc._upstream = _Boom()
+
+    with pytest.raises(RuntimeError):
+        svc.handle_chat(json.dumps({"model": CHAT_MODEL_ID}).encode())
+    assert log == ["waiter_enter", "upstream", "waiter_exit"]
+    assert orch.waiter_exits == [orch.waiter_token]
+
+
+def test_chat_waiter_refusal_is_503_and_touches_no_upstream(tmp_path):
+    calls = []
+
+    class _Upstream:
+        def __call__(self, raw, headers):
+            calls.append(1)
+            return 200, b"{}"
+
+    orch = FakeOrchestrator(waiter_ok=False,
+                            waiter_reason="lane wake in progress")
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=FakeRunner())
+    svc._upstream = _Upstream()
+    status, body = svc.handle_chat(json.dumps({"model": CHAT_MODEL_ID}).encode())
+    assert status == 503
+    assert json.loads(body)["error"]["type"] == "busy"
+    assert "lane wake in progress" in json.loads(body)["error"]["message"]
+    assert calls == []
+    assert orch.waiter_exits == []  # no token was ever handed out
+
+
+def test_chat_waiter_ok_without_token_is_fail_closed_503(tmp_path):
+    # a seam returning {'ok': True, 'token': None} would leak the reservation
+    # (handle_chat only calls waiter_exit when a token was handed out). Fail
+    # closed: honest 503, no upstream call.
+    calls = []
+
+    class _Upstream:
+        def __call__(self, raw, headers):
+            calls.append(1)
+            return 200, b"{}"
+
+    orch = FakeOrchestrator(waiter_ok=True, waiter_token=None)
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=FakeRunner())
+    svc._upstream = _Upstream()
+    status, body = svc.handle_chat(json.dumps({"model": CHAT_MODEL_ID}).encode())
+    assert status == 503
+    assert json.loads(body)["error"]["type"] == "busy"
+    assert calls == []                    # refused before the upstream
+    assert orch.waiter_exits == []        # no token to release -> no leak
+
+
+def test_chat_waiter_seam_raising_is_fail_closed_503(tmp_path):
+    class _BoomOrch(FakeOrchestrator):
+        def waiter_enter(self):
+            raise RuntimeError("orchestrator exploded")
+
+    svc = _gen_service(tmp_path, orchestrator=_BoomOrch(), runner=FakeRunner())
+    status, body = svc.handle_chat(json.dumps({"model": CHAT_MODEL_ID}).encode())
+    assert status == 503
+    assert "orchestrator exploded" in json.loads(body)["error"]["message"]
+
+
+# --- handler wiring for the new routes (no ports bound) ---------------------
+
+def _drive_get(service, path):
+    """Run the real do_GET with fakes (no socket); return status/body/ctype."""
+    handler_cls = make_handler(service)
+    handler = handler_cls.__new__(handler_cls)  # bypass create_server/socket
+    handler.path = path
+    handler.headers = _FakeHeaders({})
+    handler.wfile = _FakeWFile()
+    captured = {"status": None, "headers": {}}
+    handler.send_response = lambda status, message=None: captured.__setitem__("status", status)
+    handler.send_header = lambda k, v: captured["headers"].__setitem__(k, v)
+    handler.end_headers = lambda: None
+    handler.do_GET()
+    return captured["status"], handler.wfile.buf, captured["headers"].get("Content-Type")
+
+
+def test_handler_routes_image_generations_and_video_and_jobs(tmp_path):
+    out = _write(tmp_path / "h.png")
+    orch = FakeOrchestrator()
+    runner = FakeRunner(files=[out])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner,
+                       dispatch=_inline)
+
+    payload = json.dumps({"model": "gen/qwen-image-2.1"}).encode()
+    status, body, _ = _drive_post(
+        svc, "/v1/images/generations",
+        {"Content-Length": str(len(payload))}, body=payload)
+    assert status == 200
+    assert "data" in json.loads(body)
+
+    jid = json.loads(svc.handle_video_submit(
+        json.dumps({"model": "gen/h3-t2v"}).encode())[1])["id"]
+    st, b, ctype = _drive_get(svc, f"/v1/videos/{jid}")
+    assert st == 200 and json.loads(b)["status"] == "completed"
+    st, b, _ = _drive_get(svc, f"/jobs/{jid}")
+    assert st == 200 and json.loads(b)["id"] == jid
+    st, _, _ = _drive_get(svc, "/no/such/route")
+    assert st == 404
+
+

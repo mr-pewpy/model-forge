@@ -123,16 +123,38 @@ def _as_data_url(value: str) -> str:
     return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode()
 
 
+def _resolve_model_id(model_id: str) -> str:
+    """Canonicalize a requested model id through ``model_forge.aliases`` so the
+    pre-rename ids live clients still pin (``gen/krea2``, ``gen/krea2-img2img``,
+    ``gen/ideogram-4``) map to their canonical lane before the request leaves
+    the plugin (``gen/krea2`` -> ``gen/qwen-image-2.1``).
+
+    ``model_forge`` ships in this same repo beside the plugin; when it is not
+    importable the id passes through unchanged and the facade resolves it
+    server-side — the alias table is the same one either side reads, so a miss
+    here is never a wrong lane."""
+    try:
+        from model_forge.aliases import resolve
+    except Exception:  # noqa: BLE001 — identity keeps the plugin working
+        return model_id
+    return resolve(model_id)
+
+
 def _resolve_model(explicit: Optional[str]) -> str:
     """Model id: explicit arg, else settings default, else the live catalog's
     first row. Empty string when nothing names a model (caller reports it)."""
     if explicit:
-        return explicit
+        return _resolve_model_id(str(explicit))
     default = _default_model()
     if default:
-        return default
+        return _resolve_model_id(default)
     models = _live_models()
-    return models[0].get("id", "") if models else ""
+    if not models:
+        return ""
+    # Run the catalog's first id through the same alias resolution the
+    # explicit and settings-default branches use, so a pre-rename id from the
+    # catalog lands on its canonical lane too.
+    return _resolve_model_id(str(models[0].get("id", "")))
 
 
 def _extra_body(image_url: Optional[str],

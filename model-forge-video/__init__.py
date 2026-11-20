@@ -44,6 +44,19 @@ def _default_model() -> str:
         return ""
 
 
+def _resolve_model_id(model_id: str) -> str:
+    """Canonicalize a requested model id through ``model_forge.aliases`` so the
+    pre-rename ids live clients still pin (``gen/krea2`` etc.) map to their
+    canonical lane before the job is submitted. ``model_forge`` ships beside
+    this plugin; when it is not importable the id passes through unchanged and
+    the facade resolves it server-side."""
+    try:
+        from model_forge.aliases import resolve
+    except Exception:  # noqa: BLE001 — identity keeps the plugin working
+        return model_id
+    return resolve(model_id)
+
+
 def _live_models() -> List[Dict[str, Any]]:
     """GET /v1/models; video workflows first (output_kind filter), else all."""
     base = _base_url()
@@ -126,6 +139,10 @@ class ModelForgeVideoGenProvider(OpenAICompatibleVideoGenProvider):
                 kwargs["model"] = default
             elif models:
                 kwargs["model"] = models[0].get("id")
+        if kwargs.get("model"):
+            # Canonicalize a legacy id (gen/krea2) before submitting so the
+            # facade routes it to the right lane.
+            kwargs["model"] = _resolve_model_id(str(kwargs["model"]))
         return super().generate(prompt, **kwargs)
 
 

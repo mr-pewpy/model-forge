@@ -1177,12 +1177,22 @@ def test_activate_media_setup_gated_on_route_probe(tmp_path, monkeypatch):
 # --- schema honesty ---------------------------------------------------------
 
 def test_generate_media_schema_honest_about_gateway():
-    desc = schemas.GENERATE_MEDIA["description"]
+    schema = schemas.GENERATE_MEDIA
+    desc = schema["description"]
+    # the enum admits every modality the handler actually ships
+    enum = schema["parameters"]["properties"]["modality"]["enum"]
+    assert set(enum) == {"3d", "music", "sfx", "image", "video"}
+    # the gateway lanes for 3d/music/sfx are named
     assert "media gateway" in desc
     assert "/v1/videos/generations" in desc
     assert "/v1/audio/music" in desc and "/v1/audio/sfx" in desc
-    # the ComfyUI-native flow is stated as a known limit, not implied support
-    assert "ComfyUI" in desc and "not implemented" in desc
+    # the shipped local ComfyUI runner path and facade video API are stated
+    assert "ComfyUI" in desc and "workflow runner" in desc
+    assert "/v1/images/generations" in desc
+    assert "/v1/videos" in desc
+    # the ComfyUI-native flow is a known limit ONLY for 3d/music/sfx
+    assert "not implemented" in desc
+    assert "3d/music/sfx" in desc
 
 
 def test_install_schema_example_is_a_real_repo_path():

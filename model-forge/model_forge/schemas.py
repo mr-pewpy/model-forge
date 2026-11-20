@@ -217,18 +217,23 @@ INSTALL = {
 GENERATE_MEDIA = {
     "name": "model_forge_generate_media",
     "description": (
-        "Generate 3D models, music, or sound effects through a "
-        "user-configured OpenAI-compatible media gateway endpoint on a "
-        "compute target (lanes: /v1/videos/generations for 3d jobs, "
-        "/v1/audio/music, /v1/audio/sfx). 3d: image to GLB (submit job, "
-        "then poll with job_id). music/sfx: prompt to audio; the call "
-        "blocks while the audio renders and the result is saved to the "
-        "plugin media directory. The GPU lane is claimed around the job and "
-        "released when the job completes or fails. Known limit: the "
-        "ComfyUI-native job flow is not implemented — a plain ComfyUI "
-        "endpoint does not serve these lanes. Use when the user wants a 3D "
-        "model, soundtrack, or sound effect generated through a media "
-        "gateway."
+        "Generate media through a compute target. image/video run through "
+        "the local ComfyUI workflow runner when one is available on a local "
+        "target (image lanes run synchronously and return data: URLs; video "
+        "lanes submit a job and return filesystem asset paths, polled with "
+        "job_id). On a target without a runner, image falls back to the "
+        "target's media-gateway OpenAI images route "
+        "(/v1/images/generations) and a remote video request is refused with "
+        "a pointer to the Model Forge facade video job API (POST /v1/videos). "
+        "3d/music/sfx ride the media-gateway endpoint only (lanes: "
+        "/v1/videos/generations for 3d jobs, /v1/audio/music, /v1/audio/sfx); "
+        "3d submits a job (poll with job_id) while music/sfx run "
+        "synchronously. The GPU lane is claimed around the job and released "
+        "when the job completes or fails. Known limit: the ComfyUI-native job "
+        "flow for 3d/music/sfx is not implemented — a plain ComfyUI endpoint "
+        "does not serve those lanes; they need a media gateway. Use when the "
+        "user wants an image, video, 3D model, soundtrack, or sound effect "
+        "generated."
     ),
     "parameters": {
         "type": "object",
@@ -236,21 +241,24 @@ GENERATE_MEDIA = {
             "modality": {
                 "type": "string",
                 "description": "What to generate.",
-                "enum": ["3d", "music", "sfx"],
+                "enum": ["3d", "music", "sfx", "image", "video"],
             },
             "model": {
                 "type": "string",
                 "description": "Engine lane/model id, e.g. 'gen/3d' on a "
-                               "media gateway target.",
+                               "media gateway target, or a ComfyUI workflow "
+                               "lane (e.g. 'gen/krea2' for image, "
+                               "'gen/h3-t2v' for video).",
             },
             "prompt": {
                 "type": "string",
-                "description": "Text prompt (required for music/sfx; "
-                               "optional for 3d).",
+                "description": "Text prompt (required for image, video, "
+                               "music, sfx; optional for 3d).",
             },
             "image": {
                 "type": "string",
-                "description": "Source image for 3d: URL or local file path.",
+                "description": "Source image: URL or local file path (for 3d "
+                               "image-to-GLB, and img2img/edit lanes).",
             },
             "target": {
                 "type": "string",
@@ -258,7 +266,8 @@ GENERATE_MEDIA = {
             },
             "job_id": {
                 "type": "string",
-                "description": "Poll a submitted 3d job instead of starting.",
+                "description": "Poll a submitted 3d or local video job "
+                               "instead of starting.",
             },
         },
         "required": ["modality"],

@@ -48,6 +48,10 @@ when a task needs a different model. Four pieces:
   ``ready``) as pure data, and ``swap`` — the one-call weight exchange in
   strict measured phases (PREFLIGHT / EVICT / LOAD / READY) with the hard
   guarantee that no evict/release call runs before the preflight passes.
+  The orchestrator also carries the LLM-waiter priority seam (roadmap §3):
+  ``waiter_enter`` / ``waiter_exit`` / ``llm_waiters`` account for chat
+  requests blocked on a lane wake, and ``admit_gen`` refuses new generative
+  jobs while any waiter exists — the waiter owns the wake.
 
 Everything external is injectable (HTTP functions, process runners, binary
 lookups, clocks) so this module performs no I/O outside those seams.
@@ -1714,6 +1718,10 @@ class EvictionPlanner:
       freed only when the nominal fit gate still fails without it.
     - Image-generation entry evicts GPU residents every time — the whole
       card, deterministic full eviction, no clever sharing.
+    - LLM-waiter priority (roadmap §3): while a chat request waits on a lane
+      wake it OWNS the wake, so a generative plan is refused as pure data
+      (an honest reason) when the caller passes ``waiter_count`` > 0 — the
+      waiter owns the wake and two swaps must not fight over the card.
     - Loads fire sequentially: the plan is an ordered, serialized list;
       concurrency control is the caller's (concurrent engine inits OOM).
 
@@ -1734,10 +1742,19 @@ class EvictionPlanner:
         """Plan making one model resident."""
         return self.plan_load_many(target_id, [request])
 
-    def plan_load_many(self, target_id, requests) -> LoadPlan:
+    def plan_load_many(self, target_id, requests, *, waiter_count=0) -> LoadPlan:
         """Plan making a set of models resident (e.g. a scope restore).
 
-        Pure planning: nothing is loaded, released, or recorded here."""
+        Pure planning: nothing is loaded, released, or recorded here.
+
+        ``waiter_count`` is the current LLM-waiter count (default 0 — no
+        waiter). When it is non-zero AND the request set contains a
+        generative (image-generation) entry, the plan is REFUSED as pure
+        data with an honest reason: the rule of roadmap §3 expressed in the
+        planner's own style — a chat waiter owns the lane wake, so gen
+        eviction/wake planning is suppressed while it waits. Callers with no
+        waiter context (the normal claim/release path) pass nothing and get
+        the policy unchanged; a chat plan is never suppressed."""
         reqs = list(requests)
         if not reqs:
             return LoadPlan(target_id, True, "nothing to load", (), ())
@@ -1745,6 +1762,17 @@ class EvictionPlanner:
         image_entry = any(is_image_generation(r.modality, r.lane)
                           for r in reqs)
         now = self._clock()
+
+        # -- LLM-waiter priority: a waiting chat request owns the lane wake,
+        # so generative eviction/wake planning is suppressed while it waits.
+        if waiter_count > 0 and image_entry:
+            return self._refuse(
+                target_id,
+                f"refused: a chat request owns the lane wake — {waiter_count} "
+                f"LLM waiter(s) pending (roadmap §3 LLM-waiter priority: the "
+                f"waiter owns the wake; generative eviction/wake planning is "
+                f"suppressed while any chat request waits)")
+
 
         # -- fail-closed gate inputs: nominal bookings and a declared budget.
         missing = [r.model_id for r in reqs
@@ -1941,6 +1969,114 @@ class Orchestrator:
         # belongs to another still-open scope whose request is not visible
         # from the releasing scope.
         self._load_specs: dict[tuple[str, str], dict] = {}
+        # LLM-waiter priority (roadmap §3): a chat request blocked on a lane
+        # wake OWNS that wake, so new generative jobs are refused until it
+        # gets in. Waiters are tracked as a set of opaque tokens, so a token's
+        # exit is idempotent (removing a token that is not held is a no-op)
+        # and concurrent waiters never double-count. The count has its own
+        # lock, separate from ``self._lock``: the facade serves concurrent
+        # requests (ThreadingHTTPServer), so an admission check or an exit
+        # may arrive from another thread while a claim holds ``self._lock``
+        # for a long engine load — sharing that lock would make an admission
+        # check block behind a slow engine call.
+        self._waiter_lock = threading.Lock()
+        self._llm_waiters: set[str] = set()
+        self._waiter_seq = 0
+
+    # -- LLM-waiter priority (roadmap §3) --
+
+    @property
+    def llm_waiters(self) -> int:
+        """How many chat requests currently wait on a lane wake.
+
+        This is the model-forge proxy for the production broker's
+        ``Lifecycle.llm_waiters`` counter (weights-broker ``broker/main.py``,
+        ``prepare_llm`` increments on entry and its ``finally`` decrements on
+        exit; ``prepare_gen`` refuses while it is non-zero). A waiter is a
+        chat request that has entered the lane-wake path and not yet left it.
+        The count is read under the waiter lock, so a concurrent enter/exit
+        never shows a torn or half-applied value."""
+        with self._waiter_lock:
+            return len(self._llm_waiters)
+
+    def waiter_enter(self) -> dict:
+        """Register one LLM (chat) waiter that is blocked on a lane wake.
+
+        Mirrors ``prepare_llm``'s entry: it bumps the waiter count and hands
+        back a token the caller holds for the duration of the wait. The token
+        is unique (a monotonic sequence under the waiter lock), so concurrent
+        waiters are all tracked independently and each exit removes exactly
+        its own waiter. Registration cannot fail — the set is unbounded and
+        nothing external is touched — so ``ok`` is always ``True`` here; the
+        ``ok``/``reason`` shape matches the module's dict-row convention.
+
+        Returns ``{'ok': True, 'token': <str>, 'reason': <str>}``."""
+        with self._waiter_lock:
+            self._waiter_seq += 1
+            token = f"llm-waiter-{self._waiter_seq}"
+            self._llm_waiters.add(token)
+            pending = len(self._llm_waiters)
+        return {
+            "ok": True, "token": token,
+            "reason": f"registered LLM waiter {token} — {pending} waiter(s) "
+                      f"now own the lane wake; new generative jobs are "
+                      f"refused while any chat request waits (roadmap §3 "
+                      f"LLM-waiter priority: the waiter owns the wake)",
+        }
+
+    def waiter_exit(self, token: str) -> None:
+        """Deregister one LLM waiter. Idempotent and never raises.
+
+        Mirrors ``prepare_llm``'s ``finally: self.llm_waiters -= 1``: the
+        waiter count drops by one when a token leaves. Because waiters are a
+        set, removing a token that is not held (an unknown token, or a
+        double exit of one already released) is a no-op — the count can never
+        go negative and interleaved enter/exit pairs never double-count. A
+        ``None``/empty token is likewise a no-op, never a raise: a
+        late/duplicated exit must never sink the caller."""
+        with self._waiter_lock:
+            self._llm_waiters.discard(token)
+        return None
+
+    def admit_gen(self, model_id: str = "") -> dict:
+        """Admit a generative job, or refuse it while a chat waiter owns the
+        lane wake (roadmap §3 LLM-waiter priority).
+
+        This is the REFUSAL side of the rule, mirroring ``prepare_gen``'s
+        ``if self.llm_waiters > 0: raise RuntimeError(...)`` — except the
+        refusal is returned as an honest row, never raised. While any chat
+        request waits on a lane wake, a generative job is refused: it must
+        NOT start or queue a lane wake of its own, because the waiter owns
+        the wake and two swaps fighting over the card is exactly what the
+        rule prevents.
+
+        Admission is a gate, NOT a claim. When it returns ``ok=True`` it has
+        done nothing but answer — the existing ``claim``/``release`` scope
+        performs the actual lane claim (lane wake / eviction), unchanged.
+        Likewise a chat ``claim`` never consults this seam: a chat request is
+        the waiter, so it always gets its wake.
+
+        Returns ``{'ok': bool, 'reason': str}`` with an honest reason naming
+        the policy."""
+        pending = self.llm_waiters
+        if pending > 0:
+            for_model = f" for {model_id}" if str(model_id or "").strip() else ""
+            return {
+                "ok": False,
+                "reason": f"refused: a chat request owns the lane wake — "
+                          f"{pending} LLM waiter(s) pending{for_model} "
+                          f"(roadmap §3 LLM-waiter priority: the waiter owns "
+                          f"the wake; no generative job is started or queued "
+                          f"while a chat request waits on its lane wake)",
+            }
+        lead = f"admitted for {model_id}: " if str(model_id or "").strip() \
+               else "admitted: "
+        return {
+            "ok": True,
+            "reason": f"{lead}no chat waiter owns the lane wake — admission "
+                      f"only; the claim/release scope performs the actual "
+                      f"lane claim (admission alone never claims)",
+        }
 
     # -- workflow scopes --
 
