@@ -1454,6 +1454,138 @@ def test_scope_release_steps_down_only_what_the_scope_brought_in():
     assert {r.model_id for r in ledger.residents("local")} == {"chat-a"}
 
 
+# --- orchestrator: residency heal (gate on the runtime, not the ledger) ------
+
+class ProbeLifecycle(EngineLifecycle):
+    """Recording adapter with a controllable lifecycle probe — the
+    residency-heal seam. Records ``ensure_loaded`` calls and reports a chosen
+    probe state (or raises), so a claim can be exercised against a runtime
+    the ledger believes is up."""
+
+    def __init__(self, engine_id="container", state="running",
+                 raise_probe=False):
+        self.engine_id = engine_id
+        self.state = state
+        self.raise_probe = raise_probe
+        self.loads = []
+        self.probes = 0
+
+    def ensure_loaded(self, model_id, **kwargs):
+        self.loads.append(model_id)
+        return {"ok": True, "reason": "started"}
+
+    def release(self, model_id):
+        return {"ok": True, "reason": "stopped"}
+
+    def probe(self):
+        self.probes += 1
+        if self.raise_probe:
+            raise RuntimeError("probe boom")
+        if self.state == "unknown":
+            return {"ok": False, "state": "unknown", "resident": []}
+        return {"ok": True, "state": self.state, "resident": []}
+
+
+def _heal_setup(state="stopped", raise_probe=False):
+    """A local target with chat-a recorded resident on a container engine
+    whose probe is controllable — the shadow-run scenario: the ledger says
+    resident, the runtime says otherwise."""
+    clock = FakeClock()
+    ledger = ResidencyLedger(bookings={"chat-a": 6.0}, clock=clock)
+    ledger.set_budget("local", 24.0)
+    ledger.record_resident("local", "chat-a", engine="container", lane="chat")
+    adapter = ProbeLifecycle("container", state=state, raise_probe=raise_probe)
+    orch = Orchestrator(ledger, EvictionPlanner(ledger, clock=clock),
+                        {"container": adapter}, clock=clock)
+    return ledger, adapter, orch
+
+
+def test_claim_heals_a_resident_whose_runtime_is_down():
+    """Finding 1: the ledger calls the requested model resident but the probe
+    reports the runtime stopped — the claim must re-emit the load step and
+    run ensure_loaded (the adapter's start is idempotent)."""
+    ledger, adapter, orch = _heal_setup(state="stopped")
+    res = orch.claim("s1", "local",
+                     LoadRequest("chat-a", "container", lane="chat"))
+    assert res["ok"] is True
+    assert [s.model_id for s in res["plan"].load_steps] == ["chat-a"]
+    assert adapter.loads == ["chat-a"]           # ensure_loaded ran
+    assert ledger.is_resident("local", "chat-a")
+
+
+def test_claim_keeps_a_resident_whose_runtime_reports_up():
+    """No regression: a probe that reports the runtime up keeps the resident
+    assumption — no load step, no ensure_loaded call."""
+    ledger, adapter, orch = _heal_setup(state="running")
+    res = orch.claim("s1", "local",
+                     LoadRequest("chat-a", "container", lane="chat"))
+    assert res["ok"] is True
+    assert res["plan"].load_steps == ()
+    assert adapter.loads == []
+
+
+def test_claim_probe_unknown_or_raising_keeps_optimistic_residency():
+    """Documented fail-soft choice: a probe that reports ``unknown`` (ok
+    False) or raises does NOT prove the runtime down, so the optimistic
+    resident assumption is kept — no spurious load step."""
+    for kwargs in ({"state": "unknown"}, {"raise_probe": True}):
+        ledger, adapter, orch = _heal_setup(**kwargs)
+        res = orch.claim("s1", "local",
+                         LoadRequest("chat-a", "container", lane="chat"))
+        assert res["ok"] is True, kwargs
+        assert res["plan"].load_steps == (), kwargs
+        assert adapter.loads == [], kwargs
+
+
+def test_claim_heals_a_container_stopped_outside_the_broker():
+    """The exact shadow-run finding, end to end through the REAL
+    DockerContainerLifecycle: the ledger says the chat container is resident,
+    but ``docker inspect`` reports it stopped — the next claim re-starts it."""
+    import model_forge.broker as broker
+
+    class _Inspect:
+        def __init__(self, running):
+            self._running = running
+
+        def communicate(self, timeout=None):
+            return (b"true" if self._running else b"false"), b""
+
+    class _Docker:
+        def __init__(self, running):
+            self.running = running
+            self.calls = []
+
+        def __call__(self, args):
+            self.calls.append([str(a) for a in args])
+            if args[0] == "inspect":
+                return _Inspect(self.running)
+            return object()
+
+    clock = FakeClock()
+    ledger = ResidencyLedger(bookings={"chat": 6.0}, clock=clock)
+    ledger.set_budget("local", 24.0)
+    ledger.record_resident("local", "chat", engine="vllm", lane="chat")
+    docker = _Docker(running=False)              # externally stopped
+    adapter = broker.DockerContainerLifecycle(
+        "vllm", container="vllm-server",
+        health_url="http://127.0.0.1:8000/health", boot_budget_s=30.0,
+        runner=docker, sleep=clock.advance, clock=clock)
+    orch = Orchestrator(ledger, EvictionPlanner(ledger, clock=clock),
+                        {"vllm": adapter}, clock=clock)
+
+    orig = broker._http_healthy
+    broker._http_healthy = lambda url, timeout=2.0: True
+    try:
+        res = orch.claim("s1", "local",
+                         LoadRequest("chat", "vllm", lane="chat"))
+    finally:
+        broker._http_healthy = orig
+
+    assert res["ok"] is True
+    assert [s.model_id for s in res["plan"].load_steps] == ["chat"]
+    assert ["start", "vllm-server"] in docker.calls
+
+
 # --- orchestrator: the P4 adapters as plan steps -----------------------------
 
 def test_comfyui_vllm_and_maya_run_as_orchestrator_plan_steps():

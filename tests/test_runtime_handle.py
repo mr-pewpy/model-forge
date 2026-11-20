@@ -127,6 +127,27 @@ def health(monkeypatch):
     return fake
 
 
+class StagedDockerRunner:
+    """Injected docker runner whose ``docker inspect`` reports running for the
+    first ``running_polls`` reads (after a stop), then stopped — the seam the
+    release-wait tests drive. Non-inspect subcommands return an opaque handle
+    (no ``communicate``), so the state is only ever read from inspect here."""
+
+    def __init__(self, running_polls: int = 2):
+        self.calls: list[list[str]] = []
+        self.running_polls = running_polls
+        self.inspect_calls = 0
+
+    def __call__(self, args):
+        sub = args[0]
+        self.calls.append([str(a) for a in args])
+        if sub == "inspect":
+            self.inspect_calls += 1
+            running = self.inspect_calls <= self.running_polls
+            return _FakeDockerProc(b"true" if running else b"false")
+        return object()
+
+
 def _container(**overrides):
     kwargs = dict(engine_id="comfyui", container="weights-broker-comfyui-1",
                   health_url="http://127.0.0.1:18188/system_stats",
@@ -272,6 +293,86 @@ def test_release_stop_failure_is_an_honest_row():
     res = dcl.release("krea-2-turbo")
     assert res["ok"] is False
     assert "docker stop" in res["reason"]
+
+
+def test_release_waits_until_the_container_reports_stopped():
+    """Finding 2: ``docker stop`` frees VRAM only when the container actually
+    exits, so release must WAIT for stopped — not return the moment the stop
+    was issued. Here inspect reports running twice, then stopped: release
+    returns only after the container reaches stopped, having polled past the
+    running observations."""
+    clock = FakeClock()
+    runner = StagedDockerRunner(running_polls=2)
+    dcl = _container(runner=runner, sleep=clock.advance, clock=clock,
+                     stop_budget_s=30.0)
+    res = dcl.release("krea-2-turbo")
+    assert res["ok"] is True and res["state"] == "released"
+    assert ["stop", "weights-broker-comfyui-1"] in runner.calls
+    assert "confirmed stopped" in res["reason"]
+    # it kept asking docker until stopped was reported: 3 inspect reads.
+    assert runner.inspect_calls == 3
+    # it slept between the two running observations — the wait was real.
+    assert clock.now == 1_000.0 + 2 * dcl.POLL_INTERVAL_S
+
+
+def test_release_overrun_reports_stopping_and_never_claims_released(health):
+    """Finding 2: on stop-budget overrun, release must return an honest
+    non-released row ('stopping') — never claim 'released' while the
+    container still runs (its VRAM is not yet free). The injectable clock
+    keeps the bounded wait instant."""
+    clock = FakeClock()
+    runner = StagedDockerRunner(running_polls=1_000)   # never reports stopped
+    dcl = _container(runner=runner, sleep=clock.advance, clock=clock,
+                     stop_budget_s=5.0)
+    assert dcl.ensure_loaded("krea-2-turbo")["ok"] is True
+    assert dcl._running is True
+    res = dcl.release("krea-2-turbo")
+    assert res["ok"] is False
+    assert res["state"] == "stopping"
+    assert "NOT released" in res["reason"] and "budget" in res["reason"]
+    # honest: the tracked state is NOT reset — the container is still up.
+    assert dcl._running is True
+    # the stop budget was honoured exactly (bounded, never a hang).
+    assert clock.now - 1_000.0 >= 5.0
+
+
+def test_release_joins_the_stop_handle_when_docker_state_is_unreadable():
+    """Release falls back to the stop handle's own join (``docker stop``
+    blocks until exit) when ``docker inspect`` gives no readable state, then
+    reports released — never a false 'released' while the stop still runs."""
+    clock = FakeClock()
+
+    class _Handle:
+        def __init__(self):
+            self.waited = False
+            self._done = False
+
+        def wait(self, timeout=None):
+            self.waited = True
+            self._done = True
+            return 0
+
+        def poll(self):
+            return 0 if self._done else None
+
+    handle = _Handle()
+
+    class _Runner:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, args):
+            self.calls.append([str(a) for a in args])
+            if args[0] == "stop":
+                return handle
+            return object()               # opaque inspect -> unreadable
+
+    runner = _Runner()
+    dcl = _container(runner=runner, sleep=clock.advance, clock=clock,
+                     stop_budget_s=30.0)
+    res = dcl.release("krea-2-turbo")
+    assert res["ok"] is True and res["state"] == "released"
+    assert handle.waited is True
 
 
 def test_probe_fails_soft_when_the_runner_raises():

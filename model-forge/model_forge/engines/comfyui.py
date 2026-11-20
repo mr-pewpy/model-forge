@@ -651,5 +651,5 @@ class ComfyWorkflowRunner:
                                    {"prompt_id": prompt_id})
         return self._empty(cfg.output_kind,
                            f"history poll timed out after "
-                           f"{self._history_timeout_s}s for {prompt_id}",
+                           f"{budget:g}s for {prompt_id}",
                            {"prompt_id": prompt_id})

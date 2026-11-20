@@ -442,6 +442,26 @@ def test_run_without_timeout_uses_history_budget():
     assert len(http.calls_to("/history/pid-default")) == 4
 
 
+def test_timeout_reason_reports_the_honored_budget_not_the_ceiling():
+    """Finding 3: when the request's smaller ``timeout_s`` wins, the timeout
+    reason must name the budget ACTUALLY honoured — not the instance's
+    larger history ceiling."""
+    http = FakeHTTP()
+    http.history = {}                     # never completes
+    sleep = FakeSleep()
+    r = make_runner(http, sleep, poll_interval_s=1.0, history_timeout_s=3600.0)
+    res = r.run("moss-image", {}, assets_dir="/tmp/a", job_id="j",
+                timeout_s=3.0)
+    assert res["ok"] is False
+    assert "timed out after 3s" in res["reason"]     # the honored budget
+    assert "3600" not in res["reason"]               # not the ceiling
+    # without a request budget the reason still names the history budget
+    r2 = make_runner(http, FakeSleep(), poll_interval_s=1.0,
+                     history_timeout_s=3600.0)
+    res2 = r2.run("moss-image", {}, assets_dir="/tmp/a", job_id="j")
+    assert "timed out after 3600s" in res2["reason"]
+
+
 def test_history_error_status_is_ok_false():
     http = FakeHTTP()
     http.history = {"pid-default": {"status": {

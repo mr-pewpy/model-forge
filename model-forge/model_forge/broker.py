@@ -1283,9 +1283,12 @@ class DockerContainerLifecycle(EngineLifecycle):
 
     ``ensure_loaded`` starts the container only when it is not already
     running, then polls ``health_url`` until it answers 200 or the cold-boot
-    budget expires. ``release`` issues ``docker stop``. Both drive the host
-    docker CLI through the injectable ``runner``; tests inject fakes and
-    NEVER call real docker.
+    budget expires. ``release`` issues ``docker stop`` and then WAITS for the
+    container to actually reach stopped, bounded by ``stop_budget_s``: VRAM
+    is freed only when the container exits, so returning as soon as the stop
+    was issued would race the next load's allocation (OOM on the 24 GB cards).
+    Both drive the host docker CLI through the injectable ``runner``; tests
+    inject fakes and NEVER call real docker.
 
     ``boot_budget_s`` is the cold-boot allowance the CALLER passes (vLLM
     ~90-170 s warm / ~8 min cold, ComfyUI minutes): this adapter never
@@ -1302,7 +1305,7 @@ class DockerContainerLifecycle(EngineLifecycle):
 
     def __init__(self, engine_id, *, container: str, health_url: str,
                  boot_budget_s: float, gpu_count: int = 1, runner=None,
-                 sleep=None, clock=None):
+                 sleep=None, clock=None, stop_budget_s: float = 60.0):
         self.engine_id = str(engine_id)
         self._container = str(container)
         self._health_url = str(health_url)
@@ -1311,6 +1314,14 @@ class DockerContainerLifecycle(EngineLifecycle):
         self._runner = runner or _run_docker
         self._sleep = sleep or time.sleep
         self._clock = clock or time.monotonic
+        # The release-side stop budget: ``release`` waits for the container to
+        # actually reach stopped within this window before it reports the GPU
+        # freed. Freeing VRAM happens only when the container exits, so a
+        # release followed straight away by the next load would race the free
+        # (OOM on the real 24 GB cards) if release returned as soon as
+        # ``docker stop`` was issued. ``docker stop`` normally blocks until
+        # exit, so this is an upper bound, not a per-release wait.
+        self._stop_budget_s = float(stop_budget_s)
         # The last state this adapter observed. ``docker start`` against an
         # already-running container is the engine's own no-op, so tracking is
         # safe; ``probe`` still asks docker when it can, and resets this flag
@@ -1377,23 +1388,96 @@ class DockerContainerLifecycle(EngineLifecycle):
                         f"~8min, ComfyUI minutes)"}
             self._sleep(self.POLL_INTERVAL_S)
 
+    def _await_stopped(self, handle) -> bool:
+        """Wait for the container to reach stopped, bounded by
+        ``stop_budget_s``.
+
+        Returns ``True`` when the container is confirmed stopped (or when
+        docker state is unreadable but the stop CLI's own join returned),
+        ``False`` when the container is still running at budget — never a
+        false ``released`` while it still holds VRAM. A failed inspect is
+        fail-soft (treated as unreadable, not as running).
+        """
+        start = self._clock()
+        joined = False
+        while True:
+            try:
+                observed = _docker_state(self._runner, self._container)
+            except Exception:  # noqa: BLE001 — unreadable, not proven running
+                observed = None
+            if observed is False:
+                return True
+            if observed is None:
+                # ``docker inspect`` gave no readable state. Fall back to the
+                # stop CLI's own contract: ``docker stop`` blocks until the
+                # container exits, so join the handle ONCE within the budget.
+                # A handle with no join seam (an opaque fake) is taken at
+                # face value — the tracked flag already says we stopped it.
+                if not joined:
+                    joined = True
+                    if not self._join(handle):
+                        return False
+                return True
+            # observed is True — the container is still running. Wait it out
+            # against the injectable clock so the budget is bounded.
+            if self._clock() - start >= self._stop_budget_s:
+                return False
+            self._sleep(self.POLL_INTERVAL_S)
+
+    def _join(self, handle) -> bool:
+        """Join a stop handle within ``stop_budget_s``: ``True`` when it has
+        finished (or exposes no join seam), ``False`` when it is still
+        running. Never raises."""
+        wait = getattr(handle, "wait", None)
+        if not callable(wait):
+            return True
+        try:
+            wait(timeout=self._stop_budget_s)
+        except TypeError:
+            try:
+                wait()
+            except Exception:  # noqa: BLE001 — honest, never a raise
+                return True
+        except Exception:  # noqa: BLE001 — honest, never a raise
+            return True
+        poll = getattr(handle, "poll", None)
+        if callable(poll):
+            try:
+                return poll() is not None
+            except Exception:  # noqa: BLE001
+                return True
+        return True
+
     def release(self, model_id) -> dict:
         base = {"engine": self.engine_id, "action": "release",
                 "model_id": model_id, "container": self._container,
                 "lifecycle": self.LIFECYCLE}
         try:
-            self._runner(["stop", self._container])
+            handle = self._runner(["stop", self._container])
         except Exception as exc:  # noqa: BLE001 — honest row, never a raise
             return {**base, "ok": False, "state": "running",
                     "reason": f"docker stop {self._container!r} failed: "
                               f"{type(exc).__name__}: {exc} — the container "
                               f"may still hold VRAM"}
+        # VRAM is freed only when the container exits: wait for it to reach
+        # stopped within the stop budget before reporting the release. Never
+        # claim ``released`` while the container is still running.
+        if not self._await_stopped(handle):
+            return {**base, "ok": False, "state": "stopping",
+                    "reason": f"docker stop {self._container!r} was issued "
+                              f"but the container had not reached stopped "
+                              f"when the {self._stop_budget_s:g}s stop "
+                              f"budget expired — NOT released (its VRAM is "
+                              f"not yet free; the container is still "
+                              f"stopping)"}
         self._running = False
         self._booting = False
         self._serving = None
         return {**base, "ok": True, "state": "released",
                 "reason": f"stopped container {self._container!r} (docker "
-                          f"stop) — its VRAM is freed instantly"}
+                          f"stop) — confirmed stopped within the "
+                          f"{self._stop_budget_s:g}s stop budget; its VRAM "
+                          f"is freed instantly once the container exits"}
 
     def probe(self) -> dict:
         try:
@@ -2151,6 +2235,15 @@ class Orchestrator:
                               f"release it first (fail-closed)",
                               target_id, request)
         restore = tuple(self._ledger.residents(target_id))
+        # Residency heal (weights-broker hard rule: gate on CONTAINER state,
+        # not the stale ledger/cache). If the ledger calls the REQUESTED model
+        # resident but its runtime is actually down (e.g. a container stopped
+        # outside this broker), the planner would emit NO load step, report
+        # ready, and the upstream forward would 502. Consult the lifecycle
+        # probe for the requested model and drop the stale residency so the
+        # planner re-emits the load (the adapter's ensure_loaded is
+        # idempotent: starting a running container is a no-op).
+        self._heal_residency(target_id, {request.model_id})
         result = self._run_plan(
             self._planner.plan_load_many(target_id, [request]),
             key=scope_id, scope_id=scope_id, ready_model=request.model_id)
@@ -2300,6 +2393,57 @@ class Orchestrator:
         return self._run_plan(
             self._planner.plan_load_many(target_id, [request]),
             key=key, ready_model=request.model_id)
+
+    # -- residency heal (gate on the runtime, not the stale ledger) --
+
+    @staticmethod
+    def _runtime_reports_down(adapter) -> bool:
+        """True when an adapter's lifecycle probe says its runtime is NOT up.
+
+        Only an explicit, healthy probe naming a down state (``stopped`` /
+        ``idle``) counts — the honest "the container/process is not running"
+        answers. Anything else keeps the optimistic resident assumption:
+        an unregistered adapter, a probe that raises, a probe whose ``ok`` is
+        False (``unknown`` — fail-soft), or any up state (``running`` /
+        ``booting`` / ``ready`` / ``observed``). Gating on a real "down"
+        answer — never on an absence of one — is the fail-soft choice: a
+        transiently unreadable probe degrades to the old behavior (treat as
+        resident) rather than firing a spurious load."""
+        try:
+            probe = adapter.probe()
+        except Exception:  # noqa: BLE001 — a probe never sinks the caller
+            return False
+        if not isinstance(probe, dict) or not probe.get("ok"):
+            return False
+        state = str(probe.get("state") or "").strip().lower()
+        return state in ("stopped", "idle")
+
+    def _heal_residency(self, target_id, model_ids) -> tuple:
+        """Drop ledger residency for any of ``model_ids`` whose runtime is down.
+
+        Only the named models are checked — those a plan would otherwise treat
+        as resident and skip loading. For each that the ledger calls resident
+        and whose engine has a registered adapter, consult the lifecycle
+        probe: a probe that reports the runtime stopped releases that model
+        from the ledger so the planner treats it as NOT resident and re-emits
+        its load step. Fail-soft: an engine with no adapter, a raising probe,
+        or a probe that does not name a down state leaves residency untouched
+        (the optimistic assumption). Returns the model ids healed, in order —
+        for honest reporting/tests."""
+        want = {m for m in (model_ids or ()) if m}
+        if not want:
+            return ()
+        healed = []
+        for rec in self._ledger.residents(target_id):
+            if rec.model_id not in want:
+                continue
+            adapter = self._adapters.get(rec.engine)
+            if adapter is None:
+                continue
+            if self._runtime_reports_down(adapter):
+                self._ledger.record_released(target_id, rec.model_id)
+                healed.append(rec.model_id)
+        return tuple(healed)
 
     def touch(self, target_id, model_id) -> bool:
         """Record a use — keeps the model inside the recency window."""

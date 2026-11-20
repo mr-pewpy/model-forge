@@ -285,6 +285,23 @@ class FacadeConfig:
     # Comfy base for the default runner; the production ai-dock lane (broker
     # exposed it on 18188).
     comfy_base_url: str = "http://127.0.0.1:18188"
+    # -- topology / runtime overrides (shadow + stub deployments) -----------
+    # The container names, health URLs and cold-boot budgets of the two lanes
+    # serve.py assembles. Production defaults are the real .62 containers; a
+    # shadow/stub deployment points them at throwaway containers so the
+    # container-dance mechanics can be exercised without touching the live
+    # stack. Defaults are byte-identical to serve.py's former hardcoded
+    # TOPOLOGY_ENTRIES, so behaviour is unchanged when nothing overrides them.
+    chat_container: str = "vllm-server"
+    chat_health_url: str = "http://127.0.0.1:8000/health"
+    gen_container: str = "weights-broker-comfyui-1"
+    gen_health_url: str = "http://127.0.0.1:18188/"
+    chat_boot_s: float = 480.0
+    gen_boot_s: float = 600.0
+    # Absolute base under which the runner resolves collected ComfyUI outputs.
+    # The ai-dock image mounts its output dir at /output; a stub deployment
+    # points this at a stub-writable dir under assets_dir so /assets serves it.
+    comfy_output_dir: str = "/output"
 
     @classmethod
     def from_env(cls, **overrides) -> "FacadeConfig":

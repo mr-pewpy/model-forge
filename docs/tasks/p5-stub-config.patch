@@ -1,0 +1,226 @@
+diff --git a/model-forge/model_forge/facade.py b/model-forge/model_forge/facade.py
+index e84e5a1..241de3f 100644
+--- a/model-forge/model_forge/facade.py
++++ b/model-forge/model_forge/facade.py
+@@ -285,6 +285,23 @@ class FacadeConfig:
+     # Comfy base for the default runner; the production ai-dock lane (broker
+     # exposed it on 18188).
+     comfy_base_url: str = "http://127.0.0.1:18188"
++    # -- topology / runtime overrides (shadow + stub deployments) -----------
++    # The container names, health URLs and cold-boot budgets of the two lanes
++    # serve.py assembles. Production defaults are the real .62 containers; a
++    # shadow/stub deployment points them at throwaway containers so the
++    # container-dance mechanics can be exercised without touching the live
++    # stack. Defaults are byte-identical to serve.py's former hardcoded
++    # TOPOLOGY_ENTRIES, so behaviour is unchanged when nothing overrides them.
++    chat_container: str = "vllm-server"
++    chat_health_url: str = "http://127.0.0.1:8000/health"
++    gen_container: str = "weights-broker-comfyui-1"
++    gen_health_url: str = "http://127.0.0.1:18188/"
++    chat_boot_s: float = 480.0
++    gen_boot_s: float = 600.0
++    # Absolute base under which the runner resolves collected ComfyUI outputs.
++    # The ai-dock image mounts its output dir at /output; a stub deployment
++    # points this at a stub-writable dir under assets_dir so /assets serves it.
++    comfy_output_dir: str = "/output"
+ 
+     @classmethod
+     def from_env(cls, **overrides) -> "FacadeConfig":
+diff --git a/model-forge/model_forge/serve.py b/model-forge/model_forge/serve.py
+index 7575641..8ecf137 100644
+--- a/model-forge/model_forge/serve.py
++++ b/model-forge/model_forge/serve.py
+@@ -91,38 +91,54 @@ GEN_BOOT_S = 600.0
+ # into a DockerContainerLifecycle; the engine id is the entry's first engine
+ # ('vllm' / 'comfyui'), which is exactly the engine name the facade's gen
+ # claim and the chat claim put on their LoadRequests.
+-TOPOLOGY_ENTRIES: tuple[ModelEntry, ...] = (
+-    ModelEntry(
+-        id=CHAT_MODEL_ID,
+-        name="Qwen3.8-27B-FP8 vLLM TP2 lane",
+-        modality="chat",
+-        engines=("vllm",),
+-        source=CHAT_MODEL_ID,
+-        runtime={
+-            "kind": "container",
+-            "name": "vllm-server",
+-            "health_url": "http://127.0.0.1:8000/health",
+-            "boot_budget_s": CHAT_BOOT_S,
+-            "gpu_count": 2,
+-        },
+-    ),
+-    ModelEntry(
+-        id="comfyui-gen-lane",
+-        name="ComfyUI ai-dock gen lane (single card)",
+-        modality="image",
+-        engines=("comfyui",),
+-        source="Comfy-Org/Krea-2",
+-        runtime={
+-            "kind": "container",
+-            "name": "weights-broker-comfyui-1",
+-            # the ai-dock lane; the broker exposed it on 18188. The health URL
+-            # is its root, as the container adapter probes it.
+-            "health_url": "http://127.0.0.1:18188/",
+-            "boot_budget_s": GEN_BOOT_S,
+-            "gpu_count": 1,
+-        },
+-    ),
+-)
++#
++# The container names / health URLs / boot budgets are read from the resolved
++# ``FacadeConfig`` (see ``topology_entries``), so a stub or shadow deployment
++# can point the lanes at throwaway containers without touching this file. With
++# the config defaults the result is byte-identical to the former hardcoded
++# tuple (vllm-server / weights-broker-comfyui-1).
++def topology_entries(config: "FacadeConfig | None" = None) -> tuple[ModelEntry, ...]:
++    """The .62 lane runtime entries, resolved from ``config`` (defaults when
++    ``config`` is None)."""
++    config = config or FacadeConfig()
++    return (
++        ModelEntry(
++            id=CHAT_MODEL_ID,
++            name="Qwen3.8-27B-FP8 vLLM TP2 lane",
++            modality="chat",
++            engines=("vllm",),
++            source=CHAT_MODEL_ID,
++            runtime={
++                "kind": "container",
++                "name": config.chat_container,
++                "health_url": config.chat_health_url,
++                "boot_budget_s": float(config.chat_boot_s),
++                "gpu_count": 2,
++            },
++        ),
++        ModelEntry(
++            id="comfyui-gen-lane",
++            name="ComfyUI ai-dock gen lane (single card)",
++            modality="image",
++            engines=("comfyui",),
++            source="Comfy-Org/Krea-2",
++            runtime={
++                "kind": "container",
++                "name": config.gen_container,
++                # the ai-dock lane; the broker exposed it on 18188. The health
++                # URL is its root, as the container adapter probes it.
++                "health_url": config.gen_health_url,
++                "boot_budget_s": float(config.gen_boot_s),
++                "gpu_count": 1,
++            },
++        ),
++    )
++
++
++# The production-default entries (byte-identical to the former hardcoded
++# tuple). Kept as a module constant for importers (tests) that read the
++# documented production runtimes.
++TOPOLOGY_ENTRIES: tuple[ModelEntry, ...] = topology_entries()
+ 
+ # The bare runner workflow ids the gen lane can claim: the facade advertises
+ # ``gen/<id>`` and strips the prefix to reach these. Booking every one keeps
+@@ -132,7 +148,7 @@ GEN_WORKFLOW_IDS: tuple[str, ...] = tuple(
+     dict.fromkeys(mid.removeprefix("gen/") for mid in GEN_MODELS))
+ 
+ 
+-def topology_bookings() -> dict[str, dict]:
++def topology_bookings(config: "FacadeConfig | None" = None) -> dict[str, dict]:
+     """The nominal booked ceilings for the .62 topology (ledger booking shape).
+ 
+     Honest provenance: every figure here is a published/advisory ceiling (the
+@@ -144,11 +160,15 @@ def topology_bookings() -> dict[str, dict]:
+     Registry footprints are used where the registry declares one for a bare
+     workflow id (e.g. ``qwen-image-2.1``); otherwise a gen workflow books the
+     full single-card ceiling. ``load_s`` carries the lane's cold-boot budget as
+-    the honest load-duration estimate.
++    the honest load-duration estimate. ``config`` supplies those budgets (and
++    the chat id) for a shadow/stub deployment; ``None`` uses the production
++    defaults.
+     """
++    chat_boot = float(config.chat_boot_s) if config is not None else CHAT_BOOT_S
++    gen_boot = float(config.gen_boot_s) if config is not None else GEN_BOOT_S
+     bookings: dict[str, dict] = {
+         CHAT_MODEL_ID: {"vram_gb": CHAT_BOOKED_GB, "source": "published",
+-                        "load_s": CHAT_BOOT_S},
++                        "load_s": chat_boot},
+     }
+     reg = registry_bookings()
+     for wf in GEN_WORKFLOW_IDS:
+@@ -157,7 +177,7 @@ def topology_bookings() -> dict[str, dict]:
+         bookings[wf] = {
+             "vram_gb": min(vram, GEN_CARD_CEILING_GB),
+             "source": "published",
+-            "load_s": GEN_BOOT_S,
++            "load_s": gen_boot,
+         }
+     return bookings
+ 
+@@ -185,7 +205,8 @@ def build_stack(config: FacadeConfig | None = None, *,
+     """
+     config = config or FacadeConfig.from_env()
+ 
+-    ledger = ResidencyLedger(bookings=topology_bookings(), clock=clock)
++    entries = topology_entries(config)
++    ledger = ResidencyLedger(bookings=topology_bookings(config), clock=clock)
+     # The chat lane and the gen lane share ONE physical pool: same target id as
+     # the facade's gen claims, so the planner sees the chat resident and evicts
+     # it for a gen claim, then restores it on release.
+@@ -205,13 +226,14 @@ def build_stack(config: FacadeConfig | None = None, *,
+         seams["clock"] = clock
+ 
+     adapters: dict = {}
+-    for entry in TOPOLOGY_ENTRIES:
++    for entry in entries:
+         lifecycle = runtime_lifecycle_for(entry, **seams)
+         if lifecycle is not None:                 # all .62 lanes are containers
+             adapters[lifecycle.engine_id] = lifecycle
+ 
+     orchestrator = Orchestrator(ledger, planner, adapters, clock=clock)
+-    runner = comfy_runner or ComfyWorkflowRunner(config.comfy_base_url, http=http)
++    runner = comfy_runner or ComfyWorkflowRunner(
++        config.comfy_base_url, http=http, output_dir=config.comfy_output_dir)
+     service = FacadeService(config, orchestrator=orchestrator, runner=runner)
+ 
+     return {
+@@ -223,7 +245,7 @@ def build_stack(config: FacadeConfig | None = None, *,
+         "orchestrator": orchestrator,
+         "runner": runner,
+         "service": service,
+-        "entries": TOPOLOGY_ENTRIES,
++        "entries": entries,
+     }
+ 
+ 
+@@ -252,6 +274,18 @@ _ENV_TO_FIELD = {
+     "PUBLIC_BASE_URL": "public_base_url",
+     "GEN_TARGET_ID": "gen_target_id",
+     "UPSTREAM_TIMEOUT_S": "upstream_timeout_s",
++    # -- topology / runtime overrides (shadow + stub deployments) ---------
++    # These let a deployment point the two lanes at alternate containers,
++    # health URLs, cold-boot budgets and an alternate runner output dir —
++    # the same seam a stub-based acceptance run needs. Absent any override,
++    # the production .62 defaults apply (see FacadeConfig).
++    "CHAT_CONTAINER": "chat_container",
++    "CHAT_HEALTH_URL": "chat_health_url",
++    "GEN_CONTAINER": "gen_container",
++    "GEN_HEALTH_URL": "gen_health_url",
++    "CHAT_BOOT_S": "chat_boot_s",
++    "GEN_BOOT_S": "gen_boot_s",
++    "COMFY_OUTPUT_DIR": "comfy_output_dir",
+ }
+ 
+ # The fields a file or an explicit override may set: exactly those reachable
+@@ -299,6 +333,15 @@ def resolve_settings(env: dict | None = None, config_file: str | None = None,
+         "comfy_base_url": _DEFAULT_COMFYUI_BASE_URL,
+         "assets_dir": _DEFAULT_ASSETS_DIR,
+         "public_base_url": _DEFAULT_PUBLIC_BASE_URL,
++        # topology / runtime defaults (production .62 containers + budgets);
++        # a stub/shadow deployment overrides these via env or FACADE_CONFIG.
++        "chat_container": "vllm-server",
++        "chat_health_url": "http://127.0.0.1:8000/health",
++        "gen_container": "weights-broker-comfyui-1",
++        "gen_health_url": "http://127.0.0.1:18188/",
++        "chat_boot_s": 480.0,
++        "gen_boot_s": 600.0,
++        "comfy_output_dir": "/output",
+     }
+     for env_name, field in _ENV_TO_FIELD.items():
+         value = env.get(env_name)
