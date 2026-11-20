@@ -265,12 +265,23 @@ class PullRecord:
 
 @dataclass(frozen=True)
 class ResidentRecord:
-    """A model loaded in memory on a compute target."""
+    """A model loaded in memory on a compute target.
+
+    ``provenance`` is honest server-process provenance (B8): ``"plugin"``
+    when Model Forge started the engine's server/runtime for this model, and
+    ``"external"`` when the runtime was already running and Model Forge
+    adopted it (a server the user started themselves — e.g. a docker
+    container brought up by compose). Stopping an ``"external"`` runtime is
+    stopping a process the user started, so it rides the approval gate; a
+    ``"plugin"`` runtime was gated at start, so stopping it is symmetric and
+    ungated. ``""`` means provenance is not recorded (an engine with no
+    stoppable server)."""
     model_id: str
     engine: str
     lane: str
     loaded_at: float
     last_used: float
+    provenance: str = ""
 
 
 class ResidencyLedger:
@@ -406,14 +417,16 @@ class ResidencyLedger:
 
     # -- residency (weights in memory) --
 
-    def record_resident(self, target_id, model_id, engine, lane="chat") -> dict:
+    def record_resident(self, target_id, model_id, engine, lane="chat",
+                        provenance="") -> dict:
         now = self._clock()
         rec = ResidentRecord(model_id=model_id, engine=engine, lane=lane,
-                             loaded_at=now, last_used=now)
+                             loaded_at=now, last_used=now,
+                             provenance=str(provenance or ""))
         with self._lock:
             self._residents.setdefault(target_id, {})[model_id] = rec
         return {"ok": True, "target_id": target_id, "model_id": model_id,
-                "engine": engine, "lane": lane}
+                "engine": engine, "lane": lane, "provenance": rec.provenance}
 
     def record_released(self, target_id, model_id) -> bool:
         with self._lock:
@@ -437,7 +450,8 @@ class ResidencyLedger:
                 return False
             self._residents[target_id][model_id] = ResidentRecord(
                 model_id=rec.model_id, engine=rec.engine, lane=rec.lane,
-                loaded_at=rec.loaded_at, last_used=now)
+                loaded_at=rec.loaded_at, last_used=now,
+                provenance=rec.provenance)
             return True
 
     def last_used(self, target_id, model_id) -> float | None:
@@ -662,6 +676,20 @@ class EngineLifecycle(abc.ABC):
     def probe(self) -> dict:
         """Observational: what is resident right now. Fail-soft — an
         unreachable engine reports ``state="unknown"``, never raises."""
+
+    def stops_externally_started(self, model_id: str = "") -> bool:
+        """True only when ``release``/eviction would STOP an engine runtime
+        the user started themselves (an externally-started server) — the B8
+        gate signal.
+
+        The default is ``False``: process adapters (llama.cpp, vLLM) only
+        terminate a handle they started themselves and HTTP adapters never
+        stop a server, so they can never stop an externally-started one. The
+        container adapter overrides this: it can ``docker stop`` a container
+        the user brought up (e.g. via compose), which is the case the
+        approval gate must cover. ``model_id`` is accepted for a uniform
+        signature; container adapters gate per-container, not per-model."""
+        return False
 
 
 def _http_json(method: str, url: str, body: dict | None = None,
@@ -1339,6 +1367,12 @@ class DockerContainerLifecycle(EngineLifecycle):
         self._running = False
         self._booting = False
         self._serving: str | None = None
+        # B8 server provenance: True only when THIS adapter started the
+        # container; False when it adopted a container the user already had
+        # running (externally started — e.g. via compose) or when the prior
+        # state was unreadable (fail-safe: treated as external, so a stop is
+        # gated). Reset to False when the container is stopped.
+        self._started_by_plugin = False
 
     def ensure_loaded(self, model_id, **_ignored) -> dict:
         row = {"ok": False, "engine": self.engine_id, "action": "load",
@@ -1356,13 +1390,23 @@ class DockerContainerLifecycle(EngineLifecycle):
         # re-issue no start, just retry readiness against the health endpoint.
         did_start = False
         if not self._running:
+            # B8 provenance: was the container already running (externally
+            # started — e.g. by the user / compose) before this load? Only a
+            # container this load actually starts is plugin-owned; adopting a
+            # running one, or an unreadable prior state, is treated as
+            # external (fail-safe) so a later stop rides the gate.
+            try:
+                prior = _docker_state(self._runner, self._container)
+            except Exception:  # noqa: BLE001 — unreadable -> fail-safe external
+                prior = None
+            self._started_by_plugin = (prior is False)
             try:
                 self._runner(["start", self._container])
             except Exception as exc:  # noqa: BLE001 — honest row, never a raise
                 return {**row, "reason": f"docker start {self._container!r} "
                                          f"failed: {type(exc).__name__}: {exc}"}
             self._running = True
-            did_start = True
+            did_start = (prior is not True)
         start = self._clock()
         # Poll the health endpoint until it answers 200 or the cold-boot
         # budget expires. The budget is the caller's; overrunning it is an
@@ -1456,10 +1500,19 @@ class DockerContainerLifecycle(EngineLifecycle):
                 return True
         return True
 
+    def stops_externally_started(self, model_id: str = "") -> bool:
+        """True when ``release`` would ``docker stop`` a container Model Forge
+        did NOT start — an externally-started runtime (B8 gate signal)."""
+        return bool(self._running and not self._started_by_plugin)
+
     def release(self, model_id) -> dict:
+        external = bool(self._running and not self._started_by_plugin)
         base = {"engine": self.engine_id, "action": "release",
                 "model_id": model_id, "container": self._container,
-                "lifecycle": self.LIFECYCLE}
+                "lifecycle": self.LIFECYCLE,
+                # B8: whether this stop targets a server the user started
+                "stopped_external": external,
+                "provenance": ("external" if external else "plugin")}
         try:
             handle = self._runner(["stop", self._container])
         except Exception as exc:  # noqa: BLE001 — honest row, never a raise

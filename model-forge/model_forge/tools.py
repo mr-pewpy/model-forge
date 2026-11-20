@@ -650,6 +650,34 @@ def policy_hook(tool_name: str, args: dict | None = None, task_id: str = "",
                     "this prompt time out starts nothing."),
                 "rule_key": "model-forge:broker_server_start",
             }
+    # B8: stopping an externally-started server (a runtime the user started
+    # themselves, e.g. a docker container brought up by compose) rides the
+    # approval gate too. This is provenance-scoped: a plugin-owned runtime
+    # was gated at start, so stopping it is symmetric and ungated; only a
+    # stop that would take down a server Model Forge did NOT start prompts.
+    if (tool_name == "model_forge_broker"
+            and args.get("action") in ("claim", "swap", "release")
+            and not (args.get("action") == "swap"
+                     and _swap_dry_run(args.get("dry_run")))):
+        detail = _broker_would_stop_external(args)
+        if detail is not None:
+            return {
+                "action": "approve",
+                "message": (
+                    "Model Forge wants to STOP an inference engine runtime "
+                    "that YOU started yourself (an externally-started "
+                    f"server: a {detail['engine']} runtime). This swap/"
+                    "release would stop a process you run, so it needs your "
+                    "approval:\n"
+                    f"  engine: {detail['engine']}\n"
+                    f"  model: {detail['model_id']}\n"
+                    f"  target: {detail['target']}\n"
+                    "  stops: a server Model Forge did NOT start\n"
+                    "Approving stops the server (its weights stay on disk "
+                    "and it can be re-loaded); denying or letting this "
+                    "prompt time out stops nothing."),
+                "rule_key": "model-forge:broker_server_stop",
+            }
     return None
 
 
@@ -3080,6 +3108,7 @@ def _build_broker_stack(target, *, http=None, runner=None, which=None,
     orchestrator = Orchestrator(ledger, planner, adapters, clock=clock)
     return {"target_id": target.id, "ledger": ledger, "planner": planner,
             "orchestrator": orchestrator, "bookings": bookings,
+            "adapters": adapters,
             "budget_gb": budget}
 
 
@@ -3338,6 +3367,107 @@ def _media_would_start_server(args) -> dict | None:
             "port": _PROCESS_ENGINE_PORTS.get(rec.engine, "its default"),
             "target": target.id,
             "models": [r.model_id for r in process]}
+
+
+def _external_stop_detail(target, stop_steps) -> dict | None:
+    """The first model whose eviction/release would STOP an externally-started
+    engine runtime (B8) — else ``None``. ``stop_steps`` are the plan's
+    release steps (each carrying ``engine`` and ``model_id``) that the call
+    would run. The live adapter is asked directly (``stops_externally_started``)
+    so a container the user started is caught from current runtime state, not
+    a stale record. Process adapters answer ``False`` (they only stop a handle
+    they started), so they never escalate here.
+
+    Fail-safe: any uncertainty about provenance escalates."""
+    steps = list(stop_steps or ())
+    try:
+        stack = broker_stack(target)
+        adapters = (stack.get("adapters")
+                    or getattr(stack.get("orchestrator"), "_adapters", None))
+    except Exception:  # noqa: BLE001 — uncertainty -> escalate (fail-safe)
+        adapters = None
+    if adapters is None:
+        # Cannot resolve the adapter catalog. With nothing to stop there is
+        # nothing to gate; with steps whose provenance is unknowable, fail
+        # safe and escalate.
+        return ({"target": getattr(target, "id", ""),
+                 "engine": steps[0].engine if steps else "(unresolved)",
+                 "model_id": steps[0].model_id if steps else "",
+                 "external": True} if steps else None)
+    for step in steps:
+        adapter = adapters.get(step.engine)
+        if adapter is None:
+            continue
+        fn = getattr(adapter, "stops_externally_started", None)
+        if not callable(fn):
+            # A duck-typed adapter with no provenance capability: it is not
+            # modeled as able to stop an externally-started server, so it
+            # does not escalate (all real adapters carry the method).
+            continue
+        try:
+            if fn(step.model_id):
+                return {"target": target.id, "engine": step.engine,
+                        "model_id": step.model_id, "external": True}
+        except Exception:  # noqa: BLE001 — real adapter error -> escalate
+            return {"target": target.id, "engine": step.engine,
+                    "model_id": step.model_id, "external": True}
+    return None
+
+
+def _broker_would_stop_external(args) -> dict | None:
+    """Whether a ``model_forge_broker`` claim/swap/release would STOP an
+    externally-started server (B8), and the honest detail for the approval
+    prompt — else ``None``.
+
+    The eviction/step-down set is computed exactly as the handler computes it:
+    a claim/swap's ``plan_load_many(...).release_steps`` (what must be evicted
+    to fit the incoming model), and a release's ``restore_plan`` step-down
+    (``release_steps``). Only when one of those would ``docker stop`` a
+    container Model Forge did NOT start does this escalate — a plugin-owned
+    runtime was gated at start and is stopped symmetrically, ungated.
+
+    Fail-safe: any uncertainty escalates. An unresolvable request is refused
+    by the handler before any stop, so it does not escalate."""
+    action = str(args.get("action") or "").strip()
+    model_id = str(args.get("model_id") or "").strip()
+    modality = str(args.get("modality") or "").strip()
+    try:
+        target = get_target(args.get("target"))
+    except Exception:  # noqa: BLE001 — uncertainty -> escalate (fail-safe)
+        target = None
+    if target is None:
+        return None    # the handler refuses an unknown target before any stop
+    if action == "release":
+        scope_id = str(args.get("scope_id") or "").strip()
+        if not scope_id:
+            return None    # the handler refuses: nothing released, nothing stops
+        try:
+            plan = broker_stack(target)["orchestrator"].restore_plan(scope_id)
+        except Exception:  # noqa: BLE001 — uncertainty -> escalate (fail-safe)
+            return {"target": target.id, "engine": "(unresolved)",
+                    "model_id": "", "external": True}
+        if plan is None:
+            return None    # unknown scope: release fails closed, stops nothing
+        return _external_stop_detail(target, plan.release_steps)
+    # claim / swap
+    try:
+        entry, err = _claim_entry(model_id, modality)
+    except Exception:  # noqa: BLE001 — uncertainty -> escalate (fail-safe)
+        return {"target": target.id, "engine": "(unresolved)",
+                "model_id": model_id or f"(modality {modality!r})",
+                "external": True}
+    if err or entry is None:
+        return None    # refused by the handler before anything stops
+    request, rerr = _claim_request(entry)
+    if rerr or request is None:
+        return None
+    try:
+        plan = broker_stack(target)["planner"].plan_load_many(target.id,
+                                                              [request])
+    except Exception:  # noqa: BLE001 — uncertainty -> escalate (fail-safe)
+        return {"target": target.id, "engine": request.engine,
+                "model_id": request.model_id, "external": True}
+    return _external_stop_detail(target, plan.release_steps)
 
 
 def _claim_entry(model_id: str = "", modality: str = ""):

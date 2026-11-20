@@ -263,9 +263,14 @@ The list is grouped as:
   configured in settings.
 - **What exists today:** the disclosure states the process start/stop
   behavior; the verbs are non-destructive and fail closed on a refused claim.
-- **What would unblock it:** a gate scoped to stopping servers the user
-  started themselves (externally-started servers), which is a future
-  consideration (see B8).
+  Stopping an EXTERNALLY-started server (a runtime the user started) is now
+  gated (rule_key `model-forge:broker_server_stop`) — see B8. A plugin-owned
+  server is still stopped without asking, by design: it was gated when Model
+  Forge started it, so stopping it is the symmetric counterpart (weights stay
+  on disk and a re-load that starts a server passes the gate again).
+- **What would unblock it:** nothing further for the external case (B8 is
+  implemented); a gate on plugin-owned stops would be redundant with the
+  start gate.
 
 ### A19. Automated quality gates are partly short of their own targets
 
@@ -410,17 +415,26 @@ The list is grouped as:
 
 ### B8. An approval gate for residency swaps on externally-started servers
 
-- **What it is:** a gate (or equivalent control) on `claim`/`release` when
-  the swap would start or stop a server process the user started themselves.
-- **Why:** the verbs are deliberately ungated today because they are
-  non-destructive and confined to registered/configured targets (see A18);
-  distinguishing a plugin-started server from an externally-started one is
-  the missing signal.
-- **What exists today:** the no-gate decision and its reason are recorded in
-  the approval coverage map, and the process start/stop behavior is
-  disclosed.
-- **What would unblock it:** provenance tracking of which process a target's
-  server came from, then a gate scoped to the externally-started case.
+**Implemented.** Model Forge now tracks honest server-process provenance and
+gates the stop of an externally-started server.
+
+- **What it is:** a gate on `claim`/`swap`/`release` when the swap would stop
+  a server process the user started themselves (an externally-started
+  runtime — e.g. a docker container brought up by compose).
+- **Why:** the stop verb was ungated because a stop is non-destructive; the
+  missing signal was provenance — whether the plugin or the user started the
+  server. Stopping a server the user runs is the one case that should ask.
+- **What exists today:** the container lifecycle records provenance — a
+  container it starts is ``plugin`` (gated at start, symmetric to stop), one
+  it adopts already-running is ``external``, and an unreadable prior state is
+  fail-safe ``external``. ``stops_externally_started()`` on each engine
+  lifecycle is the signal (process adapters answer ``False``: they only stop
+  a handle they started). The policy gate escalates a stop of an external
+  runtime to the human-approval gate (rule_key
+  ``model-forge:broker_server_stop``); a plugin-owned stop stays ungated.
+- **Scope:** the container adapter is the one runtime that can stop a
+  user-started server (``docker stop``). Process adapters never stop a
+  process they did not start, so they never need this gate.
 
 ### B9. Engine bundles (core-provisioned engine runtimes)
 
