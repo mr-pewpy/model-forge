@@ -383,7 +383,7 @@ class FakeOrchestrator:
 
     def __init__(self, *, claim_ok=True, claim_reason="", admit_ok=True,
                  admit_reason="", waiter_ok=True, waiter_reason="",
-                 waiter_token: str | None = "tok-1", log=None):
+                 waiter_token: str | None = "tok-1", gen_busy=False, log=None):
         self.claim_ok = claim_ok
         self.claim_reason = claim_reason
         self.admit_ok = admit_ok
@@ -391,6 +391,9 @@ class FakeOrchestrator:
         self.waiter_ok = waiter_ok
         self.waiter_reason = waiter_reason
         self.waiter_token = waiter_token
+        # The gen-busy read the chat path polls (a plain bool here; the real
+        # orchestrator derives it from its open scopes).
+        self.gen_busy = gen_busy
         self.log = log
         self.claims = []
         self.releases = []
@@ -406,8 +409,8 @@ class FakeOrchestrator:
         self._rec("claim")
         return {"ok": self.claim_ok, "reason": self.claim_reason}
 
-    def release(self, scope_id):
-        self.releases.append(scope_id)
+    def release(self, scope_id, *, restore=True):
+        self.releases.append((scope_id, restore))
         self._rec("release")
         return {"ok": True}
 
@@ -976,8 +979,16 @@ def test_chat_waiter_enter_before_upstream_and_exit_after(tmp_path):
 
     status, _ = svc.handle_chat(json.dumps({"model": CHAT_MODEL_ID}).encode())
     assert status == 200
-    assert log == ["waiter_enter", "upstream", "waiter_exit"]
+    # prepare_llm parity: reserve the waiter, wake the lane (claim), forward,
+    # release (restore=False so the lane stays up), then exit the waiter.
+    assert log == ["waiter_enter", "claim", "upstream", "release", "waiter_exit"]
     assert orch.waiter_exits == [orch.waiter_token]
+    # the chat claim targeted the chat model on the shared target.
+    scope, target, request = orch.claims[0]
+    assert request.model_id == CHAT_MODEL_ID
+    assert request.engine == "vllm" and request.lane == "chat"
+    # released WITHOUT restoring prior residency: the lane stays up.
+    assert orch.releases == [(scope, False)]
 
 
 def test_chat_waiter_exit_in_finally_when_upstream_raises(tmp_path):
@@ -994,8 +1005,11 @@ def test_chat_waiter_exit_in_finally_when_upstream_raises(tmp_path):
 
     with pytest.raises(RuntimeError):
         svc.handle_chat(json.dumps({"model": CHAT_MODEL_ID}).encode())
-    assert log == ["waiter_enter", "upstream", "waiter_exit"]
+    # The waiter still exits exactly once, and any taken scope is released
+    # (restore=False keeps the lane up) even though the upstream raised.
+    assert log == ["waiter_enter", "claim", "upstream", "release", "waiter_exit"]
     assert orch.waiter_exits == [orch.waiter_token]
+    assert orch.releases and orch.releases[0][1] is False
 
 
 def test_chat_waiter_refusal_is_503_and_touches_no_upstream(tmp_path):
@@ -1089,5 +1103,178 @@ def test_handler_routes_image_generations_and_video_and_jobs(tmp_path):
     assert st == 200 and json.loads(b)["id"] == jid
     st, _, _ = _drive_get(svc, "/no/such/route")
     assert st == 404
+
+
+# ===========================================================================
+# P5c — chat path: prepare_llm parity (wait for gen jobs, wake the lane,
+# leave it up). The real Orchestrator + recording engine adapters drive the
+# wake; a fake clock drives the bounded wait loop.
+# ===========================================================================
+
+from model_forge.broker import (  # noqa: E402
+    EngineLifecycle,
+    EvictionPlanner,
+    LoadRequest,
+    Orchestrator,
+    ResidencyLedger,
+)
+
+
+class _FakeClock:
+    def __init__(self, now=1000.0):
+        self.now = float(now)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, s):
+        self.now += s
+
+
+class _RecordingLifecycle(EngineLifecycle):
+    """Records ensure_loaded/release (no processes, no network)."""
+
+    def __init__(self, engine_id):
+        self.engine_id = engine_id
+        self.calls = []
+
+    def ensure_loaded(self, model_id, **kwargs):
+        self.calls.append(("ensure_loaded", model_id))
+        return {"ok": True, "reason": "warmed"}
+
+    def release(self, model_id):
+        self.calls.append(("release", model_id))
+        return {"ok": True, "reason": "evicted"}
+
+    def probe(self):
+        return {"ok": True, "state": "observed", "resident": []}
+
+
+def _orch_for_chat(clock=None):
+    """A real orchestrator over the shared 'comfy' target: the chat lane is
+    booked to the vLLM adapter, a gen workflow to the comfyui adapter."""
+    clock = clock or _FakeClock()
+    ledger = ResidencyLedger(
+        bookings={CHAT_MODEL_ID: 45.6, "image-x": 12.0}, clock=clock)
+    ledger.set_budget("comfy", 48.0)
+    vllm = _RecordingLifecycle("vllm")
+    comfy = _RecordingLifecycle("comfyui")
+    orch = Orchestrator(ledger, EvictionPlanner(ledger, clock=clock),
+                        {"vllm": vllm, "comfyui": comfy}, clock=clock)
+    return orch, ledger, vllm, comfy, clock
+
+
+def _chat_svc(orch, clock=None, sleep=None, upstream=None, **cfg):
+    config = FacadeConfig(llm_canonical_id=CHAT_MODEL_ID,
+                          llm_served_id="qwen-served", gen_target_id="comfy",
+                          **cfg)
+    return FacadeService(config, upstream=upstream or FakeUpstream(),
+                         orchestrator=orch, clock=clock, sleep=sleep)
+
+
+def test_chat_wakes_the_lane_via_orchestrator_and_leaves_it_up():
+    orch, ledger, vllm, _comfy, _clock = _orch_for_chat()
+    svc = _chat_svc(orch)
+
+    status, _ = svc.handle_chat(json.dumps({"model": CHAT_MODEL_ID}).encode())
+
+    assert status == 200
+    # the wake ran: the claim drove the vLLM lane's ensure_loaded.
+    assert ("ensure_loaded", CHAT_MODEL_ID) in vllm.calls
+    assert ledger.is_resident("comfy", CHAT_MODEL_ID)
+    # released with restore=False -> the lane is NOT stepped down, and the
+    # scope no longer occupies the table.
+    assert ("release", CHAT_MODEL_ID) not in vllm.calls
+    assert orch._scopes == {}
+
+
+def test_chat_exposes_release_with_restore_false(tmp_path):
+    orch = FakeOrchestrator()
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=FakeRunner())
+    svc._upstream = FakeUpstream()
+
+    status, _ = svc.handle_chat(json.dumps({"model": CHAT_MODEL_ID}).encode())
+
+    assert status == 200
+    assert orch.claims and orch.claims[0][2].model_id == CHAT_MODEL_ID
+    assert orch.releases == [(f"chat-{orch.waiter_token}", False)]
+
+
+def test_chat_waits_for_running_gen_job_then_wakes():
+    clock = _FakeClock()
+    orch, _ledger, vllm, _comfy, _ = _orch_for_chat(clock=clock)
+    # a gen job is running: an open image scope holds the card.
+    assert orch.claim("gen-1", "comfy",
+                      LoadRequest("image-x", "comfyui", lane="image",
+                                  modality="image"))["ok"] is True
+    assert orch.gen_busy is True
+    polls = []
+
+    def sleep(s):
+        polls.append(s)
+        clock.advance(s)
+        orch.release("gen-1")           # the gen job finishes during the wait
+
+    svc = _chat_svc(orch, clock=clock, sleep=sleep, max_gen_wait_s=30.0)
+    status, _ = svc.handle_chat(json.dumps({"model": CHAT_MODEL_ID}).encode())
+
+    assert status == 200
+    assert polls == [0.25]              # polled once; budget not exhausted
+    assert ("ensure_loaded", CHAT_MODEL_ID) in vllm.calls   # then it woke
+    assert orch.gen_busy is False
+
+
+def test_chat_wait_budget_exhaustion_is_honest_503():
+    clock = _FakeClock()
+    orch, _ledger, vllm, _comfy, _ = _orch_for_chat(clock=clock)
+    orch.claim("gen-1", "comfy",
+               LoadRequest("image-x", "comfyui", lane="image",
+                           modality="image"))
+
+    def sleep(s):
+        clock.advance(s)
+
+    svc = _chat_svc(orch, clock=clock, sleep=sleep, max_gen_wait_s=3.0)
+    status, body = svc.handle_chat(json.dumps({"model": CHAT_MODEL_ID}).encode())
+
+    assert status == 503
+    err = json.loads(body)["error"]
+    assert err["type"] == "busy"
+    assert "LLM wait budget exhausted" in err["message"]
+    # the waiter exited exactly once; no chat claim was taken (the gen scope
+    # is the only one open) and the lane was never woken.
+    assert orch.llm_waiters == 0
+    assert list(orch._scopes) == ["gen-1"]
+    assert ("ensure_loaded", CHAT_MODEL_ID) not in vllm.calls
+
+
+def test_chat_claim_refusal_is_503_and_exits_waiter(tmp_path):
+    orch = FakeOrchestrator(claim_ok=False, claim_reason="no free VRAM")
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=FakeRunner())
+    svc._upstream = FakeUpstream()
+
+    status, body = svc.handle_chat(json.dumps({"model": CHAT_MODEL_ID}).encode())
+
+    assert status == 503
+    assert "no free VRAM" in json.loads(body)["error"]["message"]
+    assert orch.waiter_exits == [orch.waiter_token]
+    assert orch.releases == []          # claim refused -> nothing to release
+
+
+def test_chat_upstream_raise_exits_waiter_and_releases_scope(tmp_path):
+    orch = FakeOrchestrator()
+
+    class _Boom:
+        def __call__(self, raw, headers):
+            raise RuntimeError("vllm died mid-request")
+
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=FakeRunner())
+    svc._upstream = _Boom()
+
+    with pytest.raises(RuntimeError):
+        svc.handle_chat(json.dumps({"model": CHAT_MODEL_ID}).encode())
+
+    assert orch.waiter_exits == [orch.waiter_token]
+    assert orch.releases == [(f"chat-{orch.waiter_token}", False)]
 
 

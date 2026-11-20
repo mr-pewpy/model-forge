@@ -282,7 +282,14 @@ ACTIVATE = {
         "shows what would change. apply=true (behind the human-approval "
         "gate) writes the model config AND registers the matching "
         "custom_providers entry so the model is selectable via /model "
-        "afterwards. Use when the user says 'use this model', 'run hermes "
+        "afterwards. Set facade=true when the target is an OpenAI-compatible "
+        "model-forge facade: the plan and apply then also cover the two "
+        "Hermes consumer surfaces the live clients read — the index-addressed "
+        "custom_providers entry (its declared model list refreshed from the "
+        "facade's /v1/models when reachable, fail-soft otherwise) and "
+        "auxiliary.vision (model + base_url for the vision lane) — with model "
+        "ids written as their canonical facade ids (legacy aliases resolved "
+        "first). Use when the user says 'use this model', 'run hermes "
         "on it', or 'make it my model'."
     ),
     "parameters": {
@@ -301,6 +308,19 @@ ACTIVATE = {
                 "description": (
                     "Engine-native served model id to write into the config "
                     "when the registry default is not what the engine serves."
+                ),
+            },
+            "facade": {
+                "type": "boolean",
+                "description": (
+                    "true when the target is an OpenAI-compatible model-forge "
+                    "facade: the plan and apply then also write the two "
+                    "consumer surfaces — the index-addressed custom_providers "
+                    "entry (model list refreshed from the facade's "
+                    "/v1/models when reachable) and auxiliary.vision "
+                    "(model + base_url). Model ids are written as their "
+                    "canonical facade ids (legacy aliases resolved first). "
+                    "false/omitted = engine-native activation only."
                 ),
             },
             "apply": {

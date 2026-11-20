@@ -20,6 +20,7 @@ import time
 import urllib.request
 import uuid
 
+from .aliases import resolve
 from .broker import (
     EngineLifecycle, EvictionPlanner, LlamaCppServerLifecycle,
     LlamaSwapLifecycle, LoadRequest, MayaLifecycle, MeasuredFootprintRecorder,
@@ -180,6 +181,31 @@ def write_custom_provider_entry(entry: dict) -> dict:
     cfg["custom_providers"] = rows
     save_config(cfg)
     return merged
+
+
+def write_auxiliary_vision(model: str, base_url: str) -> dict:
+    """Point Hermes' ``auxiliary.vision`` lane at a Model Forge facade: the
+    vision lane's model + base_url, saved through the SAME in-process
+    ``hermes_cli.config`` load/save API ``write_custom_provider_entry`` uses.
+
+    Never a dotted ``hermes config set`` path: the CLI splits a key on '.',
+    so ``auxiliary.vision.model`` would create three nested nodes instead of
+    the flat ``auxiliary: {vision: {model: ...}}`` Hermes reads. Raises on
+    config failure — callers report it honestly instead of hiding it."""
+    from hermes_cli.config import load_config, save_config
+    cfg = load_config()
+    auxiliary = cfg.get("auxiliary")
+    if not isinstance(auxiliary, dict):
+        auxiliary = {}
+    vision = auxiliary.get("vision")
+    if not isinstance(vision, dict):
+        vision = {}
+    vision["model"] = model
+    vision["base_url"] = base_url
+    auxiliary["vision"] = vision
+    cfg["auxiliary"] = auxiliary
+    save_config(cfg)
+    return dict(vision)
 
 
 # Engine provisioning: the vendor-official installers Model Forge's
@@ -898,6 +924,109 @@ def activation_plan(entry: ModelEntry, target: ComputeTarget,
     }
 
 
+# --- facade activation: the two Hermes consumer surfaces (P5c C2) -----------
+#
+# Pointing a Hermes install at a model-forge facade is ONE activation that must
+# cover BOTH config surfaces the live consumers read:
+#
+#   * ``custom_providers`` — a LIST, merged in-process with the existing
+#     merge_custom_provider_entry helper (identity: the ``custom:<name>`` slug,
+#     else slash-normalized base_url + api_mode). The entry is computed by the
+#     existing custom_provider_entry / merge_custom_provider_entry helpers; the
+#     declared model list is refreshed from the facade's ``/v1/models`` when it
+#     answers (fail-soft, with an honest 'models not refreshed' note otherwise).
+#   * ``auxiliary.vision`` — the vision lane (model + base_url) the house-scan
+#     vision cron reads.
+#
+# Both surfaces are written IN-PROCESS through the same ``hermes_cli.config``
+# load/save API ``write_custom_provider_entry`` uses. Dotted ``hermes config
+# set`` index writes were abandoned: the CLI splits a key on '.' (so a
+# canonical model id like ``Qwen/Qwen3.8-27B-FP8`` shatters into nested keys),
+# cannot grow a list (a fresh config becomes an unread MAPPING ``{'0': {...}}``,
+# and appending at ``len(rows)`` raises IndexError). Model ids are canonicalized
+# through the alias table first: the facade resolves legacy aliases anyway, so
+# the config should name the canonical id ``/v1/models`` actually advertises.
+_FACADE_MODELS_TIMEOUT_S = 2.0
+
+
+def _fetch_facade_models(base_v1: str,
+                         timeout: float = _FACADE_MODELS_TIMEOUT_S) -> list[str]:
+    """Model ids advertised by a facade's ``/v1/models``. Seam: tests replace
+    this so no network call happens. Raises on failure — the caller turns the
+    failure into an honest 'models not refreshed' note, never a hang (the
+    request carries a short timeout)."""
+    url = base_v1.rstrip("/") + "/models"
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        payload = json.loads(resp.read().decode("utf-8", "replace"))
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        raise ValueError("unexpected /v1/models payload (no data list)")
+    ids: list[str] = []
+    for row in data:
+        mid = row.get("id") if isinstance(row, dict) else None
+        if isinstance(mid, str) and mid:
+            ids.append(mid)
+    return ids
+
+
+def _current_custom_providers() -> list[dict]:
+    """The current ``custom_providers`` list — the merge helper needs the live
+    list so an existing entry is updated in place, never duplicated. Fail-soft:
+    an unreadable config reads as no providers, so an activation never crashes
+    on config access."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        rows = cfg.get("custom_providers")
+        return ([r for r in rows if isinstance(r, dict)]
+                if isinstance(rows, list) else [])
+    except Exception:  # noqa: BLE001 — outside Hermes, or unreadable config
+        return []
+
+
+def _facade_plan_surfaces(plan: dict, *, providers, loader=None) -> dict:
+    """Augment an ok activation *plan* for a FACADE target with both Hermes
+    consumer surfaces (custom_providers + auxiliary.vision).
+
+    Pure apart from the read-only ``/v1/models`` probe (injectable, fail-soft).
+    The written model id is the CANONICAL id: a legacy alias is resolved
+    through :mod:`model_forge.aliases` first, because the facade resolves
+    aliases anyway and the config should name the id ``/v1/models`` advertises
+    (naming what the endpoint actually serves, not a pre-rename id)."""
+    base_v1 = plan["base_url"]
+    model = resolve(str(plan.get("model") or ""))
+    plan["model"] = model
+
+    cp = plan["custom_provider"]
+    cp_entry = dict(cp["entry"])
+    cp_entry["models"] = {model: {}}
+    note = ""
+    try:
+        refreshed = (loader or _fetch_facade_models)(base_v1)
+        for mid in refreshed:
+            cp_entry["models"].setdefault(resolve(str(mid)), {})
+    except Exception as exc:  # noqa: BLE001 — fail soft, honest note
+        note = (f"models not refreshed from {base_v1}/models: "
+                f"{type(exc).__name__}: {exc}; the custom_providers entry "
+                "declares only the activated model")
+    cp["entry"] = cp_entry
+    _, cp["merged"] = merge_custom_provider_entry(cp_entry, providers)
+    cp["write"] = ("registers the custom_providers entry " + cp["slug"]
+                   + " (merged into the list) declaring "
+                   + ", ".join(cp_entry["models"]))
+    if note:
+        cp["models_note"] = note
+    plan["auxiliary_vision"] = {
+        "model": model,
+        "base_url": base_v1,
+        "write": ("sets auxiliary.vision.model + auxiliary.vision.base_url so "
+                  "the vision lane chats through the facade endpoint"),
+        "applied": False,
+    }
+    plan["facade"] = True
+    return plan
+
+
 # --- engine provisioning (approved vendor installers) -----------------------
 
 def _core_llamacpp_status() -> dict:
@@ -1466,15 +1595,36 @@ def model_forge_activate(args: dict | None = None, **kwargs) -> str:
     """Connect a running chat/vision model as THIS Hermes' default model.
 
     Safe by default: pass apply=true to actually write model.* config
-    (takes effect next session; revert with `hermes model`)."""
+    (takes effect next session; revert with `hermes model`).
+
+    Pass facade=true when the target is an OpenAI-compatible model-forge
+    facade: the plan and apply then cover BOTH config surfaces the live
+    consumers read — the index-addressed ``custom_providers`` entry (model
+    list refreshed from the target's ``/v1/models`` when reachable, fail-soft
+    otherwise) AND ``auxiliary.vision`` (model + base_url for the vision lane).
+    A legacy alias in the requested/served model id is written as its CANONICAL
+    id (the facade resolves aliases anyway; config names what /v1/models
+    advertises). Engine-native activations are unchanged.
+
+    Tests exercise the REAL write path against real ``hermes_cli.config``
+    load/save semantics (an isolated config in a temp home); the two facade
+    surfaces are written IN-PROCESS, never through dotted ``hermes config set``
+    CLI calls. The human-approval gate (policy_hook, apply=true) is
+    unchanged."""
     args = args or {}
     try:
-        model_id = str(args.get("model_id") or "").strip()
-        if not model_id:
+        requested = str(args.get("model_id") or "").strip()
+        if not requested:
             return _dump({"error": "model_id required"})
+        # A legacy alias resolves to its canonical id first (identity for a
+        # canonical id): the registry is keyed on canonical ids and the config
+        # should name the canonical id the facade advertises.
+        model_id = resolve(requested)
         entry = next((m for m in models_for() if m.id == model_id), None)
         if entry is None:
-            return _dump({"error": f"unknown model_id: {model_id}"})
+            entry = next((m for m in models_for() if m.id == requested), None)
+        if entry is None:
+            return _dump({"error": f"unknown model_id: {requested}"})
         target = get_target(args.get("target"))
         if target is None:
             return _dump({"error": f"unknown target: {args.get('target')}"})
@@ -1516,6 +1666,11 @@ def model_forge_activate(args: dict | None = None, **kwargs) -> str:
                     "endpoint did not answer the matching route, so the "
                     "setup hint is withheld (run it manually only if your "
                     "endpoint serves that route): " + "; ".join(withheld))
+        # A facade target covers BOTH consumer surfaces: the index-addressed
+        # custom_providers entry and auxiliary.vision (see _facade_plan_surfaces).
+        if plan.get("ok") and args.get("facade") is True:
+            _facade_plan_surfaces(plan,
+                                  providers=_current_custom_providers())
         if plan.get("ok"):
             if args.get("apply") is True:
                 try:
@@ -1532,15 +1687,56 @@ def model_forge_activate(args: dict | None = None, **kwargs) -> str:
                 # The custom_providers registration is its own honest write:
                 # a failure here is reported beside the model-section state,
                 # never folded into it.
-                try:
-                    plan["custom_provider"]["saved"] = \
-                        write_custom_provider_entry(
-                            plan["custom_provider"]["entry"])
-                    plan["custom_provider"]["applied"] = True
-                except Exception as exc:
-                    plan["custom_provider"]["applied"] = False
-                    plan["custom_provider"]["error"] = \
-                        f"{type(exc).__name__}: {exc}"
+                if plan.get("facade"):
+                    # Both consumer surfaces are written IN-PROCESS through the
+                    # SAME hermes_cli.config load/save API the non-facade path
+                    # uses. Index-addressed `hermes config set` writes cannot be
+                    # used: the CLI splits a key on '.' (a canonical model id
+                    # like Qwen/Qwen3.8-27B-FP8 shatters into nested keys) and
+                    # cannot grow a list (a fresh config becomes an unread
+                    # MAPPING {'0': {...}}, appending at len(rows) raises
+                    # IndexError). Each surface keeps its own honest
+                    # applied/error state.
+                    try:
+                        plan["custom_provider"]["saved"] = \
+                            write_custom_provider_entry(
+                                plan["custom_provider"]["entry"])
+                        plan["custom_provider"]["applied"] = True
+                    except Exception as exc:  # noqa: BLE001 — honest state
+                        plan["custom_provider"]["applied"] = False
+                        plan["custom_provider"]["error"] = \
+                            f"{type(exc).__name__}: {exc}"
+                    try:
+                        plan["auxiliary_vision"]["saved"] = \
+                            write_auxiliary_vision(
+                                plan["auxiliary_vision"]["model"],
+                                plan["auxiliary_vision"]["base_url"])
+                        plan["auxiliary_vision"]["applied"] = True
+                    except Exception as exc:  # noqa: BLE001 — honest state
+                        plan["auxiliary_vision"]["applied"] = False
+                        plan["auxiliary_vision"]["error"] = \
+                            f"{type(exc).__name__}: {exc}"
+                    plan["config_writes"] = [
+                        {"key": "custom_providers",
+                         "value": plan["custom_provider"]["slug"],
+                         "ok": plan["custom_provider"]["applied"]},
+                        {"key": "auxiliary.vision.model",
+                         "value": plan["auxiliary_vision"]["model"],
+                         "ok": plan["auxiliary_vision"]["applied"]},
+                        {"key": "auxiliary.vision.base_url",
+                         "value": plan["auxiliary_vision"]["base_url"],
+                         "ok": plan["auxiliary_vision"]["applied"]},
+                    ]
+                else:
+                    try:
+                        plan["custom_provider"]["saved"] = \
+                            write_custom_provider_entry(
+                                plan["custom_provider"]["entry"])
+                        plan["custom_provider"]["applied"] = True
+                    except Exception as exc:
+                        plan["custom_provider"]["applied"] = False
+                        plan["custom_provider"]["error"] = \
+                            f"{type(exc).__name__}: {exc}"
             else:
                 plan["applied"] = False
                 plan["hint"] = "re-run with apply=true to write the config"

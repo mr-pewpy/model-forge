@@ -218,6 +218,13 @@ _DEFER_NOTE = ("image references are uploaded at run time (not at job "
                "creation), so the stored params carry the raw ref, not the "
                "broker's pre-uploaded {'upload': {'path': ...}} shape")
 
+# The chat path's prepare_llm parity tunables. A chat request polls the
+# orchestrator's gen-busy state while it waits for in-flight gen jobs to drain;
+# the poll interval is small enough to wake promptly and coarse enough not to
+# spin. ``_CHAT_ENGINE`` is the engine id a chat claim targets (the vLLM lane).
+GEN_WAIT_POLL_S = 0.25
+_CHAT_ENGINE = "vllm"
+
 
 def _enrich(entry: dict, meta: dict | None = None) -> dict:
     """Attach advertisement fields for an entry (broker ``enrich`` shape)."""
@@ -254,6 +261,11 @@ class FacadeConfig:
     llm_canonical_id: str = CHAT_MODEL_ID
     llm_api_key: str = field(default_factory=lambda: os.environ.get("BROKER_VLLM_API_KEY", ""))
     upstream_timeout_s: float = 600.0
+    # How long a chat request waits for an in-flight gen job to drain before it
+    # wakes the LLM lane (broker ``llm.max_gen_wait_s``, default 200 s < the
+    # consumers' 240 s gateway timeout). On exhaustion the request gets an
+    # honest 503 rather than a silent stall.
+    max_gen_wait_s: float = 200.0
     # -- generation lane --------------------------------------------------
     # Where generated assets live on disk. ``/upload`` writes under
     # ``<assets_dir>/uploads`` and the runner resolves data-/http- image refs
@@ -370,7 +382,9 @@ class FacadeService:
                  orchestrator: object | None = None,
                  runner: object | None = None,
                  jobs: JobStore | None = None,
-                 dispatch: Callable[[Callable[[], None]], None] | None = None):
+                 dispatch: Callable[[Callable[[], None]], None] | None = None,
+                 sleep: Callable[[float], None] | None = None,
+                 clock: Callable[[], float] | None = None):
         self.config = config or FacadeConfig.from_env()
         self.aliases = DEFAULT_ALIASES if aliases is None else aliases
         self.models = models_advertised if models_advertised is not None else MODELS_ADVERTISED
@@ -388,6 +402,10 @@ class FacadeService:
         self._runner = runner
         self._jobs = jobs or JobStore()
         self._dispatch = dispatch or _default_dispatch
+        # Injectable time seams for the chat wait-for-gen-drain loop, so a test
+        # drives it with a fake clock and records the polls it makes.
+        self._sleep = sleep or time.sleep
+        self._clock = clock or time.monotonic
 
     # -- upstream default (urllib; the passthrough fix lives in handle_chat) --
 
@@ -518,8 +536,61 @@ class FacadeService:
         except Exception as e:  # broken seam -> honest refusal, fail-closed
             return False, f"gate error: {e}", None
 
+    def _gen_busy(self) -> bool:
+        """Whether the orchestrator reports an open generative scope.
+
+        Fail-soft: an unwired or unreadable accessor reads as not-busy, so a
+        broken seam never leaves a chat request waiting on a state it cannot
+        observe (the caller then wakes the lane as before). The accessor is a
+        plain read (``Orchestrator.gen_busy``) that never claims or evicts."""
+        if self._orchestrator is None:
+            return False
+        accessor = getattr(self._orchestrator, "gen_busy", None)
+        if accessor is None:
+            return False
+        try:
+            return bool(accessor() if callable(accessor) else accessor)
+        except Exception:
+            return False
+
+    def _wait_for_gen_drain(self) -> bool:
+        """Wait for in-flight gen jobs to drain, bounded by ``max_gen_wait_s``.
+
+        Polls the orchestrator's gen-busy state on the injectable clock/sleep.
+        Returns True once no generative scope is open; False when the budget is
+        exhausted with one still running (the caller answers an honest 503). A
+        running gen job holds the GPU card, so the chat wake must wait for it
+        to finish before it can bring the LLM lane up."""
+        deadline = self._clock() + float(self.config.max_gen_wait_s)
+        while self._gen_busy():
+            if self._clock() >= deadline:
+                return False
+            self._sleep(GEN_WAIT_POLL_S)
+        return True
+
     def handle_chat(self, raw: bytes) -> tuple[int, bytes]:
-        """Alias-canonicalize, reserve the lane wake, forward verbatim."""
+        """Alias-canonicalize, run prepare_llm parity, forward verbatim.
+
+        prepare_llm parity (the broker's chat path), in order:
+
+        1. reserve the LLM waiter (``waiter_enter``; a refusal is a 503);
+        2. wait, bounded by ``max_gen_wait_s``, for any in-flight generative
+           job to drain — a gen job holds the card, so the chat wake cannot
+           proceed until it finishes (budget exhaustion -> honest 503);
+        3. wake the chat lane: ``claim`` the chat lane on the orchestrator,
+           which ensures the vLLM server is loaded (a claim refusal is a 503
+           with its reason);
+        4. forward upstream;
+        5. ``release`` the scope with ``restore=False`` so the chat lane STAYS
+           UP — the waiter owns the wake, and the lane stays resident until a
+           gen entry evicts it.
+
+        The waiter exits exactly once, in the ``finally``, on every path
+        (success, upstream raise, claim refusal, budget exhaustion), and any
+        scope taken is released there too. The explicit ``gate`` override
+        (tests) keeps its wave-1 behavior: it decides admission and no
+        orchestrator claim/wait runs.
+        """
         try:
             body = json.loads(raw or b"{}")
         except Exception as e:
@@ -539,8 +610,31 @@ class FacadeService:
         if not ok:
             return 503, _error_bytes(reason, "busy")
 
+        orchestrator = self._orchestrator
+        using_orchestrator = orchestrator is not None and self._gate is None
+        scope: str | None = None
+        claimed = False
         try:
-            # canonical -> served rewrite (rename pass; LiteLLM-style id map).
+            if using_orchestrator:
+                # 2. wait for in-flight gen jobs to drain (bounded).
+                if not self._wait_for_gen_drain():
+                    return 503, _error_bytes(
+                        "gen job in progress and LLM wait budget exhausted "
+                        f"(waited {float(self.config.max_gen_wait_s):g}s)",
+                        "busy")
+                # 3. wake the chat lane: claim -> vllm-server ensure_loaded.
+                scope = f"chat-{token}" if token else f"chat-{uuid4().hex[:12]}"
+                request = _LoadRequest(model_id=model_id, engine=_CHAT_ENGINE,
+                                       lane="chat", modality="chat")
+                claim = orchestrator.claim(
+                    scope, self.config.gen_target_id, request) or {}
+                if not claim.get("ok"):
+                    return 503, _error_bytes(
+                        claim.get("reason") or "chat lane claim refused",
+                        "busy")
+                claimed = True
+
+            # 4. canonical -> served rewrite (rename pass; LiteLLM-style id map).
             if self.config.llm_served_id and body.get("model") == self.config.llm_canonical_id:
                 body["model"] = self.config.llm_served_id
 
@@ -551,9 +645,17 @@ class FacadeService:
             status, text = self._upstream(out_raw, headers)
             return int(status), text if isinstance(text, bytes) else str(text).encode()
         finally:
+            # 5. Release the chat scope WITHOUT restoring prior residency
+            # (restore=False): the lane the waiter just woke stays UP until a
+            # gen entry evicts it — never stopped and immediately re-started.
+            if claimed and scope is not None:
+                try:
+                    self._orchestrator.release(scope, restore=False)
+                except Exception:
+                    pass
             # The waiter owns the wake: release the reservation no matter how
-            # the upstream returned (error, timeout, or success) so the lane
-            # accounting never leaks a phantom waiter. ``waiter_exit`` is
+            # the request returned (error, timeout, success, refusal) so the
+            # lane accounting never leaks a phantom waiter. ``waiter_exit`` is
             # idempotent and never raises by contract; the guard is belt-and-
             # braces against a misbehaving seam.
             if token is not None:

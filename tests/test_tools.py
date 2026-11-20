@@ -113,6 +113,18 @@ def test_activate_requires_model_id():
     assert schemas.TARGET_ADD["parameters"]["required"] == ["id", "base_url"]
 
 
+def test_activate_schema_documents_the_facade_surface():
+    # facade=true is the model-forge-facade activation: it writes BOTH consumer
+    # surfaces (custom_providers + auxiliary.vision) with canonical ids.
+    assert "facade" in schemas.ACTIVATE["parameters"]["properties"]
+    assert "facade=true" in schemas.ACTIVATE["description"]
+    desc = schemas.ACTIVATE["parameters"]["properties"]["facade"]["description"]
+    assert "custom_providers" in desc and "auxiliary.vision" in desc
+    assert "canonical" in desc          # ids written as canonical facade ids
+    # additive: the required list is unchanged.
+    assert schemas.ACTIVATE["parameters"]["required"] == ["model_id"]
+
+
 def test_storage_schema_shape():
     spec = schemas.STORAGE
     props = spec["parameters"]["properties"]
@@ -2869,6 +2881,224 @@ def test_activate_persisted_slugs_are_resolvable():
     assert plan["custom_provider"]["slug"] == "custom:local"
     assert _resolvable(plan["custom_provider"]["slug"],
                        [plan["custom_provider"]["entry"]])
+
+
+# --- tools.py: facade activation writes BOTH consumer surfaces --------------
+
+def _real_config_store(monkeypatch, tmp_path, *, initial=None):
+    """``hermes_cli.config`` fake backed by a REAL config file under an
+    isolated ``HERMES_HOME``. ``load_config``/``save_config`` round-trip the
+    file, so the shape the facade write path produces on disk is the real
+    list/dict semantics Hermes reads — not a recorder's fiction. This is the
+    seam the in-process write path is exercised through (the bug this guards:
+    dotted ``hermes config set`` index writes corrupt custom_providers)."""
+    home = tmp_path / "hermes_home"
+    home.mkdir(exist_ok=True)
+    cfg_path = home / "config.json"
+    cfg_path.write_text(json.dumps(initial or {}))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    mod = types.ModuleType("hermes_cli.config")
+
+    def _load():
+        return json.loads(cfg_path.read_text())
+
+    def _save(cfg):
+        cfg_path.write_text(json.dumps(cfg))
+
+    mod.load_config = _load
+    mod.load_config_readonly = _load
+    mod.save_config = _save
+    mod.path = cfg_path
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", mod)
+    return mod
+
+
+def _facade_target(monkeypatch, tmp_path, *, initial=None):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    cfg_mod = _real_config_store(monkeypatch, tmp_path, initial=initial)
+    return tools, cfg_mod
+
+
+def test_activation_plan_facade_lists_both_surfaces(tmp_path, monkeypatch):
+    tools, _ = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat", "vision"))
+    monkeypatch.setattr(
+        tools, "_fetch_facade_models",
+        lambda base, timeout=2.0: ["Qwen/Qwen3.8-27B-FP8", "extra/model"])
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "minicpm-v-4.6", "target": "gpu-box", "facade": True}))
+    assert out["ok"] is True and out["facade"] is True
+    assert out["applied"] is False
+    # surface (a): custom_providers — the entry is MERGED into the list from
+    # the declared models, refreshed from /v1/models (no dotted index writes).
+    cp = out["custom_provider"]
+    assert cp["slug"] == "custom:gpu-box"
+    assert set(cp["entry"]["models"]) == {
+        "minicpm-v-4.6", "Qwen/Qwen3.8-27B-FP8", "extra/model"}
+    assert cp["merged"]["name"] == "gpu-box"           # merge applied
+    assert "models_note" not in cp          # /v1/models answered -> refreshed
+    # surface (b): auxiliary.vision — model + base_url
+    av = out["auxiliary_vision"]
+    assert av["model"] == "minicpm-v-4.6"
+    assert av["base_url"] == "http://gpu-box.example.com:8080/v1"
+
+
+def test_activate_facade_apply_writes_both_surfaces_real_config(tmp_path,
+                                                                monkeypatch):
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat", "vision"))
+    _persist_stub(monkeypatch)
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: [])
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box",
+         "facade": True, "apply": True}))
+    assert out["applied"] is True
+    assert out["custom_provider"]["applied"] is True
+    assert out["auxiliary_vision"]["applied"] is True
+
+    # REAL config semantics — read back the on-disk config the way Hermes does.
+    saved = json.loads(cfg_mod.path.read_text())
+    rows = saved.get("custom_providers") or []
+    assert isinstance(rows, list) and len(rows) == 1     # a LIST, not a mapping
+    row = rows[0]
+    assert row["name"] == "gpu-box"
+    assert row["base_url"] == "http://gpu-box.example.com:8080/v1"
+    assert row["api_mode"] == "chat_completions"
+    assert "glm-5.3-flash" in row["models"]
+    # auxiliary.vision landed as the flat model + base_url Hermes reads
+    assert saved["auxiliary"]["vision"]["model"] == "glm-5.3-flash"
+    assert saved["auxiliary"]["vision"]["base_url"] == \
+        "http://gpu-box.example.com:8080/v1"
+    # both surfaces reported honestly in the summary
+    written = {w["key"] for w in out["config_writes"]}
+    assert {"custom_providers", "auxiliary.vision.model",
+            "auxiliary.vision.base_url"} <= written
+    assert all(w["ok"] for w in out["config_writes"])
+
+
+def test_activate_facade_apply_appends_to_existing_list(tmp_path, monkeypatch):
+    # An already-present custom_providers list: the append case index writes
+    # could not do (hermes_cli never grows a list -> IndexError). The new entry
+    # is appended and the untouched provider at index 0 is left intact.
+    tools, cfg_mod = _facade_target(
+        monkeypatch, tmp_path,
+        initial={"custom_providers": [
+            {"name": "other", "base_url": "http://other.example:9/v1",
+             "api_mode": "chat_completions"}]})
+    _ok_engine(monkeypatch, ("chat",))
+    _persist_stub(monkeypatch)
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: [])
+    tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box",
+         "facade": True, "apply": True})
+    rows = json.loads(cfg_mod.path.read_text())["custom_providers"]
+    assert isinstance(rows, list) and len(rows) == 2
+    assert rows[0] == {"name": "other", "base_url": "http://other.example:9/v1",
+                       "api_mode": "chat_completions"}      # byte-for-byte
+    assert rows[1]["name"] == "gpu-box"
+    assert "glm-5.3-flash" in rows[1]["models"]
+
+
+def test_activate_facade_alias_writes_canonical_id(tmp_path, monkeypatch):
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat", "vision"))
+    _persist_stub(monkeypatch)
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: ["Qwen/Qwen3.8-27B-FP8"])
+    canonical = "Qwen/Qwen3.8-27B-FP8"
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "minicpm-v-4.6", "target": "gpu-box", "facade": True,
+         "engine_model": "vision/minicpm-v-4.6",   # legacy alias
+         "apply": True}))
+    assert out["model"] == canonical
+    assert out["auxiliary_vision"]["model"] == canonical
+    saved = json.loads(cfg_mod.path.read_text())
+    assert saved["auxiliary"]["vision"]["model"] == canonical
+    # the canonical id survives as ONE key in the models mapping. A dotted CLI
+    # write would have shattered it into {"Qwen/Qwen3": {"8-27B-FP8": {}}}.
+    models = saved["custom_providers"][0]["models"]
+    assert canonical in models
+    assert "Qwen/Qwen3" not in models
+    # the alias never appears anywhere in the written config
+    assert "vision/minicpm-v-4.6" not in json.dumps(saved)
+
+
+def test_activate_facade_plan_only_writes_nothing_and_gate_unchanged(
+        tmp_path, monkeypatch):
+    from model_forge import tools as _tools
+
+    # the human-approval gate still escalates apply=true for a facade activate
+    d = _tools.policy_hook("model_forge_activate",
+                           {"apply": True, "facade": True, "target": "gpu-box",
+                            "model_id": "glm-5.3-flash"})
+    assert d is not None and d["action"] == "approve"
+    assert d["rule_key"] == "model-forge:activate"
+    assert _tools.policy_hook("model_forge_activate",
+                              {"facade": True, "model_id": "glm-5.3-flash"}) is None
+
+    # plan-only (approval not granted / apply absent): nothing is written
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat", "vision"))
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: [])
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box", "facade": True}))
+    assert out["applied"] is False
+    assert out["auxiliary_vision"]["applied"] is False
+    # fail closed: the isolated config file is untouched
+    assert json.loads(cfg_mod.path.read_text()) == {}
+
+
+def test_activate_facade_unreachable_models_degrades_honest(tmp_path,
+                                                            monkeypatch):
+    tools, _ = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat",))
+
+    def _boom(base, timeout=2.0):
+        raise OSError("connection refused")
+    monkeypatch.setattr(tools, "_fetch_facade_models", _boom)
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box", "facade": True}))
+    assert out["ok"] is True
+    note = out["custom_provider"]["models_note"]
+    assert "models not refreshed" in note and "OSError" in note
+    # the entry still declares the activated model, no hang, no raise
+    assert "glm-5.3-flash" in out["custom_provider"]["entry"]["models"]
+    # the probe carries a short timeout so an unreachable endpoint cannot hang
+    import inspect
+    default = inspect.signature(
+        tools._fetch_facade_models).parameters["timeout"].default
+    assert default <= 5.0
+
+
+def test_activate_facade_surface_failure_is_honest(tmp_path, monkeypatch):
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat", "vision"))
+    _persist_stub(monkeypatch)
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: [])
+
+    def boom(model, base_url):
+        # the auxiliary.vision write fails; custom_providers still lands
+        raise OSError("auxiliary.vision is read-only")
+    monkeypatch.setattr(tools, "write_auxiliary_vision", boom)
+
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box",
+         "facade": True, "apply": True}))
+    assert out["custom_provider"]["applied"] is True
+    assert out["auxiliary_vision"]["applied"] is False
+    assert "OSError" in out["auxiliary_vision"]["error"]
+    # the honest failure never folded into the other surface's state
+    assert (json.loads(cfg_mod.path.read_text()).get("custom_providers") or [])
 
 
 def test_policy_hook_activate_approval_shows_custom_provider_write():

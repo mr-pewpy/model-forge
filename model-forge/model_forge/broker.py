@@ -43,15 +43,19 @@ when a task needs a different model. Four pieces:
   later published-footprint updates, and ledger reports label every booking
   honestly as measured or published.
 - ``Orchestrator`` — claim/release workflow scopes (a scope claims the lane
-  for a modality and restores what was resident on release), pre-warm on
-  intent, honest progress states (``queued`` / ``loading (~Ns)`` /
-  ``ready``) as pure data, and ``swap`` — the one-call weight exchange in
+  for a modality; ``release`` by default restores what was resident at claim
+  time, while ``release(scope, restore=False)`` leaves residency untouched —
+  the claim's target stays resident), pre-warm on intent, honest progress
+  states (``queued`` / ``loading (~Ns)`` / ``ready``) as pure data, and
+  ``swap`` — the one-call weight exchange in
   strict measured phases (PREFLIGHT / EVICT / LOAD / READY) with the hard
   guarantee that no evict/release call runs before the preflight passes.
   The orchestrator also carries the LLM-waiter priority seam (roadmap §3):
   ``waiter_enter`` / ``waiter_exit`` / ``llm_waiters`` account for chat
   requests blocked on a lane wake, and ``admit_gen`` refuses new generative
-  jobs while any waiter exists — the waiter owns the wake.
+  jobs while any waiter exists — the waiter owns the wake. ``gen_busy`` is
+  the cheap, honest read of whether any generative scope is open, so a chat
+  request can wait for in-flight gen jobs to drain before it wakes the lane.
 
 Everything external is injectable (HTTP functions, process runners, binary
 lookups, clocks) so this module performs no I/O outside those seams.
@@ -105,6 +109,7 @@ __all__ = [
     "VllmLifecycle",
     "VllmServerLifecycle",
     "is_image_generation",
+    "is_gen_lane",
     "loading_state",
     "runtime_lifecycle_for",
 ]
@@ -184,6 +189,25 @@ def is_image_generation(modality: str, lane: str = "") -> bool:
         norm = str(token or "").replace("-", "").replace("_", "") \
                              .replace(" ", "").lower()
         if norm.startswith("image"):
+            return True
+    return False
+
+
+def is_gen_lane(modality: str, lane: str = "") -> bool:
+    """True when a request names a generative (``image`` / ``video`` / ``gen``)
+    lane — the lanes ``Orchestrator.gen_busy`` counts as an in-flight gen job.
+
+    Generalizes ``is_image_generation`` to the whole generative surface: the
+    facade's gen claims name their lane ``image`` or ``video`` (the video lane
+    holds the card exactly as an image lane does), and a caller may use the
+    umbrella ``gen``. Tokens normalize the same way (strip ``-``/``_``/spaces,
+    lowercase) so ``image_edit`` / ``h3-t2v``-style lanes still match by their
+    lane token."""
+    for token in (modality, lane):
+        norm = str(token or "").replace("-", "").replace("_", "") \
+                             .replace(" ", "").lower()
+        if norm == "gen" or norm.startswith("image") \
+                or norm.startswith("video"):
             return True
     return False
 
@@ -1944,14 +1968,17 @@ class Orchestrator:
     """Ties the ledger, engine adapters, and eviction planner together.
 
     Workflow scopes: ``claim`` takes the lane for a modality and remembers
-    what was resident on the target; ``release`` steps the scope's models
-    down and restores exactly that set. ``prewarm`` loads on intent, before
-    the user's click lands. Progress states (``queued`` / ``loading (~Ns)`` /
-    ``ready``) are pure data rows recorded per scope or pre-warm key —
-    no network I/O happens anywhere outside the injected adapter calls, and
-    every engine call runs strictly one at a time (concurrency control is
-    the caller's). A failed engine call mid-plan stops the run and is
-    reported: fail closed, never a silent stall.
+    what was resident on the target; ``release`` (default) steps the scope's
+    models down and restores exactly that set, while
+    ``release(scope_id, restore=False)`` releases the scope WITHOUT touching
+    residency — the claim's target stays resident (the lane the waiter just
+    woke stays up until a gen entry evicts it). ``prewarm`` loads on intent,
+    before the user's click lands. Progress states (``queued`` /
+    ``loading (~Ns)`` / ``ready``) are pure data rows recorded per scope or
+    pre-warm key — no network I/O happens anywhere outside the injected
+    adapter calls, and every engine call runs strictly one at a time
+    (concurrency control is the caller's). A failed engine call mid-plan
+    stops the run and is reported: fail closed, never a silent stall.
     """
 
     def __init__(self, ledger, planner, adapters, clock=None):
@@ -1963,6 +1990,12 @@ class Orchestrator:
         self._scopes: dict[str, dict] = {}
         self._history: dict[str, list] = {}
         self._current: dict[str, dict] = {}
+        # The scope table has its OWN lock, separate from ``self._lock``: the
+        # ``gen_busy`` accessor is polled by the facade while a gen job runs,
+        # and reading the scope table must never block behind a slow engine
+        # load (the same reason the waiter seam has its own lock). No code
+        # path ever holds ``self._scopes_lock`` and ``self._lock`` at once.
+        self._scopes_lock = threading.Lock()
         # Per-target load specs of successfully loaded models (weights path,
         # load estimate) — a scope release restores claim-time residents with
         # the fidelity their original load had, even when the evicted model
@@ -2078,6 +2111,26 @@ class Orchestrator:
                       f"lane claim (admission alone never claims)",
         }
 
+    # -- gen-busy read (the facade's wait for in-flight gen jobs) --
+
+    @property
+    def gen_busy(self) -> bool:
+        """True while a generative (image/video) workflow scope is open.
+
+        Cheap and honest: the scope table is read under its own lock (never
+        the plan lock), so a facade can poll this while a gen job runs without
+        blocking behind a slow engine load. A generative job holds the GPU
+        card, so the facade's chat path polls this and waits, bounded by its
+        own budget, for in-flight gen jobs to drain before it wakes the LLM
+        lane — the waiter owns the wake (roadmap §3). A plain read; it never
+        claims, evicts, or records anything.
+        """
+        with self._scopes_lock:
+            scopes = list(self._scopes.values())
+        return any(is_gen_lane(getattr(s.get("request"), "modality", ""),
+                               getattr(s.get("request"), "lane", ""))
+                   for s in scopes)
+
     # -- workflow scopes --
 
     def claim(self, scope_id, target_id, request) -> dict:
@@ -2090,7 +2143,9 @@ class Orchestrator:
             return self._fail(f"{target_id}:{request.model_id}", None,
                               "scope id must be a non-empty string",
                               target_id)
-        if scope_id in self._scopes:
+        with self._scopes_lock:
+            already = scope_id in self._scopes
+        if already:
             return self._fail(scope_id, scope_id,
                               f"scope {scope_id!r} is already claimed — "
                               f"release it first (fail-closed)",
@@ -2100,27 +2155,57 @@ class Orchestrator:
             self._planner.plan_load_many(target_id, [request]),
             key=scope_id, scope_id=scope_id, ready_model=request.model_id)
         if result["ok"]:
-            self._scopes[scope_id] = {
-                "target_id": target_id,
-                "request": request,
-                "restore": restore,
-                # what this scope's plan actually loaded — the only models
-                # its release may step down
-                "brought_in": frozenset(
-                    step.model_id for step in result["steps"]
-                    if step.action == "load"),
-            }
+            with self._scopes_lock:
+                self._scopes[scope_id] = {
+                    "target_id": target_id,
+                    "request": request,
+                    "restore": restore,
+                    # what this scope's plan actually loaded — the only models
+                    # its release may step down
+                    "brought_in": frozenset(
+                        step.model_id for step in result["steps"]
+                        if step.action == "load"),
+                }
         return result
 
-    def release(self, scope_id) -> dict:
-        """Release a claimed scope: step the scope's models down, then
-        restore what was resident at claim time (loads fire sequentially)."""
-        scope = self._scopes.get(scope_id)
+    def release(self, scope_id, *, restore=True) -> dict:
+        """Release a claimed scope.
+
+        With ``restore=True`` (the default) the scope's own models are stepped
+        down and then exactly what was resident at claim time is restored
+        (loads fire sequentially).
+
+        With ``restore=False`` the scope is released WITHOUT touching
+        residency: the scope's models are NOT stepped down and prior residents
+        are NOT restored — the claim's target stays resident. This is the
+        chat path's release: the waiter owns the wake, so after forwarding the
+        request the LLM lane stays up (resident) until a gen entry evicts it,
+        instead of being stopped and immediately re-started."""
+        with self._scopes_lock:
+            scope = self._scopes.get(scope_id)
         if scope is None:
             return self._fail(scope_id, scope_id,
                               f"no claimed scope {scope_id!r} — nothing to "
                               f"release (fail-closed)", "", None)
         target_id = scope["target_id"]
+
+        # -- restore=False: drop the scope, leave residency exactly as it is.
+        # The claim's target (and any other resident) stays up — the lane the
+        # waiter just woke is not stopped; it stays resident until a gen entry
+        # evicts it (the facade's chat release behavior).
+        if not restore:
+            with self._scopes_lock:
+                self._scopes.pop(scope_id, None)
+            return {
+                "ok": True, "scope_id": scope_id, "target_id": target_id,
+                "plan": None, "steps": (), "progress": self._current.get(scope_id),
+                "reason": f"scope {scope_id!r} released without restore — "
+                          f"residency is left as it is: the claim's target "
+                          f"and any other resident stay up (the waiter owns "
+                          f"the wake; the lane stays resident until a gen "
+                          f"entry evicts it)",
+            }
+
         # The scope's own models: what its claim plan loaded. Step-down is
         # scoped to those — releasing one live scope must never step down a
         # model another still-open scope brought in.
@@ -2165,7 +2250,8 @@ class Orchestrator:
             target_id, True, "nothing to restore", (), ())
         r2 = self._run_plan(plan, key=scope_id, scope_id=scope_id)
         if r2["ok"]:
-            self._scopes.pop(scope_id, None)
+            with self._scopes_lock:
+                self._scopes.pop(scope_id, None)
         return {"ok": r2["ok"], "scope_id": scope_id,
                 "target_id": target_id, "plan": plan,
                 "steps": r1["steps"] + r2["steps"],
@@ -2197,7 +2283,8 @@ class Orchestrator:
         returned plan's ``load_steps`` name the engines a release would
         (re)start, so the approval gate can ask before a process-engine
         server (llama.cpp, vLLM) is spawned."""
-        scope = self._scopes.get(scope_id)
+        with self._scopes_lock:
+            scope = self._scopes.get(scope_id)
         if scope is None:
             return None
         target_id = scope["target_id"]
