@@ -371,3 +371,109 @@ printed) — injected via `systemd-run --setenv=BROKER_VLLM_API_KEY=…` (env-on
 `weights-broker` remains stopped by design. Rollback remains available per §6:
 `systemctl stop mf-facade && docker start weights-broker`.
 No live container was removed, no image pruned, `gluetun` never touched, no git commit.
+
+---
+
+## 8. Consumer flips — the four live consumers onto model-forge (2026-11-20)
+
+**Model:** deepseek/deepseek-v4.1-flash
+**Endpoint:** `http://192.168.1.62:8080` — `mf-facade` active; `weights-broker` stopped (address unchanged,
+so consumers already reached the facade). This phase refreshed each consumer's config to canonical ids
+and re-verified it green, one at a time.
+
+**Facade logging reality (correction to the task premise):** the facade handler overrides
+`BaseHTTPRequestHandler.log_message` (`model_forge/facade.py:1118` — deliberately *quiet*), so
+`journalctl -u mf-facade` carries **only** the two startup lines
+(`listening on 0.0.0.0:8080 — lanes [comfyui:weights-broker-comfyui-1, vllm:vllm-server]`, and the
+systemd `Started` line). There are **no per-request journal lines**. Request-landing evidence below
+therefore comes from the **backend container logs** (`vllm-server` for chat/vision, `weights-broker-comfyui-1`
+for gen) and the facade response itself.
+
+### 8.1 Hermes providers (this host, profile `charles`)
+
+**Found:** `custom_providers[0]` = `vLLM`, `base_url http://192.168.1.62:8080/v1`, `model
+Qwen/Qwen3.8-27B-FP8`, `models` = the 8 canonical public ids (chat + 7 `gen/*`) matching the facade's
+`/v1/models`, `context_length 262144`, `extra_body.chat_template_kwargs.enable_thinking=false` — already
+canonical. `auxiliary.vision` pointed at **provider `nous` / `xiaomi/mimo-v2.6-pro`** (not the facade).
+
+**Changed:** `model_forge_activate`'s registry has **no** entry whose id equals the facade's canonical
+`Qwen/Qwen3.8-27B-FP8` (its chat ids are `qwen3.8-flash-next` etc.; the alias table maps *into*
+`Qwen/Qwen3.8-27B-FP8` but no registry id *is* it), so `model_forge_activate(model_id=…)` cannot target
+this facade. Used the documented operator path — the tool's **own in-process helpers**
+`write_custom_provider_entry()` + `write_auxiliary_vision()` (the identical config surfaces the tool's
+`facade=true` branch writes, through the same `hermes_cli.config` load/save; no dotted-index CLI writes):
+- `custom_providers["vLLM"]` refreshed (merge-by-name preserved `api_key`, `extra_body`, `context_length`,
+  and all `models`; added `api_mode: chat_completions`).
+- `auxiliary.vision`: `model Qwen/Qwen3.8-27B-FP8`, `base_url http://192.168.1.62:8080/v1` (provider left
+  `nous`; with a lane `base_url` set, `resolve_vision_provider_client()` takes the explicit endpoint
+  override — `agent/auxiliary_client.py` "direct endpoint overrides beat provider selection").
+
+**Evidence:**
+- **(a) chat** — `POST /v1/chat/completions` `{"model":"Qwen/Qwen3.8-27B-FP8","messages":[{"role":"user","content":"…"}],"max_tokens":16,"chat_template_kwargs":{"enable_thinking":false}}` → **200**, content `"CONSUMER1-CHAT-OK"`, `system_fingerprint vllm-0.24.0-tp2-c741c66b`.
+- **(b) vision** — same route, `content:[{"type":"text",…},{"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}]` → **200**, *"…the image is a solid red square. The dominant color is red."*
+- **landing** — `vllm-server` log: `172.18.0.1:33978 - "POST /v1/chat/completions HTTP/1.1" 200 OK` (facade → vLLM).
+
+**Verdict: PASS.**
+
+### 8.2 Image-gen plugin (this host)
+
+**Found:** `image_gen.provider = nous` — **not a registered image provider** (registered: `weightsbroker`,
+`model-forge`, plus bundled `deepinfra/fal/krea/meta-ai/openai/openai-codex/openrouter/xai`). With `nous`
+unregistered and more than one available provider, `get_active_provider()` returned **None** →
+`image_generate` was non-functional. The `model-forge-image` plugin is present (provider name `model-forge`)
+but had **no settings** configured.
+
+**Changed:** `image_gen.provider = model-forge`; `plugins.entries.model-forge-image.settings.base_url =
+http://192.168.1.62:8080/v1`; `…settings.default_model = gen/qwen-image-2.1` (canonical gen id).
+
+**Evidence:** exercised the plugin's own path —
+`ModelForgeImageGenProvider().generate("a single small red apple on a plain white background, centered",
+aspect_ratio="square")` → `success:true` in **214.5 s**, `{"image":"http://192.168.1.62:8080/assets/9cca8dcd0dd2/qwen_image_21_00014_.png","model":"gen/qwen-image-2.1","provider":"model-forge"}`.
+Asset fetch: **HTTP 200, `image/png`, 1,075,042 bytes, PNG 1024×1024 RGBA**. The full gen dance ran
+(evict `vllm-server` → `weights-broker-comfyui-1` up → job → restore); `docker ps` after: `vllm-server Up (healthy)`.
+
+**Verdict: PASS.**
+
+### 8.3 House-scan vision cron (this host)
+
+**Found:** the live house-scan cron is job `5bb6eba5d45e` *"New Home Alert — Baldwin & Mobile (hourly)"* —
+`schedule 0 * * * *`, **`no_agent: true`**, script `run_house_scan_alert.sh` → `run_house_scan.py`,
+with **`model: null`, `provider: null`, `base_url: null`**. The script's only network targets are
+`https://www.sweethomealabama.homes/api-site/search/realTimeListings`, the Estately JSON-LD fallback,
+`zillow.com` link building, and the listing-photo downloads — it makes **no LLM/vision call** and never
+contacts `192.168.1.62`. No cron in either profile, and no historical job output, contains a house/vision
+model call (the only vision-using historical crons were `gym-book-pipeline` and the X-audit *text* labeler,
+both unrelated).
+
+**Changed:** none — there is no model/base_url config to refresh and **no vision call shape to replay**.
+
+**Verdict: N/A** — the consumer described does not exist. The house-scan job is a deterministic
+scraper → filter → PDF pipeline, not a model consumer; nothing to flip or verify. (Honest finding, not a
+fabricated green.) The only vision consumer on this host is the Hermes `auxiliary.vision` lane, already
+flipped and verified in §8.1.
+
+### 8.4 OpenViking (.63 = 192.168.1.63)
+
+**Found:** `/root/.openviking/ov.conf` → `vlm = {"provider":"openai","model":"openbmb/MiniCPM-V-4.6",
+"api_base":"http://192.168.1.62:8080/v1"}` (`openbmb/MiniCPM-V-4.6` is a **facade alias** → `Qwen/Qwen3.8-27B-FP8`).
+`openviking.service` active; its VLM backend (`OpenAIVLM`) posts OpenAI `chat/completions` with
+`image_url` data-URL content parts.
+
+**Changed:** `ov.conf` `vlm.model` → `Qwen/Qwen3.8-27B-FP8` (canonical); `api_base` and `api_key` untouched
+(JSON edited in place, validated). Backup: `/root/.openviking/ov.conf.bak-model-forge-flip-20261120-043553`.
+`systemctl restart openviking` → active, root `HTTP 302`.
+
+**Evidence:** from **.63**, `POST http://192.168.1.62:8080/v1/chat/completions`
+`{"model":"openbmb/MiniCPM-V-4.6","messages":[{"role":"user","content":[{"type":"text",…},
+{"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}]}]}` → **200**, resolved
+`model:"Qwen/Qwen3.8-27B-FP8"`, red description. Post-refresh, the **same call with the canonical id** →
+**200**. `vllm-server` log shows the forwarded POSTs.
+
+**Verdict: PASS.**
+
+### 8.5 Cleanup / no-ops
+
+- No git commit. `mf-facade`, `vllm-server`, `weights-broker-comfyui-1`, `gluetun` were never
+  stopped/restarted/removed by this phase (the facade's *own* gen dance stopped+started `vllm-server` and
+  `weights-broker-comfyui-1` as designed; both left healthy afterward). No `docker rm`/prune.
+- Throwaway scratch (probe script, tiny test PNGs, fetched asset) removed from `cache/scratch`.
