@@ -265,3 +265,109 @@ No commits made (per constraint). Apply with `git apply docs/tasks/p5-stub-confi
 **Rollback (any time):**
 9. `systemctl stop mf-shadow` (releases open scopes on shutdown) and
    `docker start weights-broker` to restore the broker on :8080.
+
+---
+
+## 7. REAL CUTOVER ACCEPTANCE (the .62 production window)
+
+**Model:** deepseek/deepseek-v4.1-flash
+**Repo source:** `/home/hermes/model-forge` @ `3b57bd3`
+**Date:** 2026-11-20 (UTC) — executed live on the `ai` LXC (192.168.1.62)
+**Result:** ✅ **all five real-acceptance checks PASS. No rollback. `mf-facade` left
+running on :8080.** `weights-broker` remains stopped (facade owns :8080). `gluetun`
+untouched throughout.
+
+### 7.1 Package re-deploy (pre-window)
+
+The shadow copy at `/root/model-forge-shadow/model_forge/` predated the heal +
+wait-on-stop fixes, so the whole `model_forge/` package was re-deployed from the
+`3b57bd3` repo tree (tar, `__pycache__` excluded) before the window; the old copy is
+kept at `model_forge.pre-heal/`. **md5 verified identical to local source:**
+
+| file | md5 (matches local) |
+|---|---|
+| `serve.py` | `f74156296013ccb96be9a17dee6eefb7` |
+| `facade.py` | `2eb9db6028478542a6c81d88ce9c5426` |
+| `broker.py` | `2b64d91584c36913b29dd0aadf0580ee` |
+| `engines/comfyui.py` | `1e8b49102609ab85a089a18a5e89efcb` |
+| `aliases.py` | `38317a098f2a19b2d890a5496d425321` |
+
+(`broker.py` / `comfyui.py` differ from the §1 220f72c hashes — those are the newer
+heal / wait-on-stop revisions. `serve.py` / `facade.py` / `aliases.py` match.)
+
+### 7.2 Window timeline (UTC)
+
+| T | event |
+|---|---|
+| `04:08:26Z` | pre-window idle recheck: `gen.busy=false`, `gen.container_running=false`, `llm.awake=true`; comfy container stopped |
+| `04:08:40Z` | shadow window opens — `systemctl stop mf-shadow`; `docker rm -f mf-test-vllm mf-test-comfy` |
+| `04:09:01Z` | **`docker stop weights-broker`** — :8080 goes dark (verified) |
+| `04:09:02Z` | **`systemd-run --unit=mf-facade`** up on :8080; log `listening on 0.0.0.0:8080 — lanes [comfyui:weights-broker-comfyui-1, vllm:vllm-server]` |
+| `04:10:08Z` | image job submitted (`gen/qwen-image-2.1`, 1024×1024) |
+| `~04:10:10Z` | `docker stop vllm-server` (evict) → `weights-broker-comfyui-1` Up |
+| `04:11:04–04:12:59Z` | ComfyUI on GPU1: 4.8 → 10.8 → 21.5 GB, 100% util; GPU0 ≈ 1 MiB |
+| `~04:13Z` | job done; `qwen_image_21_00013_.png` written; idle release → comfy Exited, `vllm-server` started |
+| `04:15:03Z` | `vllm-server /health → 200` (restore confirmed; both GPUs ≈ 22.6 GB) |
+
+### 7.3 Accepted config (facade-real.json)
+
+Real topology + real budgets. `host 0.0.0.0`, `port 8080`, `LLM_BASE_URL
+http://127.0.0.1:8000/v1`, `LLM_SERVED_ID Qwen/Qwen3.8-27B-FP8`, `COMFYUI_BASE_URL
+http://127.0.0.1:18188`, `CHAT_CONTAINER vllm-server`, `GEN_CONTAINER
+weights-broker-comfyui-1`, `CHAT_BOOT_S 480`, `GEN_BOOT_S 600`,
+`PUBLIC_BASE_URL http://192.168.1.62:8080`.
+
+**Two deviations from the literal runbook/instruction, both deliberate:**
+
+1. **`COMFY_OUTPUT_DIR=/data/broker/comfy/output`** — the real host path bound into
+   the container at `/opt/ComfyUI/output` (`weights-broker-comfyui-1` volume).
+2. **`ASSETS_DIR=/data/broker`** (not `/root/model-forge-shadow/assets`). The
+   `GET /assets/{jid}/{name}` route refuses to serve any file that does not resolve
+   under `assets_dir` (`FacadeConfig._within_assets`). Since the runner records the
+   **on-disk ComfyUI output path** (`os.path.join(output_dir, sub, filename)`), the
+   real output dir must be an ancestor-inclusive child of `assets_dir` for the asset
+   URL to 200. `/data/broker` is that ancestor; the literal shadow assets dir would
+   have 404'd every real gen asset. (The broker avoids this by *download*-ing outputs
+   into `assets_dir` over HTTP; the facade reads them in place.) This is a genuine
+   port difference worth a follow-up if `ASSETS_DIR` must stay at the shadow path.
+
+**vLLM API key:** read from `/root/docker/weights-broker/.env` (`BROKER_VLLM_API_KEY`)
+— sha256-identical to `/root/docker/local-ai/.env` `VLLM_API_KEY` (verified, not
+printed) — injected via `systemd-run --setenv=BROKER_VLLM_API_KEY=…` (env-only per
+§4). Value never echoed.
+
+### 7.4 Real acceptance — per check
+
+| # | Check | Evidence | Result |
+|---|-------|----------|--------|
+| **A** | `GET /v1/models` surface matches pre-flight snapshot | 18 entries: **8 public ids identical to the broker snapshot** (`Qwen/Qwen3.8-27B-FP8`, `gen/qwen-image-2.1`, `gen/qwen-image-2.1-edit`, `gen/qwen-image-2.1-cutout`, `gen/moss-image`, `gen/h3-t2v`, `gen/h3-i2v`, `gen/h3-r2v`) + 10 aliases incl. `openbmb/MiniCPM-V-4.6→Qwen/Qwen3.8-27B-FP8`, `gen/krea2→gen/qwen-image-2.1` | **PASS** |
+| **B** | real vLLM chat + legacy-alias chat | `POST /v1/chat/completions {model:Qwen/Qwen3.8-27B-FP8}` → real completion, `model:Qwen/Qwen3.8-27B-FP8`; `vllm-server Up 5 hours` **before and after** (adopt-without-restart happy path). Alias `openbmb/MiniCPM-V-4.6` → resolved `model:Qwen/Qwen3.8-27B-FP8`, 200. `vllm-server` log: `POST /v1/chat/completions 200 OK` (auth forwarded) | **PASS** |
+| **C** | real claim dance | `POST /v1/images/generations {gen/qwen-image-2.1}` → response `{"data":[{"url":"http://192.168.1.62:8080/assets/34db0586f283/qwen_image_21_00013_.png"}]}`. Mid-run: `vllm-server` **gone** from `docker ps`, `weights-broker-comfyui-1` Up, GPU0≈1 MiB / GPU1 rising to **21.5 GB @100%**. Asset URL `HTTP=200 CT=image/png bytes=955478` (`PNG 1024x1024 RGBA`). Idle release → comfy Exited + `vllm-server` restored (`Up`, healthy, both GPUs ≈22.6 GB) | **PASS** |
+| **D** | chat on the restored lane | post-restore `POST /v1/chat/completions` → real completion, `model:Qwen/Qwen3.8-27B-FP8`, `finish_reason:length`(max_tokens=8); `system_fingerprint vllm-0.24.0-tp2` | **PASS** |
+| **E** | LLM-waiter refuses gen; comfy not started | `docker stop vllm-server` → bg chat wakes it (`Up 11s, health: starting`); gen fired mid-boot → **`HTTP=503` in 0.0004 s**: `"refused: a chat request owns the lane wake — 1 LLM waiter(s) pending for qwen-image-2.1 (roadmap §3 …)"`; `weights-broker-comfyui-1` stayed **Exited**. Waiter's chat then returned normally (EXIT=0, real vLLM reply) | **PASS** |
+
+### 7.5 Container / VRAM observations
+
+- **Adopt-without-restart (B):** with `vllm-server` already healthy, the first chat
+  produced **no load step** — the container stayed `Up 5 hours` across the request.
+  The heal happy path behaves as intended on the real lane.
+- **Eviction is real and total:** GPU0 dropped 22.7 GB → 1 MiB the instant
+  `vllm-server` stopped; ComfyUI then grew GPU1 to 21.5 GB at 100% util.
+- **Restore is warm and in-budget:** `vllm-server` was back `healthy` well inside the
+  200 s target (up by ~04:13:28Z, `/health 200` at 04:15:03Z); no boot-budget pressure.
+- **Observation (not a failure):** the *synchronous* image response was returned
+  **after** the job + lane restore completed (~4 min after submit, job itself ~3 min),
+  so the client blocks for the whole dance including reload. Worth documenting for
+  consumer timeouts. (The §6 broker note's 240 s gateway figure would be tight here.)
+- **Minor surface drift (cosmetic):** the facade's alias table maps
+  `research/qwen38-uncensored` and `OBLITERATUS/Qwen3.8-27B-OBLITERATED` to
+  `Qwen/Qwen3.8-27B-FP8` (the broker maps them to the separate research container,
+  which is not in the facade's two-lane topology). Count and public ids match; only
+  these research aliases' targets differ.
+
+### 7.6 Rollback
+
+**Not invoked — all checks PASS.** `mf-facade` remains running on :8080; broker
+`weights-broker` remains stopped by design. Rollback remains available per §6:
+`systemctl stop mf-facade && docker start weights-broker`.
+No live container was removed, no image pruned, `gluetun` never touched, no git commit.
