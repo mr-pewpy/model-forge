@@ -269,6 +269,60 @@
       h(ResourceView, { key: "resource-view" }));
   }
 
+  function ResidencySection(props) {
+    // B2: broker weight-residency rows (pulled / resident / booked / unbooked /
+    // budget) — the model_forge_broker action=status data, read from the
+    // cockpit API (cockpit_data().residency). Read-only.
+    const res = props.data.residency;
+    if (!res || res.ok === false) {
+      return h(Section, { title: "Broker weight residency" },
+        h(Line, { muted: true },
+          "Weight residency (pulled / resident / booked / budget) comes from " +
+          "model_forge_broker. " + (res && res.error ? res.error + " " : "") +
+          "In chat: /model-forge broker."));
+    }
+    const budget = res.budget || {};
+    const pulled = res.pulled || [];
+    const resident = res.resident || [];
+    const booked = res.booked || [];
+    const unbooked = res.unbooked || [];
+    return h(Section, { title: "Broker weight residency" },
+      h(Line, { muted: true },
+        "budget: " + (budget.nominal_gb != null ? budget.nominal_gb + " GB nominal" : "undeclared") +
+        " · booked_now " + (budget.booked_now_gb != null ? budget.booked_now_gb + " GB" : "?") +
+        (budget.headroom_gb != null ? " · headroom " + budget.headroom_gb + " GB" : "")),
+      h(Line, { muted: true }, "pulled (" + pulled.length + "):"),
+      pulled.map(function (r, i) {
+        return h(Line, { key: "p-" + i },
+          r.model_id + " · " + (r.size_bytes != null ? fmtBytes(r.size_bytes) : "size?") +
+          " · " + (r.path || "") + (r.source ? " · " + r.source : ""));
+      }),
+      h(Line, { muted: true }, "resident (" + resident.length + "):"),
+      resident.map(function (r, i) {
+        return h(Line, { key: "r-" + i },
+          r.model_id + " · engine=" + r.engine + " · lane=" + r.lane);
+      }),
+      h(Line, { muted: true }, "booked (" + booked.length + ") — measured vs published:"),
+      booked.map(function (r, i) {
+        return h(Line, { key: "bk-" + i },
+          r.model_id + " · " + (r.vram_gb != null ? r.vram_gb + " GB" : "?") +
+          " · " + (r.label || r.source || ""));
+      }),
+      unbooked.length
+        ? h(Line, { key: "uh", muted: true },
+            "unbooked (" + unbooked.length + ") — run bench after first load:")
+        : null,
+      unbooked.slice(0, 12).map(function (r, i) {
+        return h(Line, { key: "u-" + i, muted: true },
+          r.model_id + " · " + (r.modality || ""));
+      }),
+      unbooked.length > 12
+        ? h(Line, { key: "um", muted: true },
+            "…and " + (unbooked.length - 12) + " more (see /model-forge broker)")
+        : null,
+      res.note ? h(Line, { muted: true }, res.note) : null);
+  }
+
   function Invitation(props) {
     const inv = props.invitation;
     return h("div", {
@@ -328,7 +382,8 @@
             (state.data.invitation ? h(Invitation, { invitation: state.data.invitation }) : null),
             h(TargetsSection, { data: state.data }),
             h(ModelsSection, { data: state.data }),
-            h(StorageSection, { data: state.data }));
+            h(StorageSection, { data: state.data }),
+            h(ResidencySection, { data: state.data }));
 
     return h(C.Card || "div", { style: { margin: "12px" } },
       h(C.CardHeader || "div", null,

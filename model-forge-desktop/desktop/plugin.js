@@ -779,6 +779,77 @@ function StorageSection(props) {
   return children;
 }
 
+function ResidencySection(props) {
+  // B2: broker weight-residency rows (pulled / resident / booked / unbooked /
+  // budget) — the same honest data model_forge_broker action=status reports,
+  // read from the cockpit bridge (cockpit_data().residency). Read-only.
+  const { bridge, bridgeHint } = props;
+  const res = bridge && bridge.residency;
+  const children = [jsx(SectionTitle, { key: "t", children: "Broker weight residency" })];
+  if (!res || res.ok === false) {
+    children.push(jsx(Hint, {
+      key: "h",
+      children: "Weight residency (pulled / resident / booked / budget) comes from model_forge_broker. " +
+        (res && res.error ? res.error + " " : "") +
+        (bridgeHint || "In chat: /model-forge broker."),
+    }));
+    return children;
+  }
+  const budget = res.budget || {};
+  children.push(jsx(Hint, {
+    key: "b",
+    children: "budget: " + (budget.nominal_gb != null ? budget.nominal_gb + " GB nominal" : "undeclared") +
+      " · booked_now " + (budget.booked_now_gb != null ? budget.booked_now_gb + " GB" : "?") +
+      (budget.headroom_gb != null ? " · headroom " + budget.headroom_gb + " GB" : ""),
+  }));
+  const pulled = res.pulled || [];
+  children.push(jsx(Hint, { key: "ph", children: "pulled (" + pulled.length + "):" }));
+  pulled.forEach((r, i) => {
+    children.push(jsx(Row, {
+      key: "p-" + i,
+      children: [
+        jsx("span", { key: "n", style: { minWidth: "150px", color: "var(--ui-text-secondary)" }, children: r.model_id }),
+        jsx("span", { key: "s", style: { color: "var(--ui-text-secondary)", fontSize: "12px", minWidth: "70px" }, children: r.size_bytes != null ? fmtBytes(r.size_bytes) : "size?" }),
+        jsx("span", { key: "p", style: { color: "var(--ui-text-quaternary)", fontSize: "11px" }, children: r.path || "" }),
+      ],
+    }));
+  });
+  const resident = res.resident || [];
+  children.push(jsx(Hint, { key: "rh", children: "resident (" + resident.length + "):" }));
+  resident.forEach((r, i) => {
+    children.push(jsx("div", {
+      key: "r-" + i,
+      style: { color: "var(--ui-text-secondary)", fontSize: "11px", padding: "1px 0 1px 10px" },
+      children: r.model_id + " · engine=" + r.engine + " · lane=" + r.lane,
+    }));
+  });
+  const booked = res.booked || [];
+  children.push(jsx(Hint, { key: "bh", children: "booked (" + booked.length + ") — measured vs published:" }));
+  booked.forEach((r, i) => {
+    children.push(jsx("div", {
+      key: "bk-" + i,
+      style: { color: "var(--ui-text-secondary)", fontSize: "11px", padding: "1px 0 1px 10px" },
+      children: r.model_id + " · " + (r.vram_gb != null ? r.vram_gb + " GB" : "?") + " · " + (r.label || r.source || ""),
+    }));
+  });
+  const unbooked = res.unbooked || [];
+  if (unbooked.length) {
+    children.push(jsx(Hint, { key: "uh", children: "unbooked (" + unbooked.length + ") — run bench after first load:" }));
+    unbooked.slice(0, 12).forEach((r, i) => {
+      children.push(jsx("div", {
+        key: "u-" + i,
+        style: { color: "var(--ui-text-quaternary)", fontSize: "11px", padding: "1px 0 1px 10px" },
+        children: r.model_id + " · " + (r.modality || ""),
+      }));
+    });
+    if (unbooked.length > 12) {
+      children.push(jsx(Hint, { key: "um", children: "…and " + (unbooked.length - 12) + " more (see /model-forge broker)" }));
+    }
+  }
+  if (res.note) children.push(jsx(Hint, { key: "n", children: res.note }));
+  return children;
+}
+
 function Cockpit(props) {
   const ctx = props.ctx;
   const [state, setState] = useState(null);
@@ -848,6 +919,7 @@ function Cockpit(props) {
   children.push(...engineSection.children);
   children.push(...ModelsSection({ bridge: state.bridge, bridgeHint: state.bridgeHint }));
   children.push(...StorageSection({ bridge: state.bridge, bridgeHint: state.bridgeHint }));
+  children.push(...ResidencySection({ bridge: state.bridge, bridgeHint: state.bridgeHint }));
   return jsx("div", {
     style: { padding: "8px", overflowY: "auto" },
     children,

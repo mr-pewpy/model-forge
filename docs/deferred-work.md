@@ -345,20 +345,23 @@ The list is grouped as:
 
 ### B2. Broker residency rows on the cockpit surfaces
 
+**Implemented.** Weight-residency rows render on both cockpit surfaces.
+
 - **What it is:** rendering weight-residency rows (pulled, resident, booked,
   unbooked, budget usage) in the Desktop cockpit pane and the dashboard tab.
 - **Why:** the cockpit surfaces were built around targets, engines, models
-  and storage first; residency rendering on them is not built yet (the
-  capability matrix marks it "not on the tab yet").
-- **What exists today:** residency is chat-only through the command
-  (`/model-forge broker`) and the `model_forge_broker` tool, with the same
-  honest state vocabulary everywhere. The data door for the surfaces is now
-  built: `cockpit_data()["residency"]` and the dashboard `/residency` API
-  route carry the pulled / resident / booked / unbooked / budget rows (B2
-  foundation, tested).
-- **What would unblock it:** the remaining work is the renderers — adding the
-  residency section to the Desktop pane and the dashboard tab (the data shape
-  is now exposed on both surfaces' data doors).
+  and storage first; residency rendering on them was not built initially.
+- **What exists today:** `cockpit_data()["residency"]` and the dashboard
+  `/residency` API route carry the pulled / resident / booked / unbooked /
+  budget rows, and both surfaces render a "Broker weight residency" section —
+  the Desktop pane (`ResidencySection` in `plugin.js`) and the dashboard tab
+  (`ResidencySection` in `dashboard/dist/index.js`) — with the same honest
+  state vocabulary (booked provenance labels, unbooked → run bench, budget
+  headroom). Verified by `tests/smoke_residency_renderers.js` (a Node smoke —
+  the renderers are hand-verified per A9, so this is the automated check).
+- **Remaining:** none for B2. (The dashboard `dist/index.js` is the served
+  build artifact; if a frontend source exists elsewhere, port the
+  `ResidencySection` there too.)
 
 ### B3. Bench sampling of remote compute targets
 
