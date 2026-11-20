@@ -111,6 +111,53 @@ def test_runner_plan_unknown_lane_is_refused():
     assert plan["workflow_id"] == "does-not-exist"
 
 
+def test_media_asset_url_falls_back_to_the_view_url():
+    # B1: a connected/remote ComfyUI output lives on its host (not readable
+    # here) -> the fetchable /view URL is used; never a dead local path.
+    from model_forge import tools
+    url = tools._media_asset_url("/output/remote-only.png",
+                                 fallback="http://comfy:8188/view?filename=x")
+    assert url == "http://comfy:8188/view?filename=x"
+    # no fallback -> the honest raw path is kept (never invented)
+    assert tools._media_asset_url("/output/remote-only.png") == \
+        "/output/remote-only.png"
+
+
+def test_local_workflow_runner_wires_a_connected_comfyui(monkeypatch):
+    # B1: a connected/remote ComfyUI endpoint gets a runner, not just a local
+    # one — so a connected ComfyUI serves generation, not only downloads.
+    from model_forge import tools
+    from model_forge.engines import comfyui as comfy_mod
+
+    class _St:
+        available = True
+        id = "comfyui"
+        endpoint = "http://comfy:8188"
+
+    remote = ComputeTarget(id="comfy-box", label="Comfy", kind="lan",
+                           base_url="http://comfy:8188")
+    monkeypatch.setattr(comfy_mod, "detect", lambda base_url="": _St())
+    runner = tools._local_workflow_runner(remote)
+    assert runner is not None
+    assert runner.base == "http://comfy:8188"
+
+
+def test_local_workflow_runner_none_when_not_comfyui(monkeypatch):
+    # a remote target that is NOT a ComfyUI keeps its gateway path (no runner)
+    from model_forge import tools
+    from model_forge.engines import comfyui as comfy_mod
+
+    class _St:
+        available = False
+        id = "other"
+        endpoint = ""
+
+    remote = ComputeTarget(id="gw", label="GW", kind="lan",
+                           base_url="http://gw:8000")
+    monkeypatch.setattr(comfy_mod, "detect", lambda base_url="": _St())
+    assert tools._local_workflow_runner(remote) is None
+
+
 # --- fakes for the generate_media local flow --------------------------------
 
 class _RecordingAdapter(EngineLifecycle):

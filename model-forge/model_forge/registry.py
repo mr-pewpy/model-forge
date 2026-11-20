@@ -50,10 +50,11 @@ PHANTOM_ENGINES: frozenset[str] = frozenset({"python"})
 PHANTOM_ENGINE_NOTE = "custom Python environment the plugin does not manage"
 
 # Every entry listing the "comfyui" engine carries this honest caveat: the
-# plugin downloads ComfyUI model files but does not drive ComfyUI-native
-# generation (see README known limits).
-COMFYUI_LIMIT_NOTE = ("ComfyUI download works; generation is not plugin-driven "
-                     "yet (see README known limits)")
+# plugin downloads ComfyUI model files and drives ComfyUI-native image/video
+# generation through the workflow runner (3d/music/sfx ride a media gateway).
+COMFYUI_LIMIT_NOTE = ("ComfyUI download works; image/video generation is "
+                     "plugin-driven (the /prompt + /history workflow "
+                     "runner); 3d/music/sfx ride a media gateway")
 
 # Gated HuggingFace repos need license acceptance before any download.
 GATED_REPO_NOTE = ("This is a gated repo: HF account + license acceptance "

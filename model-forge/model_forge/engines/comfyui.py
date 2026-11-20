@@ -30,6 +30,7 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from uuid import uuid4
@@ -551,10 +552,17 @@ class ComfyWorkflowRunner:
                 return
             sub = item.get("subfolder", "") or ""
             path = os.path.join(self._output_dir, sub, fn)
+            kind = item.get("type", "output")
+            # ComfyUI's fetchable /view URL for this output — works for a
+            # REMOTE/connected ComfyUI whose /output dir is not readable here
+            # (B1: a connected ComfyUI serves generation, not only downloads).
+            url = (f"{self.base}/view?filename={urllib.parse.quote(fn)}"
+                   f"&subfolder={urllib.parse.quote(sub)}"
+                   f"&type={urllib.parse.quote(kind)}")
             items.append({
                 "node": node_id, "kind": output_kind, "bucket": bucket,
                 "filename": fn, "subfolder": sub,
-                "type": item.get("type", "output"), "path": path,
+                "type": kind, "path": path, "url": url,
             })
 
         for node_id, out in (entry.get("outputs") or {}).items():
@@ -676,13 +684,14 @@ class ComfyWorkflowRunner:
             status, payload = self._poll_once(prompt_id, cfg.output_kind)
             if status == "done":
                 files = [it["path"] for it in payload]
+                urls = [it.get("url", "") for it in payload]
                 meta = {
                     "workflow_id": workflow_id, "prompt_id": prompt_id,
                     "client_id": job_id, "output_kind": cfg.output_kind,
                     "output_dir": self._output_dir, "outputs": payload,
                 }
                 return {"ok": True, "output_kind": cfg.output_kind,
-                        "files": files,
+                        "files": files, "urls": urls,
                         "reason": f"workflow {workflow_id!r} produced "
                                   f"{len(files)} {cfg.output_kind} output(s)",
                         "meta": meta}

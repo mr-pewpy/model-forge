@@ -145,6 +145,22 @@ def _image_entry(filename="out.png", subfolder="", bucket="images", node="9"):
                  "type": "output"}]}}}
 
 
+def test_collect_outputs_carries_fetchable_view_url():
+    # B1: a connected/remote ComfyUI's /output dir is not readable here, so
+    # every collected output carries its fetchable /view URL.
+    runner = make_runner(None)
+    entry = _image_entry(filename="out.png", subfolder="s", node="9")
+    rows = runner._collect_outputs(entry, "image")
+    assert len(rows) == 1
+    url = rows[0]["url"]
+    assert url.startswith("http://comfy:18188/view?")
+    assert "filename=out.png" in url
+    assert "subfolder=s" in url
+    assert "type=output" in url
+    # the local path is still reported for a local ComfyUI
+    assert rows[0]["path"] == "/output/s/out.png"
+
+
 # --- registry --------------------------------------------------------------
 
 def test_registry_has_seven_lanes_with_expected_kinds():

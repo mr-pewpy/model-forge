@@ -2243,22 +2243,39 @@ def _local_workflow_runner(target, *, http=None, **seams):
     """The local ComfyUI workflow runner for *target*, or None when the active
     stack does not provide one.
 
-    A runner exists only for a LOCAL target whose detected engines include a
-    live ComfyUI: the ported workflow templates drive a ComfyUI this process
-    can reach directly, and there is no remote-template transport, so a remote
-    media-gateway target keeps its HTTP path. Read-only detection; a failure or
-    no ComfyUI is an honest None, never a raise. Injectable — tests replace
-    this module attribute so no probe runs:
+    A runner exists for a LOCAL target whose detected engines include a live
+    ComfyUI, or for a CONNECTED/remote target whose ``base_url`` is a ComfyUI
+    endpoint (the ported, bundled templates drive it over HTTP — B1). For a
+    remote ComfyUI the outputs live on its host, so they are surfaced as the
+    fetchable ``/view`` URLs the runner reports. A target with no ComfyUI is
+    an honest ``None`` (the media-gateway HTTP path keeps its lanes). Read-only
+    detection; a failure or no ComfyUI is an honest None, never a raise.
+    Injectable — tests replace this module attribute so no probe runs:
     ``monkeypatch.setattr(tools, "_local_workflow_runner", lambda t, **k: fake)``.
     """
-    if target is None or getattr(target, "kind", "") != "local":
+    if target is None:
         return None
     try:
         from .engines.comfyui import ComfyWorkflowRunner
-        for e in _detect(""):
-            if e.id == "comfyui" and getattr(e, "available", False):
-                return ComfyWorkflowRunner(getattr(e, "endpoint", "") or "",
-                                           http=http, **seams)
+        if getattr(target, "kind", "") == "local":
+            for e in _detect(""):
+                if e.id == "comfyui" and getattr(e, "available", False):
+                    return ComfyWorkflowRunner(getattr(e, "endpoint", "") or "",
+                                               http=http, **seams)
+            return None
+        # A CONNECTED/remote target: drive a ComfyUI at its base_url when one
+        # is detected there (B1 — a connected ComfyUI serves generation, not
+        # only downloads). Its /output dir is not readable here, so outputs
+        # are surfaced as the fetchable /view URLs the runner reports.
+        base = (getattr(target, "base_url", "") or "").rstrip("/")
+        if not base:
+            return None
+        from .engines.comfyui import detect as _comfy_detect
+        st = _comfy_detect(base)
+        if (getattr(st, "available", False)
+                and getattr(st, "id", "") == "comfyui"):
+            return ComfyWorkflowRunner(
+                getattr(st, "endpoint", "") or base, http=http, **seams)
     except Exception:  # noqa: BLE001 — no runner is an honest fallback
         return None
     return None
@@ -2277,10 +2294,13 @@ def _local_assets_dir() -> str:
         return tempfile.mkdtemp(prefix="model-forge-media-")
 
 
-def _media_asset_url(path, *, embed: bool = True) -> str:
+def _media_asset_url(path, *, embed: bool = True, fallback: str = "") -> str:
     """A reference for a runner output file: a ``data:`` URL when the file is
     readable locally and ``embed`` is set (images), else the absolute path the
-    runner reported. Never raises — an unreadable file falls back to its path."""
+    runner reported. For a REMOTE/connected ComfyUI the path lives on its
+    host and is not readable here, so the ComfyUI ``/view`` URL the runner
+    reported is used (``fallback``) — never a dead local path. Never raises —
+    an unreadable file falls back to its path (or ``fallback``)."""
     from pathlib import Path
     try:
         p = Path(str(path))
@@ -2292,7 +2312,7 @@ def _media_asset_url(path, *, embed: bool = True) -> str:
                     + base64.b64encode(p.read_bytes()).decode())
     except OSError:
         pass
-    return str(path)
+    return fallback or str(path)
 
 
 def _local_gen_params(args: dict) -> dict:
@@ -2367,13 +2387,18 @@ def _run_local_image(target, runner, workflow_id, model, params) -> dict:
                              or "the local ComfyUI job failed",
                     "lane_claim": lane}
         files = result.get("files") or []
+        urls = result.get("urls") or []
+        data = [{"url": _media_asset_url(
+            f, fallback=(urls[i] if i < len(urls) else ""))}
+            for i, f in enumerate(files)]
         return {"ok": True, "action": "done", "output_kind": "image",
-                "data": [{"url": _media_asset_url(f)} for f in files],
+                "data": data,
                 "files": files, "model": model, "workflow_id": workflow_id,
                 "lane_claim": lane,
-                "note": "ran the local ComfyUI image lane; each output is a "
-                        "data: URL (or the runner's absolute path when the "
-                        "file was not readable here)"}
+                "note": "ran the ComfyUI image lane; each output is a "
+                        "data: URL (or the ComfyUI /view URL when the file "
+                        "is not readable here — e.g. a connected/remote "
+                        "ComfyUI)"}
     finally:
         if not settled:
             _release_media_lane(target, claim["scope_id"])
@@ -2414,10 +2439,13 @@ def _submit_local_video(target, runner, workflow_id, model, params) -> dict:
                 return
             if res.get("ok"):
                 files = res.get("files") or []
+                urls = res.get("urls") or []
                 rec["status"] = "completed"
                 rec["files"] = files
-                rec["data"] = [{"url": _media_asset_url(f, embed=False)}
-                               for f in files]
+                rec["data"] = [{"url": _media_asset_url(
+                    f, embed=False,
+                    fallback=(urls[i] if i < len(urls) else ""))}
+                    for i, f in enumerate(files)]
             else:
                 rec["status"] = "failed"
                 rec["error"] = (res.get("reason")

@@ -328,9 +328,13 @@ Honest scoping — current limits, and what does not work yet:
   unbooked and the planner refuses to gate them until a measured peak lands
   — run `model_forge_broker` `action=bench` after the model's first load
   (`status` marks those rows `unbooked — run bench after first load`).
-- **`model_forge_generate_media` speaks the media gateway job API only**
-  (`/v1/videos/generations`, `/v1/audio/music`, `/v1/audio/sfx`). The
-  ComfyUI-native job flow (`/prompt` + `/history`) is not implemented.
+- **`model_forge_generate_media` runs image/video through the ComfyUI-native
+  job flow** (`/prompt` + `/history`) on a local or connected ComfyUI endpoint,
+  inside the same claim/release scope as the gateway lanes, with honest
+  progress states. Outputs are `data:` URLs when the file is readable here
+  (local ComfyUI) or the fetchable ComfyUI `/view` URLs when it is not (a
+  connected/remote ComfyUI). 3d/music/sfx ride the media gateway job API
+  (`/v1/videos/generations`, `/v1/audio/music`, `/v1/audio/sfx`).
 - **Engine lifecycle management is limited to weight residency.** Model
   Forge never installs or launches full engine stacks — it detects engines,
   pulls model files, and emits run commands. Claim and release do drive

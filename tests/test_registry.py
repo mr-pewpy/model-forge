@@ -142,7 +142,10 @@ def test_comfyui_notes_do_not_overclaim():
     for m in MODELS:
         if "comfyui" in m.engines:
             assert "download works" in m.note, m.id
-            assert "generation is not plugin-driven yet" in m.note, m.id
+            # image/video generation IS plugin-driven now; the note must say
+            # so honestly without overclaiming the gateway-fed 3d/music/sfx.
+            assert "image/video generation is plugin-driven" in m.note, m.id
+            assert "3d/music/sfx ride a media gateway" in m.note, m.id
             assert "workflow lane also works" not in m.note, m.id
 
 

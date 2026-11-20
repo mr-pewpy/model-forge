@@ -88,8 +88,9 @@ states, fail-closed policy, approval gates, disclosures).
   (model-forge/plugin.yaml).
 - Approved installers cover three engines; vLLM, SGLang, ComfyUI, llama-swap, and Exo are connect-only
   or command-print (model_forge/tools.py).
-- ComfyUI-native generation is not plugin-driven; downloads work but generation does not (README.md
-  "Known limits"; model_forge/registry.py `COMFYUI_LIMIT_NOTE`).
+- ComfyUI-native generation is plugin-driven — image/video run through the `/prompt` + `/history`
+  workflow runner (local or connected ComfyUI); 3d/music/sfx ride a media gateway (README.md "Known
+  limits"; model_forge/registry.py `COMFYUI_LIMIT_NOTE`).
 - Python audio engines are honest "phantom" entries: discoverable but never selectable
   (model_forge/registry.py `PHANTOM_ENGINES`).
 
@@ -108,10 +109,11 @@ states, fail-closed policy, approval gates, disclosures).
   installer exists or the product documents and offers the connect path, with no dead-end rows.
   *Acceptance:* each engine's product row states exactly how it gets onto a machine and how it gets
   connected; no engine resolves to "install something by hand" with no guidance.
-- **W2.4 ComfyUI-native generation.** Implement the `/prompt` + `/history` job flow so ComfyUI endpoints
-  serve generation, not just downloads (README.md known limit). *Acceptance:* an image job runs on a
-  connected ComfyUI endpoint through the same claim/release scope as media jobs, with honest progress
-  states.
+- **W2.4 ComfyUI-native generation — DONE.** Implemented the `/prompt` + `/history` job flow
+  (`ComfyWorkflowRunner` + `model_forge_generate_media`) so ComfyUI endpoints serve generation, not just
+  downloads. *Acceptance (met):* an image job runs on a connected ComfyUI endpoint through the same
+  claim/release scope as media jobs, with honest progress states — local **or** connected/remote, with
+  fetchable `/view` output URLs for a remote ComfyUI.
 
 ## 4. Pillar 3 — Desktop product UX
 

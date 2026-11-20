@@ -321,19 +321,27 @@ The list is grouped as:
 
 ### B1. ComfyUI-native job generation
 
+**Implemented.** Generation runs directly on a ComfyUI endpoint through the
+`/prompt` + `/history` workflow flow — including a **connected** ComfyUI.
+
 - **What it is:** running generation jobs directly on a ComfyUI endpoint
   (the `/prompt` + `/history` workflow flow), so a connected ComfyUI engine
   serves generation and not only downloads.
 - **Why:** the media job surface was built against the OpenAI-compatible
   media gateway job API first; the ComfyUI workflow queue is a second job
   protocol with its own progress and cache semantics.
-- **What exists today:** ComfyUI downloads work (with the honest per-entry
-  caveat that generation is not plugin-driven yet), media jobs run through
-  the user-configured media gateway lane, and the ComfyUI lifecycle adapter
-  handles readiness and explicit cache frees between generative jobs.
-- **What would unblock it:** implementing the workflow-queue job flow —
-  planned as workstream W2.4 in the product master plan and the ComfyUI
-  "workflow queue" lane in the broker roadmap.
+- **What exists today:** `ComfyWorkflowRunner` drives the workflow-queue job
+  flow (submit `POST /prompt`, poll `GET /history/{id}`, collect outputs by
+  kind, free the cache between jobs) through the bundled workflow templates,
+  and `model_forge_generate_media` runs image/video through it inside the
+  same claim/release scope as the gateway lanes — on a LOCAL **or** a
+  CONNECTED/remote ComfyUI endpoint (detected at the target's `base_url`).
+  Outputs are `data:` URLs when readable locally, else the fetchable ComfyUI
+  `/view` URLs (a connected ComfyUI's `/output` is not readable here). Honest
+  progress states throughout. 3d/music/sfx ride the media gateway job API.
+- **Remaining:** a remote ComfyUI's output files are surfaced by `/view` URL
+  rather than fetched and embedded locally; the media gateway keeps the
+  3d/music/sfx lanes.
 
 ### B2. Broker residency rows on the cockpit surfaces
 
