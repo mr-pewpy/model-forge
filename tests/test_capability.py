@@ -417,6 +417,52 @@ def test_repo_weights_picks_largest_primary():
         "https://huggingface.co/api/models/org/repo?blobs=true"]
 
 
+def test_repo_weights_prefers_full_over_quant_regardless_of_size():
+    # A2: full weights win even when a quantized variant is LARGER — a quant
+    # is picked only on request (engine_model) or when no full weights exist.
+    from model_forge.tools import resolve_repo_weights
+    fetch = _fake_hf([
+        {"rfilename": "model-f16.safetensors", "size": 2 * _GB},
+        {"rfilename": "model-Q8_0.gguf", "size": 8 * _GB},
+        {"rfilename": "model-Q4_K_M.gguf", "size": 4 * _GB},
+    ])
+    plan = resolve_repo_weights("org/repo", fetch=fetch)
+    assert plan["ok"] is True
+    assert plan["file"] == "model-f16.safetensors"
+    assert plan["quantized"] is False
+    assert "full weights preferred" in plan["detail"]
+
+
+def test_repo_weights_falls_back_to_quant_only_when_no_full_weights():
+    # a GGUF/quant-only repo still resolves (largest quant), labeled honestly
+    from model_forge.tools import resolve_repo_weights
+    fetch = _fake_hf([
+        {"rfilename": "model-Q4_K_M.gguf", "size": 4 * _GB},
+        {"rfilename": "model-Q8_0.gguf", "size": 8 * _GB},
+    ])
+    plan = resolve_repo_weights("org/repo", fetch=fetch)
+    assert plan["ok"] is True
+    assert plan["file"] == "model-Q8_0.gguf"
+    assert plan["quantized"] is True
+    assert "no full weights" in plan["detail"]
+
+
+def test_is_quantized_names_quant_tokens_not_full_precision():
+    from model_forge.tools import _is_quantized
+    # quantized variants
+    assert _is_quantized("model-Q4_K_M.gguf")
+    assert _is_quantized("model-Q8_0.gguf")
+    assert _is_quantized("model-int4.safetensors")
+    assert _is_quantized("model-fp8.safetensors")
+    assert _is_quantized("model-awq.safetensors")
+    assert _is_quantized("weights/gptq/model.safetensors")
+    # full precision (never treated as quant)
+    assert not _is_quantized("model.safetensors")
+    assert not _is_quantized("model-f16.gguf")
+    assert not _is_quantized("model-bf16.safetensors")
+    assert not _is_quantized("model-fp32.bin")
+
+
 def test_repo_weights_skips_component_files():
     from model_forge.tools import resolve_repo_weights
     # the component file is the largest file — it is still not the pick

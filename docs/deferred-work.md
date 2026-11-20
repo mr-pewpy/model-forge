@@ -43,9 +43,13 @@ The list is grouped as:
   read; a pull must never guess which file it is downloading.
 - **What exists today:** resolution runs automatically where possible (via
   the repository's public file list), and the fallback error names the exact
-  `engine_model=` value to pass.
-- **What would unblock it:** broader file-list resolution (preferred full
-  weights, quantized variants only on request).
+  `engine_model=` value to pass. The resolver now prefers FULL (non-quantized)
+  weights explicitly — a quantized variant is picked only when the repo offers
+  no full weights, or when the caller names one via `engine_model=` ("quantized
+  variants only on request") — and labels the pick honestly (`quantized`
+  true/false).
+- **What would unblock it:** broader file-list resolution for repositories
+  that publish no readable file list (the fallback stays for those).
 
 ### A3. Music and SFX share one discovery lane
 

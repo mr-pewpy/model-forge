@@ -64,6 +64,18 @@ _COMPONENT_DIR_NAMES = ("vae", "clip")
 _COMPONENT_NAME_FRAGMENTS = ("tokenizer", "processor", "config",
                              "model_index.json")
 _SHARD_RE = re.compile(r"-\d{5}-of-\d{5}\.\w+$")
+# A quantized weights variant (A2: prefer FULL weights; a quant is picked only
+# on request or when the repo offers no full weights). Conventional quant
+# tokens: GGUF quants (q4, q4_k_m, Q8_0), int4/int8, fp8/fp4 (not fp16/bf16,
+# which are full precision), and named methods (awq/gptq/exl/quant).
+_QUANT_RE = re.compile(
+    r"(?:^|[-_./])(?:"
+    r"q[1-8](?:[_-][a-z0-9]+)?"
+    r"|int[1-8]"
+    r"|fp[48]"
+    r"|nf4|awq|gptq|exl2?"
+    r"|quant"
+    r")(?=[-_./]|$)", re.IGNORECASE)
 # Files at or above this size count as "large" for multi-component detection.
 _LARGE_FILE_BYTES = 100 * 1024 * 1024
 _IMAGE_MIME_BY_SUFFIX = {
@@ -2791,6 +2803,14 @@ def _suffix_rank(path: str) -> int:
     return 99
 
 
+def _is_quantized(path: str) -> bool:
+    """True for a quantized weights variant (A2). Full-precision files
+    (fp16/bf16/fp32, plain .safetensors) are NOT quantized; only conventional
+    quant tokens (GGUF q4/q8, int4/int8, fp8/fp4, awq/gptq/exl, quant) mark a
+    quant. Used to prefer full weights and label the pick honestly."""
+    return bool(_QUANT_RE.search(path.lower()))
+
+
 def _is_component_path(path: str) -> bool:
     """True for paths that hold auxiliary components (text encoders, VAEs,
     CLIP, tokenizer/processor/config files) — never the primary weights."""
@@ -2846,11 +2866,22 @@ def _weights_plan(files: list[tuple[str, int]]) -> dict:
                           + (", ".join(sorted(p for p, _ in weights))
                              or "none"),
                 "files": sorted(names)}
-    pick = min(candidates,
+    # A2: prefer FULL (non-quantized) weights. A quantized variant is picked
+    # only when the repo offers no full weights — pass engine_model to request
+    # a specific quant explicitly ("quantized variants only on request").
+    full = [(p, s) for p, s in candidates if not _is_quantized(p)]
+    quants = [(p, s) for p, s in candidates if _is_quantized(p)]
+    pool = full or quants
+    pick = min(pool,
                key=lambda row: (-row[1], _suffix_rank(row[0]), row[0]))
+    quantized = _is_quantized(pick[0])
+    detail = ("primary weights file picked from the repo file list"
+              + (" (full weights preferred)" if not quantized else
+                 " (quantized variant — this repo offers no full weights; "
+                 "pass engine_model to name a specific quant)"))
     return {"ok": True, "action": "resolved", "file": pick[0],
-            "size_bytes": pick[1],
-            "detail": "primary weights file picked from the repo file list"}
+            "size_bytes": pick[1], "quantized": quantized,
+            "detail": detail}
 
 
 def resolve_repo_weights(repo_id: str, fetch=None) -> dict:
