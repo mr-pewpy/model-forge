@@ -90,6 +90,9 @@ generalize to any machine; v2 applies them directly against raw engine APIs:
 - **Big models need process stop/start, not engine sleep/wake.** Some
   engines' wake endpoints are broken upstream; process restart is the
   reliable path for large loads.
+- **LLM-waiter priority.** While a chat request waits on a lane wake, refuse
+  new generative jobs; the waiter owns the wake. Otherwise a gen job and a
+  chat request fight over the swap.
 - **Pull manifests must read the LFS sha256 nested in the lfs object**
   (`lfs.sha256` / `lfs.oid`) — not the pointer file's own hash — and
   retry expired signed URLs per round (HF resolve links expire mid-pull).
@@ -211,6 +214,66 @@ scope with honest progress states through the swap.
 **Acceptance:** each adapter survives its engine's lifecycle quirks
 (process restart where wake is unreliable, cache free between generative
 jobs); measured peaks replace published footprints in bookings.
+
+### P5 — broker consolidation (replace the .62 weights broker)
+
+The weights broker on the .62 inference host (`192.168.1.62:8080`, Gitea
+`charles/weights-broker`) predates this roadmap and still owns what v2 must
+become: the TP2 vLLM ↔ ComfyUI container dance, the ComfyUI gen workflow
+engine, and the stable OpenAI id/alias surface the fleet points at. P5 ports
+those three jobs into Model Forge and retires the broker. The broker stays
+LIVE and serving until the final phase; every replacement is verified before
+its consumers flip, and the alias map must keep working at every step.
+
+Current broker surface to preserve (verified 2026-11-19): 8 served ids at
+`:8080` — the resident chat lane `Qwen/Qwen3.8-27B-FP8` (vLLM TP2 across
+both 3090s, 262k ctx, served through the `current` symlink) plus 7 ComfyUI
+gen lanes (`gen/qwen-image-2.1`, `-edit`, `-cutout`, `gen/moss-image`,
+`gen/h3-t2v`, `gen/h3-i2v`, `gen/h3-r2v`) — with live consumers: Hermes
+custom_providers + auxiliary.vision, the image-gen plugin, the house-scan
+vision cron, and OpenViking on .63. De-registration order for the broker
+itself follows the packer skill: survivor analysis, alias backfill for every
+orphaned id, swap/verify before deleting, config deploy then weight deletes
+last.
+
+Three workstreams, each an acceptance gate:
+
+- **(a) Docker runtime lifecycle.** Generalize `broker.py`'s
+  `ProcessHandle` seam into a `RuntimeHandle` (process | container) and add
+  a `DockerContainerLifecycle` adapter: `ensure_loaded` = `docker start` +
+  health probe with a cold-boot budget; `release` = `docker stop` (instant
+  VRAM free). Registry entries gain a `runtime: {kind, name, health_url,
+  boot_budget_s, gpu_count}` section. Budgets: vLLM 90–170 s warm / ~8 min
+  cold; ComfyUI minutes (ai-dock cold boot). The §3 LLM-waiter rule is
+  implemented in the orchestrator. **Acceptance:** orchestrator
+  claim(chat) → vllm-server up; claim(image) → lane evicted → comfyui up →
+  job → idle release → lane restored.
+- **(b) ComfyUI workflow runner.** Port the broker's workflow engine into
+  `engines/comfyui.py`: template registry (reuse the broker's
+  `workflows/*.json` verbatim), `param_map` injection (the broker's
+  `_inject`: explicit map first, class-based seed/steps/prompt fallback;
+  `size` → width/height), `/prompt` submit with 405 cold-boot retry,
+  `/history` polling, output collection by `output_kind` (image/video/3d),
+  data-URL → `/upload/image` normalization (nested `{"upload": {"path"}}`
+  shape), explicit cache free between back-to-back jobs. Wire into
+  `model_forge_generate_media` and the Hermes image/video providers.
+  **Acceptance:** all 7 gen lanes run end-to-end through Model Forge with
+  the same output shapes as today (images via `POST /v1/images/generations`
+  semantics, video via the job API); old gen id aliases resolve.
+- **(c) Facade + consumer migration.** A thin OpenAI facade in Model Forge:
+  chat passthrough + `/v1/models` catalog + aliases (port the broker's
+  route layer only — the orchestrator owns policy). Extend
+  `model_forge_activate` to write Hermes `custom_providers` +
+  `auxiliary.vision`. Flip consumers one at a time (Hermes providers →
+  image plugin → vision cron → OpenViking .63), each verified before the
+  next. **Acceptance:** all consumers green on Model Forge; the broker
+  container stopped and its repo archived; freed resources reported.
+
+Operational guardrails (from the broker skills): never `git reset --hard`
+in `~/work/weights-broker` (a stash holds an old vLLM-Omni experiment);
+infra ops through Gitea, product code through GitHub; commit with explicit
+paths only; test every replacement on throwaway ports/containers first
+(safe-adoption pattern: vLLM on :8001) and never disturb a live TP2 job.
 
 ## 8. Honest difficulty profile
 
