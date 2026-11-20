@@ -217,9 +217,89 @@ def test_probe_hardware_nvidia_and_amd_order(monkeypatch, tmp_path):
     prof = hardware.probe_hardware()
     names = [g["name"] for g in prof.gpus]
     assert names[0] == "NVIDIA A100"        # NVIDIA first (existing behavior)
-    assert names[1:] == ["AMD GPU 0 (ROCm)", "AMD GPU 1 (ROCm)",
-                         "AMD GPU (card0)"]
-    assert prof.total_vram_gb == 40.0 + 48.0 + 4.0
+    # AMD rows come from ONE probe: rocm-smi answers, so the sysfs probe is
+    # its documented fallback — never concatenated (that double-counted VRAM)
+    assert names[1:] == ["AMD GPU 0 (ROCm)", "AMD GPU 1 (ROCm)"]
+    assert prof.total_vram_gb == 40.0 + 48.0
+
+
+# --- PCI marketing names (B4) ----------------------------------------------
+
+def _write_pci_ids(path):
+    path.write_text(
+        "# pci.ids test fixture\n"
+        "8086  Intel Corporation\n"
+        "\t1234  Not a GPU\n"
+        "1002  Advanced Micro Devices, Inc. [AMD/ATI]\n"
+        "\t73bf  Navi 21 [Radeon RX 6800/6800 XT / 6900 XT]\n"
+        "\t\t73bf 1458  Subsystem line — skipped\n"
+        "\t744c\t\tNavi 21 [Radeon RX 6900 XT]\n"
+        "10de  NVIDIA Corporation\n"
+        "\t2204  GA102 [GeForce RTX 3090]\n",
+        encoding="utf-8")
+
+
+def _clear_pci_cache(monkeypatch):
+    monkeypatch.setattr(hardware, "_PCI_NAME_CACHE", {})
+
+
+def test_pci_device_name_lookup(tmp_path, monkeypatch):
+    _clear_pci_cache(monkeypatch)
+    ids = tmp_path / "pci.ids"
+    _write_pci_ids(ids)
+    # 0x-prefixed sysfs ids resolve against bare pci.ids ids
+    assert hardware._pci_device_name(
+        "0x1002", "0x73bf", ids_path=str(ids)) == \
+        "Navi 21 [Radeon RX 6800/6800 XT / 6900 XT]"
+    # tab-separated description variants parse too
+    assert hardware._pci_device_name(
+        "0x1002", "0x744c", ids_path=str(ids)) == "Navi 21 [Radeon RX 6900 XT]"
+    assert hardware._pci_device_name(
+        "0x10de", "0x2204", ids_path=str(ids)) == "GA102 [GeForce RTX 3090]"
+    # unknown pairs and missing inputs degrade to '' — never a guess
+    assert hardware._pci_device_name(
+        "0x1002", "0xffff", ids_path=str(ids)) == ""
+    _clear_pci_cache(monkeypatch)   # no file -> no name, cache or not
+    assert hardware._pci_device_name(
+        "0x1002", "0x73bf", ids_path=str(tmp_path / "none")) == ""
+    assert hardware._pci_device_name("", "0x73bf", ids_path=str(ids)) == ""
+    assert hardware._pci_device_name("0x1002", "", ids_path=str(ids)) == ""
+    # cached: a second lookup of the same pair is served without a re-read
+    # (the cache holds answers — including '' — per pair)
+    _clear_pci_cache(monkeypatch)
+    assert hardware._pci_device_name("0x1002", "0x73bf",
+                                     ids_path=str(ids)) != ""
+    assert hardware._pci_device_name("0x1002", "0x73bf",
+                                     ids_path="/definitely/not/here") != ""
+
+
+def test_amd_sysfs_uses_marketing_name(tmp_path, monkeypatch):
+    _clear_pci_cache(monkeypatch)
+    _patch_platform(monkeypatch)
+    _patch_which(monkeypatch)
+    ids = tmp_path / "pci.ids"
+    _write_pci_ids(ids)
+    monkeypatch.setattr(hardware, "_PCI_IDS_PATHS", (str(ids),))
+    _make_card(tmp_path, "card0", "0x1002", 16 * _GIB)
+    (tmp_path / "card0" / "device" / "device").write_text("0x73bf\n")
+    _patch_drm(monkeypatch, tmp_path)
+    prof = hardware.probe_hardware()
+    assert prof.gpus == (
+        {"name": "Navi 21 [Radeon RX 6800/6800 XT / 6900 XT] (card0)",
+         "vram_gb": 16.0},)
+    assert prof.total_vram_gb == 16.0
+
+
+def test_amd_sysfs_generic_label_without_database(tmp_path, monkeypatch):
+    _clear_pci_cache(monkeypatch)
+    _patch_platform(monkeypatch)
+    _patch_which(monkeypatch)
+    monkeypatch.setattr(hardware, "_PCI_IDS_PATHS", ())
+    _make_card(tmp_path, "card0", "0x1002", 16 * _GIB)
+    (tmp_path / "card0" / "device" / "device").write_text("0x73bf\n")
+    _patch_drm(monkeypatch, tmp_path)
+    prof = hardware.probe_hardware()
+    assert prof.gpus == ({"name": "AMD GPU (card0)", "vram_gb": 16.0},)
 
 
 # --- Apple Silicon unified memory -----------------------------------------

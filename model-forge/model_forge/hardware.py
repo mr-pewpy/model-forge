@@ -7,6 +7,9 @@ Vendor coverage:
 - NVIDIA: nvidia-smi CSV query (discrete VRAM per GPU).
 - AMD: rocm-smi VRAM totals, falling back to amdgpu sysfs
   (/sys/class/drm/cardN/device/mem_info_vram_total, AMD vendor id 0x1002).
+  Marketing names come from the local PCI ids database (read-only lookup,
+  B4): with no database the honest generic label stands — names are cosmetic
+  to fit, which prices against the memory totals.
 - Apple Silicon: unified memory — the GPU addresses the same pool as the CPU,
   so the honest VRAM budget is total RAM; the GPU is labeled as unified and
   platform reads "darwin-arm64" so consumers can tell this is not discrete VRAM.
@@ -35,6 +38,75 @@ _SYS_DRM = "/sys/class/drm"  # amdgpu exposes mem_info_vram_total per card
 _AMD_PCI_VENDOR = "0x1002"
 
 _ROCM_TOTAL_RE = re.compile(r"GPU\[(\d+)\]\s*:.*VRAM Total Memory \(B\):\s*(\d+)")
+
+# The kernel's PCI ids database (pciutils / hwdata) — the honest name source
+# for a PCI vendor:device pair (B4). Read-only lookup, fail-soft: no file, no
+# name, and the generic label stands.
+_PCI_IDS_PATHS = (
+    "/usr/share/hwdata/pci.ids",
+    "/usr/share/misc/pci.ids",
+    "/usr/share/pci.ids",
+)
+_PCI_NAME_CACHE: dict = {}
+
+
+def _pci_ids_path() -> str:
+    for p in _PCI_IDS_PATHS:
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+def _lookup_pci_ids(path: str, vendor_id: str, device_id: str) -> str:
+    """Device description for vendor:device from a pci.ids file. Streams the
+    file once; only the vendor's own device list is matched (subsystem lines
+    are skipped). Separator-robust: the description is whatever follows the
+    id token, whatever whitespace carries it. '' when the pair is not
+    listed."""
+    in_vendor = False
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if line.startswith("\t\t"):
+                continue                     # subsystem lines
+            if line.startswith("\t"):
+                if in_vendor:
+                    parts = line.strip().split(None, 1)
+                    if parts and parts[0].lower() == device_id:
+                        return (parts[1] if len(parts) > 1 else "").strip()
+                continue
+            if line.startswith("#") or not line.strip():
+                continue
+            if in_vendor:
+                break                        # the vendor's section ended
+            if line[:4].lower() == vendor_id and line[4:5] in (" ", "\t"):
+                in_vendor = True
+    return ""
+
+
+def _pci_device_name(vendor_id: str, device_id: str,
+                     ids_path: str | None = None) -> str:
+    """Marketing name for a PCI vendor:device pair, from the local pci.ids
+    database (cached per pair). '' when unknown — never a guess."""
+    vendor_id = (vendor_id or "").strip().lower()
+    device_id = (device_id or "").strip().lower()
+    if vendor_id.startswith("0x"):
+        vendor_id = vendor_id[2:]
+    if device_id.startswith("0x"):
+        device_id = device_id[2:]
+    if not vendor_id or not device_id:
+        return ""
+    key = f"{vendor_id}:{device_id}"
+    if key in _PCI_NAME_CACHE:
+        return _PCI_NAME_CACHE[key]
+    name = ""
+    path = ids_path if ids_path is not None else _pci_ids_path()
+    if path:
+        try:
+            name = _lookup_pci_ids(path, vendor_id, device_id)
+        except OSError:
+            name = ""
+    _PCI_NAME_CACHE[key] = name
+    return name
 
 
 def _minimal_env() -> dict:
@@ -99,7 +171,9 @@ def _probe_amd_rocm() -> tuple[dict, ...]:
 
 
 def _probe_amd_sysfs() -> tuple[dict, ...]:
-    """AMD GPUs via amdgpu sysfs (no CLI needed); silent when not readable."""
+    """AMD GPUs via amdgpu sysfs (no CLI needed); silent when not readable.
+    The label is the PCI marketing name when the local pci.ids database has
+    it (B4), else the honest generic label — never a guessed name."""
     try:
         cards = sorted(
             (e for e in os.listdir(_SYS_DRM) if e.startswith("card") and e[4:].isdigit()),
@@ -119,8 +193,23 @@ def _probe_amd_sysfs() -> tuple[dict, ...]:
             continue
         if vendor != _AMD_PCI_VENDOR:
             continue
-        gpus.append({"name": f"AMD GPU ({card})", "vram_gb": round(raw / (1024**3), 1)})
+        try:
+            with open(os.path.join(dev, "device")) as fh:
+                device = fh.read().strip().lower()
+        except OSError:
+            device = ""
+        name = _pci_device_name(vendor, device)
+        label = f"{name} ({card})" if name else f"AMD GPU ({card})"
+        gpus.append({"name": label, "vram_gb": round(raw / (1024**3), 1)})
     return tuple(gpus)
+
+
+def _probe_amd() -> tuple[dict, ...]:
+    """AMD rows from rocm-smi, falling back to the amdgpu sysfs probe — one
+    row per card, never both probes concatenated (that would double-count
+    VRAM in the fit budget on ROCm machines)."""
+    rows = _probe_amd_rocm()
+    return rows if rows else _probe_amd_sysfs()
 
 
 class _MemoryStatusEx(ctypes.Structure):
@@ -168,7 +257,7 @@ def probe_hardware() -> HardwareProfile:
     apple_silicon = system == "darwin" and machine in ("arm64", "aarch64")
     if system == "darwin":
         system = "macos"
-    probed = _probe_nvidia() + _probe_amd_rocm() + _probe_amd_sysfs()
+    probed = _probe_nvidia() + _probe_amd()
     ram = _ram_gb()
     if apple_silicon:
         # Unified memory: the GPU addresses the same pool as the CPU, so the
