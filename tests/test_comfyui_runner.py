@@ -12,7 +12,9 @@ Covered, per the port contract:
     only; size -> width/height; unknown keys ignored; nested upload resolves);
   * 405 retry loop then success, and 405 exhaustion -> ok False;
   * upload normalisation writing the nested ``{"upload": {"path": ...}}`` shape;
-  * history polling collecting image / video / 3d outputs;
+  * history polling collecting image / video / 3d outputs — including the
+    ai-dock drift where video outputs land in the ``images`` bucket with
+    ``metadata.kind == "video"`` (p5-integration §11.5);
   * free() posting /free; alive() fail-soft.
 """
 
@@ -669,3 +671,103 @@ def test_run_video_lane_injects_seconds_onto_value_node(tmp_path):
     # seconds -> node 111 value (the lane's PrimitiveFloat), prompt -> node 104
     assert graph["111"]["inputs"]["value"] == 4.0
     assert graph["104"]["inputs"]["prompt"] == "x"
+
+
+# --- images-bucket video items (history-bucket drift, p5 §11.5) ------------
+
+def _video_in_images_entry(filename="clip.mp4", subfolder="", node="92",
+                           kind="video"):
+    """History entry as the production ai-dock ComfyUI writes SaveVideo
+    outputs: the video lands in the ``images`` bucket carrying
+    ``metadata.kind == "video"`` (plus an ``animated`` flag), NOT in a
+    ``videos``/``results`` bucket."""
+    return {"status": {"status_str": "success", "messages": []},
+            "outputs": {node: {"images": [
+                {"filename": filename, "subfolder": subfolder,
+                 "type": "output",
+                 "metadata": {"kind": kind, "animated": [True]}}]}}}
+
+
+def test_images_bucket_video_item_collects_as_video(tmp_path):
+    # The drifted shape the ComfyUI-side mf_video_bucket_fix shim used to
+    # alias: a video-kind item in the images bucket must now collect as a
+    # video output on its own — ok=True, output_kind=video, file collected.
+    http = FakeHTTP()
+    http.history = _video_in_images_entry(filename="clip.mp4",
+                                          subfolder="video")
+    r = make_runner(http)
+    res = r.run("h3-t2v", {"prompt": "x"}, assets_dir=str(tmp_path),
+                job_id="j")
+    assert res["ok"] is True and res["output_kind"] == "video"
+    assert res["files"] == ["/output/video/clip.mp4"]
+    row = res["meta"]["outputs"][0]
+    assert row["kind"] == "video" and row["bucket"] == "images"
+    assert row["path"] == "/output/video/clip.mp4"
+
+
+def test_mixed_images_bucket_collects_each_item_by_kind(tmp_path):
+    # one images bucket carrying a plain image AND a video-kind item: each
+    # must collect under its own kind, the video lane never sweeping the
+    # image in and the image lane never sweeping the video in.
+    entry = {"status": {"status_str": "success", "messages": []},
+             "outputs": {"9": {"images": [
+                 {"filename": "pic.png", "subfolder": "", "type": "output"},
+                 {"filename": "clip.mp4", "subfolder": "", "type": "output",
+                  "metadata": {"kind": "video"}}]}}}
+    http = FakeHTTP()
+    http.history = entry
+    r = make_runner(http)
+    res_v = r.run("h3-t2v", {"prompt": "x"}, assets_dir=str(tmp_path),
+                  job_id="jv")
+    assert res_v["ok"] is True and res_v["output_kind"] == "video"
+    assert res_v["files"] == ["/output/clip.mp4"]        # not the image
+    res_i = r.run("moss-image", {"prompt": "x"}, assets_dir=str(tmp_path),
+                  job_id="ji")
+    assert res_i["ok"] is True and res_i["output_kind"] == "image"
+    assert res_i["files"] == ["/output/pic.png"]         # not the video
+
+
+def test_video_kind_marker_is_read_liberally(tmp_path):
+    # the marker may sit in properties instead of metadata and matches
+    # case-insensitively — accept whatever identifies a video kind.
+    http = FakeHTTP()
+    http.history = {"status": {"status_str": "success", "messages": []},
+                    "outputs": {"92": {"images": [
+                        {"filename": "a.mp4", "subfolder": "",
+                         "type": "output",
+                         "properties": {"kind": "Video"}}]}}}
+    r = make_runner(http)
+    res = r.run("h3-t2v", {}, assets_dir=str(tmp_path), job_id="j")
+    assert res["ok"] is True and res["files"] == ["/output/a.mp4"]
+
+
+def test_video_bucket_and_gifs_collection_unchanged(tmp_path):
+    # regression guard: the dedicated video buckets (videos/results/gifs)
+    # keep collecting exactly as before — no metadata required.
+    http = FakeHTTP()
+    http.history = {"status": {"status_str": "success", "messages": []},
+                    "outputs": {"92": {
+                        "videos": [{"filename": "v.mp4", "subfolder": "",
+                                    "type": "output"}],
+                        "results": [{"filename": "r.mp4", "subfolder": "",
+                                     "type": "output"}],
+                        "gifs": [{"filename": "g.gif", "subfolder": "g",
+                                  "type": "output"}]}}}
+    r = make_runner(http)
+    res = r.run("h3-t2v", {}, assets_dir=str(tmp_path), job_id="j")
+    assert res["ok"] is True and res["output_kind"] == "video"
+    assert set(res["files"]) == {"/output/v.mp4", "/output/r.mp4",
+                                 "/output/g/g.gif"}
+
+
+def test_images_bucket_video_item_still_skips_missing_filename():
+    # the honest skip-empty-filename behavior applies to the new lane too:
+    # a video-marked item with no filename is not a real output.
+    r = make_runner(FakeHTTP())
+    entry = {"outputs": {"92": {"images": [
+        {"subfolder": "", "type": "output", "metadata": {"kind": "video"}},
+        {"filename": "real.mp4", "subfolder": "", "type": "output",
+         "metadata": {"kind": "video"}}]}}}
+    items = r._collect_outputs(entry, "video")
+    assert [i["filename"] for i in items] == ["real.mp4"]
+    assert items[0]["path"] == "/output/real.mp4"

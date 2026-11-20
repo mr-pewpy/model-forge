@@ -3629,3 +3629,115 @@ def test_engine_install_approval_shows_the_exact_executed_command(
     st = _poll_until_done(started["job_id"])
     assert spy_stage == ["ollama"]
     assert calls[0] == st["executed_command"]
+
+
+# --- tools.py: facade activation of cataloged-but-unregistered ids (P5 §8) ---
+#
+# The facade chat id Qwen/Qwen3.8-27B-FP8 is a /v1/models catalog id with no
+# curated-registry entry, so facade=true used to refuse it and activation fell
+# back to manual operator steps. For FACADE activations, an id the target's own
+# /v1/models advertises (or one aliases.resolve maps to such an id) must plan +
+# write; anything else still refuses honestly. The human-approval gate
+# (policy_hook) is unchanged and stays fail-closed.
+
+_FACADE_CHAT_ID = "Qwen/Qwen3.8-27B-FP8"
+
+
+def test_activate_facade_accepts_cataloged_but_unregistered_id(tmp_path,
+                                                               monkeypatch):
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat", "vision"))
+    _persist_stub(monkeypatch)
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: [_FACADE_CHAT_ID])
+    # premise: the id is genuinely absent from the curated registry
+    assert all(m.id != _FACADE_CHAT_ID for m in models_for())
+
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": _FACADE_CHAT_ID, "target": "gpu-box", "facade": True,
+         "apply": True}))
+    assert out["ok"] is True and out["facade"] is True
+    assert out["applied"] is True
+    assert out["custom_provider"]["applied"] is True
+    assert out["auxiliary_vision"]["applied"] is True
+    # canonical-id-on-write: the requested id IS its canonical form here
+    assert out["model"] == _FACADE_CHAT_ID
+    saved = json.loads(cfg_mod.path.read_text())
+    assert saved["auxiliary"]["vision"]["model"] == _FACADE_CHAT_ID
+    assert _FACADE_CHAT_ID in saved["custom_providers"][0]["models"]
+
+
+def test_activate_facade_accepts_alias_that_resolves_to_cataloged_id(
+        tmp_path, monkeypatch):
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat", "vision"))
+    _persist_stub(monkeypatch)
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: [_FACADE_CHAT_ID])
+    legacy = "vision/minicpm-v-4.6"          # aliases.resolve -> canonical
+    assert all(m.id != legacy for m in models_for())
+
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": legacy, "target": "gpu-box", "facade": True,
+         "apply": True}))
+    assert out["ok"] is True and out["applied"] is True
+    assert out["model"] == _FACADE_CHAT_ID   # canonical-id-on-write
+    saved = json.loads(cfg_mod.path.read_text())
+    assert saved["auxiliary"]["vision"]["model"] == _FACADE_CHAT_ID
+    assert legacy not in json.dumps(saved)   # the alias is never written
+
+
+def test_activate_facade_id_absent_everywhere_refuses_honestly(tmp_path,
+                                                               monkeypatch):
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat",))
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: [_FACADE_CHAT_ID])
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "totally/unknown-id", "target": "gpu-box",
+         "facade": True, "apply": True}))
+    assert "error" in out
+    assert "unknown model_id" in out["error"] and "totally/unknown-id" in \
+        out["error"]
+    assert json.loads(cfg_mod.path.read_text()) == {}      # nothing written
+
+
+def test_activate_facade_unverifiable_catalog_refuses_fail_closed(
+        tmp_path, monkeypatch):
+    # the catalog fetch is fail-soft for the plan's model LIST, but an
+    # unverifiable id must never be activated: refuse honestly instead.
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat",))
+
+    def _boom(base, timeout=2.0):
+        raise OSError("connection refused")
+    monkeypatch.setattr(tools, "_fetch_facade_models", _boom)
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": _FACADE_CHAT_ID, "target": "gpu-box", "facade": True,
+         "apply": True}))
+    assert "error" in out
+    assert "connection refused" in out["error"]   # honest reason, named cause
+    assert json.loads(cfg_mod.path.read_text()) == {}
+
+
+def test_activate_facade_unregistered_id_gate_is_fail_closed(tmp_path,
+                                                             monkeypatch):
+    from model_forge import tools as _tools
+    args = {"model_id": _FACADE_CHAT_ID, "target": "gpu-box", "facade": True,
+            "apply": True}
+    # the human-approval gate escalates apply=true for the unregistered id
+    # exactly as for a registry id — a denial blocks the call BEFORE the
+    # handler runs (fail-closed), so nothing is ever written.
+    d = _tools.policy_hook("model_forge_activate", args)
+    assert d is not None and d["action"] == "approve"
+    assert d["rule_key"] == "model-forge:activate"
+    assert _FACADE_CHAT_ID in d["message"]
+    # plan-only needs no approval and writes nothing even for this id
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat", "vision"))
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: [_FACADE_CHAT_ID])
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": _FACADE_CHAT_ID, "target": "gpu-box", "facade": True}))
+    assert out["ok"] is True and out["applied"] is False
+    assert json.loads(cfg_mod.path.read_text()) == {}

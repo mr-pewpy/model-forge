@@ -38,6 +38,7 @@ raising probe reports a negative readiness, never an exception).
 from __future__ import annotations
 
 import json
+import math
 import mimetypes
 import os
 import threading
@@ -302,6 +303,13 @@ class FacadeConfig:
     # The ai-dock image mounts its output dir at /output; a stub deployment
     # points this at a stub-writable dir under assets_dir so /assets serves it.
     comfy_output_dir: str = "/output"
+    # ComfyUI args file the serve preflight checks for ``--novram`` (empty =
+    # unchecked; env ``COMFY_ARGS_FILE``, FACADE_CONFIG settable). On .62 it is
+    # /data/broker/comfy_args.conf bind-mounted read-only at
+    # /etc/comfyui_args.conf — and it was silently emptied 2026-09-22, after
+    # which every h3 video run OOMd (the h3 models REQUIRE --novram on a 24 GB
+    # card). See :func:`comfy_args_state`.
+    comfy_args_file: str = ""
 
     @classmethod
     def from_env(cls, **overrides) -> "FacadeConfig":
@@ -312,6 +320,32 @@ class FacadeConfig:
         (or the dataclass constructor) always wins over the environment.
         """
         return cls(**overrides)
+
+
+def comfy_args_state(path: str) -> str:
+    """``--novram`` verdict for the ComfyUI args file: ``"novram-ok"`` /
+    ``"novram-missing"`` / ``"unchecked"``.
+
+    WHY: on .62 the h3 video models REQUIRE ``--novram`` on a 24 GB card and
+    the args file (``/data/broker/comfy_args.conf``, bind-mounted read-only at
+    ``/etc/comfyui_args.conf``) was silently emptied 2026-09-22 — every h3 run
+    OOMd afterwards and nothing surfaced the drift. serve.py logs this verdict
+    at startup (an honest WARNING when the flag is confirmed absent) and
+    ``GET /health`` reports it; neither hard-fails.
+
+    Honest states only: no path configured — or a named file that cannot be
+    read — is ``"unchecked"`` (the flag can be neither confirmed nor denied;
+    the startup log carries the note naming the file). A readable file whose
+    args lack the ``--novram`` token is ``"novram-missing"`` (confirmed OOM
+    risk); one carrying it is ``"novram-ok"``.
+    """
+    if not path:
+        return "unchecked"
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "unchecked"
+    return "novram-ok" if "--novram" in text.split() else "novram-missing"
 
 
 # An upstream call: (raw_body_bytes, headers) -> (status:int, body:bytes).
@@ -502,11 +536,19 @@ class FacadeService:
         return _probe
 
     def health(self) -> dict:
-        """Lane readiness, fail-soft (mirrors the broker's /health loosely)."""
+        """Lane readiness, fail-soft (mirrors the broker's /health loosely).
+
+        ``comfy_args`` surfaces the serve preflight's ``--novram`` verdict for
+        the ComfyUI args file (see :func:`comfy_args_state`): ``novram-ok`` /
+        ``novram-missing`` / ``unchecked``. It is read live so the field can
+        never drift from the file on disk.
+        """
         llm = bool(self._probe("llm", False))
         comfy = bool(self._probe("comfy", False))
         mode = self._probe("mode", "unknown")
-        return {"llm": llm, "comfy": comfy, "mode": mode, "ok": llm}
+        return {"llm": llm, "comfy": comfy, "mode": mode,
+                "comfy_args": comfy_args_state(self.config.comfy_args_file),
+                "ok": llm}
 
     # -- chat passthrough ----------------------------------------------------
 
@@ -758,14 +800,21 @@ class FacadeService:
           ``size`` -> ``aspect_ratio`` + ``width``/``height``;
         * video lanes (``_openai_video_params``): ``seconds`` -> float,
           ``size`` -> ``resolution``;
-        * the generic job route (broker ``generate``): drops ``model`` only;
+        * the generic job route (broker ``generate``): drops ``model`` only
+          (``_timeout`` too, see below);
         * then ``image_url`` -> ``image`` (both helpers, and the broker).
+
+        ``_timeout`` is dropped on every route (video and generic included):
+        it is a transport budget (the runner poll deadline), never a workflow
+        param, so it must not reach the stored job params or the injection
+        map.
 
         The size/second helpers are the runner's own pure functions, reused so
         the stored params cannot drift from what ``run`` later injects.
         """
         if kind == "video":
-            params = {k: v for k, v in body.items() if k != "model"}
+            params = {k: v for k, v in body.items()
+                      if k not in ("model", "_timeout")}
             try:
                 if _cf_expand_video is not None:
                     _cf_expand_video(params)
@@ -779,7 +828,8 @@ class FacadeService:
             if params.get("size") and _cf_expand_size is not None:
                 _cf_expand_size(params)
         else:
-            params = {k: v for k, v in body.items() if k != "model"}
+            params = {k: v for k, v in body.items()
+                      if k not in ("model", "_timeout")}
         if params.get("image_url"):
             params["image"] = params["image_url"]
         params.pop("image_url", None)
@@ -804,10 +854,77 @@ class FacadeService:
         (never silently absorbed)."""
         return _DEFER_NOTE if self._has_image_ref(body) else None
 
+    def _request_budget(self, body: dict, default: float | None = None
+                        ) -> float | None:
+        """The request's ``_timeout`` budget in seconds (float), or ``default``.
+
+        One parse rule for every gen route: ``None``/absent/unparseable falls
+        back to ``default`` (the sync image route passes its 1200 s default;
+        the async video routes pass ``None`` — no budget, the runner's own
+        history window applies, which is exactly today's behavior).
+        """
+        raw = body.get("_timeout")
+        if raw is None:
+            return default
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return default
+        # A non-finite budget (JSON can carry 1e400 -> inf) would blow up
+        # Thread.join with OverflowError — treat it like unparseable.
+        return value if math.isfinite(value) else default
+
     def _dispatch_job(self, jid: str, workflow_id: str, params: dict,
-                      kind: str) -> None:
+                      kind: str,
+                      timeout_s: float | None = None) -> None:
         self._dispatch(
-            lambda: self._run_gen_job(jid, workflow_id, params, kind))
+            lambda: self._run_gen_job(jid, workflow_id, params, kind,
+                                      timeout_s=timeout_s))
+
+    def _run_bounded(self, workflow_id: str, params: dict, run_kwargs: dict,
+                     budget: float | None) -> dict:
+        """Run the runner under a wall-clock budget; ``budget=None`` runs inline.
+
+        WHY this is the facade's own deadline and not just the runner's
+        ``timeout_s`` seam: ``ComfyWorkflowRunner.run`` bounds its poll COUNT,
+        and each poll can block on an HTTP request timeout — a stalled or
+        black-holed ComfyUI can hold the caller (and the claimed GPU lane) far
+        past the request's ``_timeout``. A request budget is a WALL-clock
+        promise (the broker blocked its worker for up to ``_timeout`` s before
+        answering 504), so the call runs on a daemon worker thread joined for
+        the budget and an overrun is an honest 'timed out after Ns' result —
+        ``_run_gen_job``'s ``finally`` then releases the claim and frees the
+        runner, unpinning the gen lane instead of holding it for the runner's
+        3600 s default window. The budget is ALSO handed to ``run`` (the seam
+        clamps to its history ceiling) so a well-behaved runner stays bounded
+        itself. A daemon worker means an overrunning runner can never pin
+        process exit; its late result is discarded (the row is already
+        honestly terminal).
+        """
+        if budget is None:
+            return self._runner.run(workflow_id, params, **run_kwargs) or {}
+        box: dict = {}
+
+        def _call():
+            try:
+                box["result"] = self._runner.run(workflow_id, params,
+                                                 **run_kwargs)
+            except Exception as e:   # noqa: BLE001 — captured into box; the
+                # caller reads box["result"]/["exc"]. A timed-out worker's
+                # late exception is DISCARDED once the row is terminal.
+                box["exc"] = e
+
+        worker = threading.Thread(target=_call, daemon=True)
+        worker.start()
+        worker.join(max(0.0, float(budget)))
+        if worker.is_alive():
+            return {"ok": False, "files": [],
+                    "reason": (f"timed out after {float(budget):g}s (request "
+                               f"_timeout budget expired before the runner "
+                               f"reported)")}
+        if "exc" in box:
+            raise box["exc"]
+        return box.get("result") or {}
 
     def _run_gen_job(self, jid: str, workflow_id: str, params: dict,
                      kind: str,
@@ -868,7 +985,8 @@ class FacadeService:
                                 "job_id": jid}
             if timeout_s is not None:
                 run_kwargs["timeout_s"] = timeout_s
-            result = self._runner.run(workflow_id, params, **run_kwargs) or {}
+            result = self._run_bounded(workflow_id, params, run_kwargs,
+                                       timeout_s)
             if result.get("ok"):
                 files = [str(p) for p in (result.get("files") or [])]
                 self._jobs.update(jid, status="done",
@@ -896,8 +1014,12 @@ class FacadeService:
         """OpenAI-compatible SYNC image generation -> ``{"data":[{"url"}]}``.
 
         Blocks until the job is terminal: the request's ``_timeout`` (default
-        1200 s, broker main.py ~1670) IS the budget, honoured as the runner's
-        poll deadline (clamped to the runner's own ``history_timeout_s``) —
+        1200 s, broker main.py ~1670) IS the budget, honoured BOTH as the
+        runner's poll deadline (clamped to the runner's own
+        ``history_timeout_s``) AND as a facade wall-clock deadline (the sync
+        route always passes a budget, so every sync image job runs on the
+        bounded path and is cut at its budget instead of riding the runner's
+        full history window) —
         the broker blocked on its worker for up to ``_timeout``s before
         answering 504. Hermes' image_generate tool and the image plugin read
         exactly this shape. Params are normalized to the broker's stored shape
@@ -913,10 +1035,8 @@ class FacadeService:
                                                  want_kind="image")
         if werr is not None:
             return werr
-        try:
-            budget = float(body.get("_timeout", 1200))
-        except (TypeError, ValueError):
-            budget = 1200.0
+        # One parse rule for every gen route (incl. non-finite rejection).
+        budget = self._request_budget(body or {}, 1200.0)
         params = self._normalize_gen_params(body, kind="image")
         jid = self._jobs.create("gen", wf_id, params,
                                 note=self._defer_note(body))
@@ -933,7 +1053,14 @@ class FacadeService:
                                 "data": [{"url": u} for u in urls]})
 
     def handle_video_submit(self, raw: bytes) -> tuple[int, bytes]:
-        """``POST /v1/videos`` — async submit -> ``{id,status:'queued',model}``."""
+        """``POST /v1/videos`` — async submit -> ``{id,status:'queued',model}``.
+
+        The body's optional ``_timeout`` (float seconds, sync image route
+        parity) is the job's wall-clock budget: on expiry the row ends failed
+        with an honest 'timed out after Ns' reason and the claim is released
+        (the gen lane is not pinned for the runner's 3600 s default window).
+        Absent ``_timeout`` keeps today's behavior (the runner's own history
+        budget)."""
         err = self._require_runner()
         if err is not None:
             return err
@@ -947,7 +1074,8 @@ class FacadeService:
         params = self._normalize_gen_params(body, kind="video")
         jid = self._jobs.create("gen", wf_id, params,
                                 note=self._defer_note(body))
-        self._dispatch_job(jid, wf_id, params, "video")
+        self._dispatch_job(jid, wf_id, params, "video",
+                           timeout_s=self._request_budget(body))
         return self._json(200, {"id": jid, "status": "queued", "model": wf_id})
 
     def handle_video_generations(self, raw: bytes) -> tuple[int, bytes]:
@@ -955,7 +1083,8 @@ class FacadeService:
 
         No output_kind check here (the broker did none): the request is a
         workflow job, and the reply carries the ``poll``/``asset`` pointers a
-        client follows."""
+        client follows. The optional ``_timeout`` budget behaves exactly as on
+        ``POST /v1/videos`` (see :meth:`handle_video_submit`)."""
         err = self._require_runner()
         if err is not None:
             return err
@@ -968,7 +1097,8 @@ class FacadeService:
         params = self._normalize_gen_params(body, kind=None)
         jid = self._jobs.create("gen", wf_id, params,
                                 note=self._defer_note(body))
-        self._dispatch_job(jid, wf_id, params, "video")
+        self._dispatch_job(jid, wf_id, params, "video",
+                           timeout_s=self._request_budget(body))
         return self._json(200, {"id": jid, "status": "queued", "model": wf_id,
                                 "poll": f"/jobs/{jid}",
                                 "asset": f"/assets/{jid}"})

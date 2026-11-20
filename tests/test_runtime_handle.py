@@ -545,6 +545,27 @@ def test_runtime_lifecycle_for_fails_closed_on_unmappable_shape():
         runtime_lifecycle_for(bare)
 
 
+def test_runtime_lifecycle_for_missing_keys_name_the_key():
+    """A duck-typed entry (no parse validation) whose container runtime dict
+    lacks ``name``/``health_url`` must fail with a clear ValueError NAMING the
+    missing key — the promised fail-closed posture — never a bare KeyError
+    from the constructor call."""
+    class _Bare:                       # a duck-typed entry with no validation
+        id = "bare"
+        engines = ("comfyui",)
+        runtime = None
+
+    bare = _Bare()
+    setattr(bare, "runtime", {"kind": "container", "health_url": "http://x",
+                              "boot_budget_s": 60.0})          # no name
+    with pytest.raises(ValueError, match="no name"):
+        runtime_lifecycle_for(bare)
+    setattr(bare, "runtime", {"kind": "container", "name": "c",
+                              "boot_budget_s": 60.0})       # no health_url
+    with pytest.raises(ValueError, match="no health_url"):
+        runtime_lifecycle_for(bare)
+
+
 def test_runtime_lifecycle_for_passes_seams_and_engine_id_override():
     clock = FakeClock()
     runner = FakeDockerRunner()

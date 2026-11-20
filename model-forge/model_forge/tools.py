@@ -984,6 +984,46 @@ def _current_custom_providers() -> list[dict]:
         return []
 
 
+def _facade_catalog_entry(requested: str, target: ComputeTarget):
+    """Registry-free entry for a facade id the target's ``/v1/models`` catalog
+    advertises (P5 §8: the facade chat id ``Qwen/Qwen3.8-27B-FP8`` is a
+    CATALOG id, not a curated-registry entry — ``model_forge_activate`` used
+    to refuse it and activation fell back to manual operator steps).
+
+    Acceptance is fail-closed: the id must be present in the target's own
+    catalog, or ``aliases.resolve`` must map it to a cataloged id (the facade
+    resolves aliases anyway; the config writes the CANONICAL id). An
+    unreachable catalog refuses with an honest reason rather than activating
+    an id nobody could verify — the fetch stays fail-soft for the plan's
+    model LIST, but presence is the acceptance criterion here.
+
+    The returned entry is synthetic: modality chat (activation connects a
+    chat/vision default) and engines covering what an OpenAI-compatible
+    facade can front — the match only selects the provider slug, which is
+    ``custom`` for all of them, and the plan path (plus the human-approval
+    gate) is the registry one, unchanged. Returns ``(entry, refusal)`` —
+    exactly one of the two is set.
+    """
+    base_v1 = root_url(target.base_url) + "/v1"
+    canonical = resolve(requested)
+    try:
+        catalog = _fetch_facade_models(base_v1)
+    except Exception as exc:  # noqa: BLE001 — honest refusal, never a raise
+        return None, (f"unknown model_id: {requested!r} is not in the curated "
+                      f"registry and {base_v1}/models could not be fetched to "
+                      f"confirm it ({type(exc).__name__}: {exc}) — refusing "
+                      f"an unverifiable id (fail-closed)")
+    names = set(catalog)
+    if requested not in names and canonical not in names:
+        return None, (f"unknown model_id: {requested!r} is neither in the "
+                      f"curated registry nor advertised by {base_v1}/models "
+                      f"(its aliases resolve to {canonical!r}, also absent)")
+    entry = ModelEntry(id=canonical, name=canonical, modality="chat",
+                       engines=("openai-compatible", "vllm", "sglang"),
+                       source=canonical)
+    return entry, None
+
+
 def _facade_plan_surfaces(plan: dict, *, providers, loader=None) -> dict:
     """Augment an ok activation *plan* for a FACADE target with both Hermes
     consumer surfaces (custom_providers + auxiliary.vision).
@@ -1604,7 +1644,10 @@ def model_forge_activate(args: dict | None = None, **kwargs) -> str:
     otherwise) AND ``auxiliary.vision`` (model + base_url for the vision lane).
     A legacy alias in the requested/served model id is written as its CANONICAL
     id (the facade resolves aliases anyway; config names what /v1/models
-    advertises). Engine-native activations are unchanged.
+    advertises). Engine-native activations are unchanged. For facade=true a
+    registry-less id is also accepted when the TARGET's own /v1/models catalog
+    advertises it (or aliases.resolve maps it to a cataloged id) — fail-closed,
+    an honest refusal otherwise.
 
     Tests exercise the REAL write path against real ``hermes_cli.config``
     load/save semantics (an isolated config in a temp home); the two facade
@@ -1623,6 +1666,18 @@ def model_forge_activate(args: dict | None = None, **kwargs) -> str:
         entry = next((m for m in models_for() if m.id == model_id), None)
         if entry is None:
             entry = next((m for m in models_for() if m.id == requested), None)
+        if entry is None and args.get("facade") is True:
+            # P5 §8: a facade activation may name a CATALOG id the curated
+            # registry has no entry for (the facade chat id
+            # Qwen/Qwen3.8-27B-FP8). Accept exactly what the target's own
+            # /v1/models advertises (or what an alias resolves to there) —
+            # fail-closed, with an honest refusal for anything else.
+            catalog_target = get_target(args.get("target"))
+            if catalog_target is None:
+                return _dump({"error": f"unknown target: {args.get('target')}"})
+            entry, refusal = _facade_catalog_entry(requested, catalog_target)
+            if entry is None:
+                return _dump({"error": refusal})
         if entry is None:
             return _dump({"error": f"unknown model_id: {requested}"})
         target = get_target(args.get("target"))

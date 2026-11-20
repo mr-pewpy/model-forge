@@ -53,6 +53,7 @@ from .facade import (
     GEN_MODELS,
     FacadeConfig,
     FacadeService,
+    comfy_args_state,
     make_handler,
 )
 from .registry import ModelEntry, registry_bookings
@@ -61,6 +62,7 @@ __all__ = [
     "build_stack",
     "graceful_close",
     "main",
+    "preflight_comfy_args",
     "release_scopes",
     "resolve_settings",
 ]
@@ -286,6 +288,11 @@ _ENV_TO_FIELD = {
     "CHAT_BOOT_S": "chat_boot_s",
     "GEN_BOOT_S": "gen_boot_s",
     "COMFY_OUTPUT_DIR": "comfy_output_dir",
+    # The ComfyUI args file the startup preflight checks for --novram (the h3
+    # video models require it on a 24 GB card; see facade.comfy_args_state for
+    # the 2026-09-22 incident this guards against). Also FACADE_CONFIG
+    # settable under either spelling.
+    "COMFY_ARGS_FILE": "comfy_args_file",
 }
 
 # The fields a file or an explicit override may set: exactly those reachable
@@ -399,6 +406,37 @@ def _log(message: str) -> None:
     """Journal-friendly line to stdout (systemd/console read plain lines)."""
     print(f"[model-forge-serve] {message}", flush=True)
 
+def preflight_comfy_args(config: FacadeConfig, *, log=_log) -> str:
+    """Startup preflight for the ComfyUI args file (``COMFY_ARGS_FILE``).
+
+    The h3 video models REQUIRE ``--novram`` on a 24 GB card and the args file
+    on .62 (``/data/broker/comfy_args.conf``, bind-mounted read-only at
+    ``/etc/comfyui_args.conf``) was silently emptied 2026-09-22 — every h3 run
+    OOMd afterwards and nothing surfaced the drift. This check exists so that
+    drift is LOUD: a file present without the flag logs an honest WARNING
+    naming the file and the consequence (video OOM risk); a named file that is
+    missing logs an honest note (the flag can be neither confirmed nor
+    denied); a file carrying the flag logs the checked state. WARN, never
+    hard-fail — a bad args file must not stop the facade from serving chat and
+    image. Returns the ``/health`` ``comfy_args`` verdict (``novram-ok`` /
+    ``novram-missing`` / ``unchecked`` — see ``facade.comfy_args_state``).
+    """
+    path = str(config.comfy_args_file or "")
+    state = comfy_args_state(path)
+    if not path:
+        return state                      # not configured -> unchecked, quiet
+    if state == "novram-missing":
+        log(f"WARNING: {path} exists but has no --novram flag — the h3 video "
+            "models require --novram on a 24 GB card, so every h3 video run "
+            "risks a VRAM OOM (comfy_args: novram-missing)")
+    elif state == "unchecked":
+        log(f"note: COMFY_ARGS_FILE names {path} but the file is missing or "
+            "unreadable — --novram cannot be confirmed (comfy_args: unchecked)")
+    else:
+        log(f"comfy args preflight: --novram present in {path} "
+            "(comfy_args: novram-ok)")
+    return state
+
 
 def release_scopes(orchestrator) -> list[str]:
     """Release every still-open scope on ``orchestrator`` (idempotent, honest).
@@ -461,6 +499,9 @@ def main(argv=None) -> int:
     config, host, port = resolve_settings()
     stack = build_stack(config)
     service = stack["service"]
+    # Startup preflight: name the --novram drift loudly before serving (the
+    # h3 video lanes OOM without it; warn, never hard-fail).
+    preflight_comfy_args(config)
 
     server = ThreadingHTTPServer((host, port), make_handler(service))
     # Finish in-flight requests on close instead of dropping them.

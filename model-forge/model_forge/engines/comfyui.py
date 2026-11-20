@@ -11,6 +11,12 @@ collect outputs by kind, free the cache between jobs. Templates + the lane
 registry live in the ``model_forge.workflows`` package (ported verbatim); this
 module is the engine that runs them.
 
+Output collection is kind-aware, not bucket-name-only: the production ai-dock
+ComfyUI records SaveVideo/GIFMetaData outputs in the history entry's
+``images`` bucket with ``metadata.kind == "video"`` instead of a ``videos``
+bucket, so video collection also scans ``images`` for video-marked items (see
+``_collect_outputs``), retiring the ComfyUI-side ``mf_video_bucket_fix`` shim.
+
 Everything is stdlib-only. The HTTP callable is injectable (``http=``) and the
 sleep is injectable (``sleep=``) so tests drive the whole flow with fakes and
 never touch the network — the same seam style the broker lifecycle adapters in
@@ -54,7 +60,9 @@ _SIZE_TO_ASPECT = {
 
 # Which ComfyUI history output buckets a lane's ``output_kind`` collects.
 # image: SaveImage -> ``images``. video: SaveVideo/VideoCombine -> ``videos``
-# (newer) or the legacy ``results``/``gifs`` buckets. 3d: SaveGLB -> ``3d``
+# (newer) or the legacy ``results``/``gifs`` buckets — plus video-marked items
+# the shared ``images`` bucket carries on the drifting ai-dock tree (handled
+# in ``_collect_outputs``, see ``_item_is_video``). 3d: SaveGLB -> ``3d``
 # (no current lane uses it, but the collector supports it so a future lane
 # works without touching the runner).
 _OUTPUT_BUCKETS = {
@@ -62,6 +70,25 @@ _OUTPUT_BUCKETS = {
     "video": ("videos", "results", "gifs"),
     "3d": ("3d",),
 }
+
+
+def _item_is_video(item: dict) -> bool:
+    """True when a history bucket item's metadata (or properties) marks it as
+    a video output.
+
+    The production ai-dock ComfyUI records SaveVideo/GIFMetaData outputs in
+    the entry's ``images`` bucket with ``metadata.kind == "video"`` (plus an
+    ``animated`` flag) — see docs/tasks/p5-integration.md §11.5 — so the
+    bucket name alone cannot route these items. Liberal on purpose: the
+    marker is honoured wherever it sits (the item itself, its ``metadata`` or
+    its ``properties`` mapping) and matches case-insensitively, because the
+    shim-era shapes vary across node versions."""
+    for source in (item, item.get("metadata"), item.get("properties")):
+        if isinstance(source, dict):
+            kind = source.get("kind")
+            if isinstance(kind, str) and kind.strip().lower() == "video":
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -505,9 +532,31 @@ class ComfyWorkflowRunner:
         """Collect a finished history entry's outputs for ``output_kind`` into
         flat rows carrying the node id + resolved absolute path. Only the
         buckets for this kind are read, so an image lane never confuses a
-        stray ``images`` bucket in another output kind's node."""
+        stray ``images`` bucket in another output kind's node.
+
+        The shared ``images`` bucket additionally gets a kind-aware pass: the
+        production ai-dock ComfyUI records SaveVideo/GIFMetaData outputs there
+        with ``metadata.kind == "video"`` (p5-integration §11.5), so video
+        collection picks those items up while image collection skips them —
+        in a mixed bucket each item collects under its own kind. The
+        skip-empty-filename honesty and row shape are unchanged everywhere."""
         buckets = _OUTPUT_BUCKETS.get(output_kind, ())
         items: list[dict] = []
+
+        def add(bucket: str, item: dict) -> None:
+            fn = item.get("filename", "") or ""
+            if not fn:
+                # a bucket item with no filename is not a real output;
+                # skip it so it cannot count toward the done test.
+                return
+            sub = item.get("subfolder", "") or ""
+            path = os.path.join(self._output_dir, sub, fn)
+            items.append({
+                "node": node_id, "kind": output_kind, "bucket": bucket,
+                "filename": fn, "subfolder": sub,
+                "type": item.get("type", "output"), "path": path,
+            })
+
         for node_id, out in (entry.get("outputs") or {}).items():
             if not isinstance(out, dict):
                 continue
@@ -515,18 +564,16 @@ class ComfyWorkflowRunner:
                 for item in (out.get(bucket) or []):
                     if not isinstance(item, dict):
                         continue
-                    fn = item.get("filename", "") or ""
-                    if not fn:
-                        # a bucket item with no filename is not a real output;
-                        # skip it so it cannot count toward the done test.
+                    if output_kind != "video" and _item_is_video(item):
+                        # a video-kind item parked in this bucket belongs to
+                        # the video collection, never this kind's.
                         continue
-                    sub = item.get("subfolder", "") or ""
-                    path = os.path.join(self._output_dir, sub, fn)
-                    items.append({
-                        "node": node_id, "kind": output_kind, "bucket": bucket,
-                        "filename": fn, "subfolder": sub,
-                        "type": item.get("type", "output"), "path": path,
-                    })
+                    add(bucket, item)
+            if output_kind == "video":
+                # bucket-drift pass: video outputs hiding in ``images``.
+                for item in (out.get("images") or []):
+                    if isinstance(item, dict) and _item_is_video(item):
+                        add("images", item)
         return items
 
     def _poll_once(self, prompt_id: str, output_kind: str):

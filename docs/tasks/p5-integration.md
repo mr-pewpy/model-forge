@@ -643,3 +643,168 @@ last-known-good state predates both suspects.
   here).
 - No service stopped/restarted/removed by hand during this phase, no `docker rm`/prune,
   no git commit, no secrets printed.
+
+---
+
+## 11. h3 restoration — tree pin + lane parity (2026-11-20, live on 192.168.1.62)
+
+**Model:** xiaomi/mimo-v2.6-pro
+**Scope:** restore the three h3 VIDEO lanes by pinning the ComfyUI tree to the
+known-good revision baked in `weights-broker-comfyui:mfflashfix`, persist the pin,
+then run `gen/h3-t2v`, `gen/h3-i2v`, `gen/h3-r2v` end-to-end through the facade.
+**Result: ✅ 3/3 lanes PASS with real mp4 bytes** (plus one bridge-side collection fix,
+below). Image lanes regression-checked green before the video runs.
+
+### 11.1 The baked sha (step 1)
+
+`docker run --rm --entrypoint git weights-broker-comfyui:mfflashfix -C /opt/ComfyUI log -1`:
+
+```
+63e5bf594339f676b4b15e072529873e3448409e_2026-11-06 01:32:17 -0500_
+Make the partner node team code owners of comfy_api_nodes (#17575)
+```
+
+Baked-tree checks (fresh container, no update script runs): `comfy_extras/nodes_minimax_h3.py`
+present (37078 B); `comfy_kitchen/flash_attention.py:186` carries the mf-fix marker
+`if True:  # mf-fix: convrot KV strides trip the cuda kernel; use torch fallback`;
+baked `comfy/text_encoders/llama.py` md5 `4020ec32017003f32b121ab69d5fb339` (the
+`contiguous()` sed fix applied — 4 occurrences). Baked git status: ` M llama.py` only
+(plus volume-shading noise).
+
+### 11.2 Live container state (step 2)
+
+`weights-broker-comfyui-1` was `Exited(143)` (image `ltx25stable`; the compose file
+already said `mfflashfix` — image drift between compose and the running container).
+Started it for inspection: HEAD `master @ bdb0816a292d` (2026-11-07), ` M
+comfy/text_encoders/llama.py`, no MERGE_HEAD (the section-10 merge mess had already
+aborted), and the baked sha object **was already local** (`git cat-file -e` → yes) —
+no network fetch needed. `bash -n /opt/ai-dock/bin/update-comfyui.sh` → **line 34
+syntax error**: the mf-fix re-apply `sed` is an unquoted expression with parens
+(`sed -i s/flash_attention_decode_gqa(xq, …`) — bash parses the `(`. The live
+site-packages already carried the flash marker (count 1).
+
+### 11.3 Pin + persist (step 3)
+
+Inside the live container: `git merge --abort` (no-op, no merge to abort),
+`git checkout -f 63e5bf59…` (local objects, detached HEAD), re-applied the llama.py
+sed with proper quoting → md5 `4020ec32…` == baked. Fixed the update script by
+quoting the sed expression (`bash -n` → clean; backup
+`/opt/ai-dock/bin/update-comfyui.sh.bak-pre-syntax-fix` in the container layer).
+`docker commit weights-broker-comfyui-1 weights-broker-comfyui:pinned-h3`.
+
+Compose diff (`/root/docker/weights-broker/docker-compose.yaml`; backup
+`docker-compose.yaml.bak-pre-h3pin-20261120`):
+
+```diff
+-    image: weights-broker-comfyui:mfflashfix
++    image: weights-broker-comfyui:pinned-h3
+-      - COMFYUI_REF=master                     # H3 nodes are master-only (not in tags)
++      - COMFYUI_REF=63e5bf594339f676b4b15e072529873e3448409e                     # H3 nodes are master-only (not in tags)
+```
+
+Then `docker compose -f docker-compose.yaml up -d --pull never comfyui`
+(service-level; recreate succeeded, other services untouched).
+
+**Pitfall found — the first recreate did NOT hold the pin.** Boot came up at
+`bdb0816a` again (reflog: `checkout: moving from 63e5bf594 to master`) even though
+`printenv COMFYUI_REF` showed the sha. Root cause: ai-dock's
+`/opt/ai-dock/etc/environment.sh` line 12 (`export COMFYUI_REF='master'`) is
+**sourced at init** (`init.sh:487`), overriding the compose env, and
+`init_write_environment` re-persists that same env — so the file is authoritative
+and self-perpetuating; a compose-only `COMFYUI_REF` pin never reaches
+`update-comfyui.sh`. Fix: set `COMFYUI_REF='<sha>'` in `environment.sh` too
+(container layer), `git checkout -f <sha>` + sed again, re-commit
+(`pinned-h3` re-tagged `ff472a944d1d`), compose recreate again. With
+`COMFYUI_REF=<sha>` the update script's `git checkout ${ref}` keeps the pin at every
+boot (the fixed `sed` is idempotent — the pattern no longer matches after applying).
+
+### 11.4 Boot verification (after the second recreate)
+
+| check | result |
+|---|---|
+| `git log -1 --format=%H` in `/opt/ComfyUI` | `63e5bf594339f676b4b15e072529873e3448409e` ✅ (pin survived boot) |
+| `environment.sh` `COMFYUI_REF` | `'63e5bf59…'` ✅ (self-re-persisted) |
+| `/etc/comfyui_args.conf` (`:ro` mount of `/data/broker/comfy_args.conf`) | `--novram` ✅ |
+| flash marker `comfy_kitchen/flash_attention.py:186` | present (count 1) ✅ |
+| `llama.py` md5 | `4020ec32017003f32b121ab69d5fb339` == baked ✅ |
+| torch | `2.7.1+cu128` ✅ (mfflashfix-era stack) |
+| `curl 127.0.0.1:18188/` from the host | `HTTP 200` ✅ (loopback-only, probed via ssh) |
+
+### 11.5 Bridge-side collection fix — the real E2E blocker (mf_video_bucket_fix)
+
+Triage of the first post-pin t2v run found the **actual reason no h3 lane ever
+completed through the facade**: this ComfyUI tree records `SaveVideo` outputs in the
+history entry's **`images`** bucket with `metadata.kind == "video"` (plus
+`"animated": [true]`), while the facade's collector
+(`engines/comfyui.py:_OUTPUT_BUCKETS["video"] = ("videos","results","gifs")`) never
+looks there — `_poll_once` reports `running` forever and the runner rides to its
+history budget. The same mismatch retro-explains §10's "stall" (see 11.7).
+
+Facade code cannot change this without a restart (forbidden), so the fix is
+ComfyUI-side, in the mf-fix tradition: `/data/broker/comfy/custom_nodes/mf_video_bucket_fix.py`
+(**volume**-persisted, pinned tree untouched) patches
+`PromptQueue.get_history` at read time to alias video-kind `images` items into a
+`videos` bucket. Two load requirements discovered: the tree's custom-node loader
+skips modules without `NODE_CLASS_MAPPINGS`/`comfy_entrypoint`
+(`nodes.py:2347` — first attempt was `IMPORT FAILED`), and the check is
+`is not None`, so an empty `NODE_CLASS_MAPPINGS = {}` suffices. Second boot:
+`0.0 seconds: mf_video_bucket_fix.py` — imported clean, and jobs then collected.
+
+### 11.6 Lane parity — per lane (one at a time; vllm-server Up+healthy before each submit)
+
+Input image for i2v/r2v: stdlib-built 512×512 RGB PNG (1500 B, two-tone
+blue/green), sent as `data:image/png;base64,…` per §9.
+
+| lane | job | timeline (UTC) | verdict + evidence |
+|---|---|---|---|
+| `gen/h3-t2v` | `3435a622bcc0` | submit 07:33:47 → completed 07:49:30 (wall **15m43s**) | **PASS** — `{"id","status":"completed","data":[{"url":"http://192.168.1.62:8080/assets/3435a622bcc0/weightsbroker_h3_00012_.mp4"}]}`. Asset `HTTP 200 CT=video/mp4 1720304 bytes`, `ftyp` at offset 4 (`isom`); `GET /v1/videos/{id}/content` byte-identical (sha256 `ddc4f3b9dddf5ba3…`); job row `status:"done"` + `assets` list. |
+| `gen/h3-i2v` | `c078c70d568c` | submit 07:51:25 → completed 08:08:30 (wall **17m05s**) | **PASS** — `data[0].url …/assets/c078c70d568c/weightsbroker_h3_00013_.mp4`. Asset `HTTP 200 CT=video/mp4 1772983 bytes`, `ftyp@4` ok; `/content` byte-identical. |
+| `gen/h3-r2v` | `56e85dcdf30a` | submit 08:11:03 → completed 08:41:54 (wall **30m51s**) | **PASS** — `data[0].url …/assets/56e85dcdf30a/weightsbroker_h3_00014_.mp4`. Asset `HTTP 200 CT=video/mp4 2764986 bytes`, `ftyp@4` ok; `/content` byte-identical. (Heaviest lane: GPU1 peaked 13.3 GB, ~31 min — GPU stayed 100% throughout; the 25-min stall rule targets 0%-GPU no-progress, which never occurred.) |
+
+Requests were the consumer shapes: `{"model":"gen/h3-*","prompt":"a red ball bouncing
+on a wooden floor","seconds":5,"_timeout":1800}` (+ `"image": "data:image/png;base64,…"`
+for i2v/r2v); submit echo `{"id","status":"queued","model":"h3-*"}` (strips `gen/`).
+GPU dance held discipline per lane: `vllm-server` evicted for the whole job, restored
+`healthy` after each idle release (`weights-broker-comfyui-1` ended `Exited(143)`).
+
+**Superseded/failed attempts (recorded):** `24579b3ffd14` (t2v, 06:44:35Z submit) — real ComfyUI execution `Prompt executed in 00:14:45`, mp4
+`weightsbroker_h3_00011_.mp4` written 06:59, but bridge-invisible pre-shim; declared
+FAIL at the 25-min stall rule and the gen container stopped (job → honest
+`failed: ComfyUI went unreachable while polling`). `f893f39576a5` (t2v) — killed
+after 6 min when the first shim was `IMPORT FAILED` (missing `NODE_CLASS_MAPPINGS`).
+`e304baca8170` — harness error: my submit piped the echo through `sed` and re-used
+the i2v body (duplicate `h3-i2v`); killed at ~2 min (`failed: unreachable`), real
+r2v body built and `model` field verified before resubmit.
+
+### 11.7 Triage findings (cross-cutting)
+
+1. **§10's "stall" was a misdiagnosis of a completed job.** `weightsbroker_h3_00010_.mp4`
+   (mtime 05:25Z, 1720304 B — byte-size-identical to today's deterministic t2v output)
+   proves attempt 2 finished ~15 min after its 05:10:47Z submit; the 05:38/05:52Z
+   0%-GPU samples were post-completion idle. The job looked stalled only because the
+   bucket mismatch hid the output until the 3600 s history timeout.
+2. **Real E2E blocker = history-bucket drift** (tree `images`-bucket video vs facade
+   `videos/results/gifs`) — fixed with `mf_video_bucket_fix.py` (11.5). Suggested
+   follow-up: teach the facade's `_OUTPUT_BUCKETS`/`_collect_outputs` about
+   `metadata.kind == "video"` (needs a facade restart — deferred, forbidden here).
+3. **ai-dock boot env overrides compose env** (`environment.sh` sourced at init and
+   re-persisted) — any `COMFYUI_REF` pin must live there, not only in compose (11.3).
+4. §10.5 blocker 3 confirmed again: `handle_video_submit` ignores `_timeout` —
+   doomed jobs pin the gen lane for the full 3600 s history window (worth the
+   caller-supplied budget knob).
+5. `/data/broker/comfy_args.conf` = `--novram` intact all day (the Sep 22 emptier is
+   still unidentified).
+
+### 11.8 State after / constraints held
+
+`mf-facade` never stopped/restarted; `vllm-server` and `gluetun` never touched
+manually (vllm only by the facade's own dance; left `Up, healthy`); `weights-broker`
+stopped by design; the only container recreated was `weights-broker-comfyui-1`, via
+`docker compose … up -d --pull never comfyui` (two recovers total: initial pin +
+env.sh fix); no `docker rm`/prune (compose recreate manages its own container);
+no `git reset --hard` in `~/work/weights-broker` (container `/opt/ComfyUI` git ops
+only); no secrets printed; **no git commit**. Artifacts left in place:
+`pinned-h3` image (`ff472a944d1d`), compose backup `docker-compose.yaml.bak-pre-h3pin-20261120`,
+in-container backup `update-comfyui.sh.bak-pre-syntax-fix`,
+`/data/broker/comfy/custom_nodes/mf_video_bucket_fix.py` (+ scratch copy),
+`/data/broker/comfy/output/video/weightsbroker_h3_00011–00014_.mp4`.

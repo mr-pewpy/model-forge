@@ -441,3 +441,75 @@ def test_wiring_smoke_facade_chat_wakes_vllm_and_gen_evicts_then_restores(
     assert stack["ledger"].is_resident(target, CHAT_MODEL_ID)
     assert not stack["ledger"].is_resident(target, "qwen-image-2.1")
     assert runner.calls.count(["start", "vllm-server"]) == 2    # restored
+
+
+# --- COMFY_ARGS_FILE preflight (P5 follow-up: the silently-emptied --novram) -
+#
+# On .62 the h3 video models REQUIRE --novram on a 24 GB card; the args file
+# (/data/broker/comfy_args.conf, bind-mounted at /etc/comfyui_args.conf) was
+# silently emptied 2026-09-22 and every h3 run OOMd after. The startup
+# preflight must WARN (never hard-fail) when the named file lacks the flag,
+# note a missing file, and surface its verdict on GET /health.
+
+from model_forge.facade import FacadeConfig, FacadeService  # noqa: E402
+from model_forge.serve import preflight_comfy_args  # noqa: E402
+
+
+def test_comfy_args_preflight_warns_when_novram_absent(tmp_path):
+    f = tmp_path / "comfy_args.conf"
+    f.write_text("--lowvram --preview-method auto")     # no --novram
+    lines = []
+    state = preflight_comfy_args(FacadeConfig(comfy_args_file=str(f)),
+                                 log=lines.append)
+    assert state == "novram-missing"
+    (line,) = lines
+    # honest WARNING naming the file AND the consequence
+    assert "WARNING" in line and str(f) in line
+    assert "--novram" in line and "OOM" in line
+
+
+def test_comfy_args_preflight_notes_a_missing_file(tmp_path):
+    f = tmp_path / "gone.conf"
+    lines = []
+    state = preflight_comfy_args(FacadeConfig(comfy_args_file=str(f)),
+                                 log=lines.append)
+    assert state == "unchecked"        # flag neither confirmed nor denied
+    (line,) = lines
+    assert "note" in line.lower() and str(f) in line   # honest note, no lie
+
+
+def test_comfy_args_preflight_ok_state_and_unset_are_quiet(tmp_path):
+    f = tmp_path / "comfy_args.conf"
+    f.write_text("--novram")
+    lines = []
+    assert preflight_comfy_args(FacadeConfig(comfy_args_file=str(f)),
+                                log=lines.append) == "novram-ok"
+    assert lines and str(f) in lines[0]
+    # nothing configured -> nothing checked, nothing logged
+    lines = []
+    assert preflight_comfy_args(FacadeConfig(), log=lines.append) == "unchecked"
+    assert lines == []
+
+
+def test_health_surfaces_comfy_args(tmp_path):
+    f = tmp_path / "comfy_args.conf"
+    f.write_text("--novram")
+    probes = {"llm": lambda: True, "comfy": lambda: True, "mode": lambda: "gen"}
+    svc = FacadeService(FacadeConfig(comfy_args_file=str(f)), probes=probes)
+    assert svc.health()["comfy_args"] == "novram-ok"
+    f.write_text("--lowvram")
+    assert svc.health()["comfy_args"] == "novram-missing"   # live read
+    svc = FacadeService(FacadeConfig(), probes=probes)
+    assert svc.health()["comfy_args"] == "unchecked"
+
+
+def test_resolve_settings_maps_comfy_args_file(tmp_path):
+    config, _host, _port = resolve_settings(
+        env={"COMFY_ARGS_FILE": "/data/broker/comfy_args.conf"})
+    assert config.comfy_args_file == "/data/broker/comfy_args.conf"
+    cfg = tmp_path / "facade.json"
+    cfg.write_text(json.dumps({"COMFY_ARGS_FILE": "/etc/comfyui_args.conf"}))
+    config, _host, _port = resolve_settings(env={}, config_file=str(cfg))
+    assert config.comfy_args_file == "/etc/comfyui_args.conf"
+    config, _host, _port = resolve_settings(env={})
+    assert config.comfy_args_file == ""          # unset -> unchecked

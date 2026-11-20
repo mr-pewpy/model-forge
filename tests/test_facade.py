@@ -599,6 +599,18 @@ def test_image_sync_default_budget_is_1200_when_unset(tmp_path):
     assert runner.run_inputs[0]["timeout_s"] == 1200.0
 
 
+def test_non_finite_timeout_falls_back_to_default_budget(tmp_path):
+    # JSON can carry 1e400 -> inf; Thread.join(inf) raises OverflowError, so
+    # a non-finite _timeout must be treated as unparseable (default budget).
+    orch = FakeOrchestrator()
+    runner = FakeRunner(files=[_write(tmp_path / "o.png")])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner)
+    svc.handle_image_generations(
+        json.dumps({"model": "gen/qwen-image-2.1",
+                    "_timeout": 1e400}).encode())
+    assert runner.run_inputs[0]["timeout_s"] == 1200.0
+
+
 def test_image_sync_short_budget_is_honest_504(tmp_path):
     # a small _timeout yields an honest 504 (the runner reports the timeout),
     # not a request that outlives its budget.
@@ -1276,5 +1288,102 @@ def test_chat_upstream_raise_exits_waiter_and_releases_scope(tmp_path):
 
     assert orch.waiter_exits == [orch.waiter_token]
     assert orch.releases == [(f"chat-{orch.waiter_token}", False)]
+
+
+# ===========================================================================
+# P5 follow-up — async video caller budget (body._timeout -> bounded job)
+#
+# The async video routes accept the sync image route's ``_timeout`` budget.
+# On expiry the job row must end honestly (failed, 'timed out after Ns') and
+# the orchestrator scope must be RELEASED — a stalled runner must not pin the
+# gen lane for the runner's 3600 s default window.
+# ===========================================================================
+
+import threading  # noqa: E402
+import time  # noqa: E402
+
+
+class BlockingRunner:
+    """A stalled-ComfyUI runner: ``run`` blocks past any budget and IGNORES
+    the ``timeout_s`` seam (a black-holed poll can do exactly that), so the
+    facade must bound the job and release the claim itself. The test lets the
+    abandoned worker go via ``release_evt`` at teardown."""
+
+    def __init__(self, workflows=None):
+        self.workflows = _workflows() if workflows is None else workflows
+        self.run_inputs = []
+        self.started = threading.Event()
+        self.release_evt = threading.Event()
+        self.free_calls = 0
+
+    def run(self, workflow_id, params, *, assets_dir, job_id, timeout_s=None):
+        self.run_inputs.append({"workflow_id": workflow_id,
+                                "params": params, "job_id": job_id,
+                                "timeout_s": timeout_s})
+        self.started.set()
+        self.release_evt.wait()       # blocks until the test lets go
+        return {"ok": True, "output_kind": "video", "files": [],
+                "reason": "", "meta": {}}
+
+    def free(self):
+        self.free_calls += 1
+        return {"ok": True}
+
+
+def test_video_submit_timeout_fails_honestly_and_releases_claim(tmp_path):
+    orch = FakeOrchestrator()
+    runner = BlockingRunner()
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner,
+                       dispatch=_inline)
+    try:
+        raw = json.dumps({"model": "gen/h3-t2v", "prompt": "p",
+                          "_timeout": 0.05}).encode()
+        start = time.monotonic()
+        status, body = svc.handle_video_submit(raw)
+        elapsed = time.monotonic() - start
+        assert status == 200                    # async submit shape unchanged
+        jid = json.loads(body)["id"]
+        # the budget reached the runner seam too (its own poll loop stays
+        # bounded) even though this runner ignores it
+        assert runner.run_inputs[0]["timeout_s"] == 0.05
+        # the job ends on the REQUEST budget, not the runner's 3600 s window
+        assert elapsed < 2.0
+        row = svc._jobs.get(jid)
+        assert row["status"] == "failed"        # honest terminal state
+        assert "timed out after 0.05s" in row["error"]
+        assert orch.releases                    # claim released -> lane free
+        assert runner.free_calls >= 1           # weights freed too
+    finally:
+        runner.release_evt.set()                # let the abandoned worker die
+
+
+def test_video_generations_forwards_budget_and_drops_it_from_params(tmp_path):
+    orch = FakeOrchestrator()
+    runner = FakeRunner(files=[str(tmp_path / "v.mp4")])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner,
+                       dispatch=_inline)
+    raw = json.dumps({"model": "gen/h3-t2v", "prompt": "p",
+                      "_timeout": 3}).encode()
+    status, body = svc.handle_video_generations(raw)
+    assert status == 200
+    jid = json.loads(body)["id"]
+    assert runner.run_inputs[0]["timeout_s"] == 3.0   # bounded poll budget
+    # _timeout is transport, not a workflow param: it must not reach the
+    # stored job params (image-route parity: 'n'/'_timeout' are dropped).
+    params = json.loads(svc.handle_job(jid)[1])["params"]
+    assert "_timeout" not in params
+
+
+def test_video_submit_without_timeout_keeps_runner_history_budget(tmp_path):
+    # absent _timeout -> today's behavior unchanged: no facade-side bound and
+    # the runner uses its own history budget.
+    orch = FakeOrchestrator()
+    runner = FakeRunner(files=[str(tmp_path / "v.mp4")])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner,
+                       dispatch=_inline)
+    jid = json.loads(svc.handle_video_submit(
+        json.dumps({"model": "gen/h3-t2v"}).encode())[1])["id"]
+    assert runner.run_inputs[0]["timeout_s"] is None
+    assert svc._jobs.get(jid)["status"] == "done"
 
 

@@ -1528,7 +1528,10 @@ def runtime_lifecycle_for(entry, **seams):
     ``engine_id`` override — default: the entry's first engine id) pass
     straight through to the adapter. Fail closed: a container entry with no
     boot budget raises — this factory never invents a per-engine number, so a
-    malformed registry surfaces loudly rather than at a guessed boot wait.
+    malformed registry surfaces loudly rather than at a guessed boot wait. A
+    duck-typed entry (no ModelEntry parse validation) whose runtime dict is
+    missing ``name``/``health_url`` likewise raises a clear ``ValueError``
+    NAMING the missing key, never a bare ``KeyError`` from the constructor.
     """
     runtime = getattr(entry, "runtime", None)
     if runtime is None:
@@ -1546,6 +1549,12 @@ def runtime_lifecycle_for(entry, **seams):
             f"registry entry {getattr(entry, 'id', '?')!r}: runtime.kind must "
             f"be 'container' or 'process' to build a lifecycle, got {kind!r} "
             f"(fail-closed)")
+    for key in ("name", "health_url"):
+        if not runtime.get(key):
+            raise ValueError(
+                f"container runtime for {getattr(entry, 'id', '?')!r} "
+                f"declares no {key} — refusing to guess a container name or "
+                f"health URL (fail-closed)")
     engine_id = seams.pop("engine_id", None)
     if not engine_id:
         engines = getattr(entry, "engines", ()) or ()
