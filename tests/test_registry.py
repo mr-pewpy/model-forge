@@ -2,13 +2,49 @@
 
 from model_forge.hardware import HardwareProfile
 from model_forge.registry import (
-    MODALITIES, MODELS, fit_verdict, models_for,
+    MODALITIES, MODELS, fit_verdict, models_for, native_id_for, served_name_for,
 )
 
 
 def test_registry_ids_unique():
     ids = [m.id for m in MODELS]
     assert len(ids) == len(set(ids))
+
+
+# --- B5: engine-native alias reshaping (native_id_for / served_name_for) ----
+
+def test_native_id_for_maps_engine_native_served_id():
+    # deepseek-v4.1-flash is served as deepseek-maya-s by Maya (registry data).
+    assert native_id_for("deepseek-v4.1-flash", "maya") == "deepseek-maya-s"
+    # glm-5.3-flash -> glm-maya-s on Maya.
+    assert native_id_for("glm-5.3-flash", "maya") == "glm-maya-s"
+
+
+def test_native_id_for_identity_when_engine_has_no_native_name():
+    # No native id for that engine -> the registry id passes through unchanged.
+    assert native_id_for("glm-5.3-flash", "strata") == "glm-5.3-flash"
+    # Unknown (non-curated) id -> identity, never a guessed translation.
+    assert native_id_for("some/unknown-model", "maya") == "some/unknown-model"
+    # Empty engine -> identity.
+    assert native_id_for("glm-5.3-flash", "") == "glm-5.3-flash"
+
+
+def test_served_name_for_resolves_alias_then_native():
+    # Two hops: a legacy alias canonicalizes first, then reshapes to native.
+    # The gen alias gen/krea2 -> gen/qwen-image-2.1 (no engine_models entry for
+    # the image engines), so identity at the native hop is the honest answer.
+    assert served_name_for("gen/krea2", "comfyui") == "gen/qwen-image-2.1"
+    # A chat id with a native Maya name reaches the engine-native served id.
+    assert served_name_for("glm-5.3-flash", "maya") == "glm-maya-s"
+    # The alias hop is skipped for an already-canonical id.
+    assert served_name_for("deepseek-v4.1-flash", "maya") == "deepseek-maya-s"
+
+
+def test_served_name_for_alias_override_and_identity():
+    # An explicit alias table replaces the default; unmapped ids stay identity.
+    assert served_name_for("a", "maya", aliases={"a": "glm-5.3-flash"}) == \
+        "glm-maya-s"
+    assert served_name_for("zzz", "maya", aliases={}) == "zzz"
 
 
 def test_registry_modalities_known():

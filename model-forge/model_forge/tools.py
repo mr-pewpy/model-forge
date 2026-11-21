@@ -37,7 +37,7 @@ from .hardware import probe_hardware
 from .media import media_plan, runner_plan
 from .registry import (
     MODALITIES, MODALITY_LABELS, PHANTOM_ENGINE_NOTE, PHANTOM_ENGINES,
-    ModelEntry, fit_report, fit_verdict, models_for,
+    ModelEntry, fit_report, fit_verdict, models_for, native_id_for,
 )
 from .targets import (SOURCE_DECLARED, ComputeTarget, add_target, budget_label,
                       get_target, load_targets, remove_target,
@@ -982,7 +982,7 @@ def activation_plan(entry: ModelEntry, target: ComputeTarget,
                 "detail": f"none of {list(entry.engines)} answered at "
                           f"{target.base_url} — install/serve first"}
     provider = _PROVIDER_FOR_ENGINE.get(engine, "custom")
-    model_id = engine_model or entry.engine_models.get(engine) or entry.id
+    model_id = engine_model or native_id_for(entry.id, engine)
     base_v1 = root_url(target.base_url) + "/v1"
     slug = custom_provider_slug_for(target.id)
     cp_entry = custom_provider_entry(model_id, name=custom_provider_name(target.id),

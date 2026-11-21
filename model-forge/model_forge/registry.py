@@ -487,6 +487,60 @@ def _ram_short(m: ModelEntry, hw: HardwareProfile) -> bool:
     return bool(m.ram_gb_min and hw.ram_gb and hw.ram_gb < m.ram_gb_min)
 
 
+def native_id_for(model_id: str, engine: str) -> str:
+    """Per-engine alias reshaping on top of the registry's served-id data (B5).
+
+    The curated catalog ids are the shared vocabulary across the registry, the
+    providers mirror and the tools; an engine serves some of them under a
+    different NATIVE name (``ModelEntry.engine_models``: engine id -> the id
+    that engine actually serves, e.g. ``deepseek-v4.1-flash`` is served as
+    ``deepseek-maya-s`` by Maya). This reshapes a registry-form ``model_id`` to
+    ``engine``'s native served id.
+
+    Identity is the honest default: when the registry states no native id for
+    this engine (or for an id that is not a curated entry at all), the id
+    passes through unchanged — the engine is taken to serve the registry id.
+    The mapping is one hop, never guessed: a missing entry never invents a
+    translation. Callers that hold a legacy alias resolve it first
+    (:func:`model_forge.aliases.resolve`), then reshape here.
+    """
+    entry = _BY_ID.get(model_id)
+    if entry is None:
+        return model_id
+    native = (entry.engine_models or {}).get(engine, "")
+    return native or model_id
+
+
+def served_name_for(model_id: str, engine: str,
+                    aliases: dict[str, str] | None = None) -> str:
+    """The full short-alias -> engine-native served-name reshape (B5).
+
+    Two hops, in order:
+
+    1. canonicalize ``model_id`` through the alias table
+       (:func:`model_forge.aliases.resolve`), so a short / legacy alias
+       (``flash-next``, ``gen/krea2``, …) lands on its curated registry-form
+       id;
+    2. reshape that id to ``engine``'s native served name
+       (:func:`native_id_for`).
+
+    The engine-native hop is the one deferred-work B5 exists for: the registry
+    is the shared id vocabulary, but each engine serves some entries under a
+    native name, and callers that actually talk to an engine need that name,
+    not the catalog id. Identity at either hop is honest — an unaliased id
+    stays as-is, and an entry with no native id for ``engine`` stays as-is.
+    The ``aliases`` import is lazy so this module stays importable for the
+    facade/image/video fallback importers even if the alias seam moves.
+    """
+    try:
+        from .aliases import resolve
+    except Exception:  # noqa: BLE001 — identity keeps the reshape working
+        canonical = model_id
+    else:
+        canonical = resolve(model_id, aliases)
+    return native_id_for(canonical, engine)
+
+
 def engine_match(m: ModelEntry,
                  available_engines: list[str] | tuple[str, ...] | None) -> str:
     """First of the entry's engines the target can actually run ("" if none).

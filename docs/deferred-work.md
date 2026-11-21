@@ -393,16 +393,27 @@ The list is grouped as:
 
 ### B5. Engine-native reshaping of model aliases
 
+**Implemented.** A registry-form model id now reshapes to an engine's native
+served name per engine, on top of the registry's served-id data.
+
 - **What it is:** the short model aliases on the engine provider rows (for
   example `flash-next`) resolve to the curated catalog's registry-form model
-  ids; reshaping them to an engine's native served names is deferred.
+  ids; reshaping them to an engine's native served names is now built.
 - **Why:** the catalog ids are the shared vocabulary across the registry,
-  the providers mirror and the tools; engine-native names vary per engine
-  and mapping them is a per-engine translation layer.
-- **What exists today:** aliases work end to end against the registry ids,
-  and served-id information is carried where the registry states it.
-- **What would unblock it:** per-engine alias reshaping on top of the
-  registry's served-id data.
+  the providers mirror and the tools; engine-native names vary per engine and
+  mapping them is a per-engine translation layer.
+- **What exists today:** `registry.native_id_for(model_id, engine)` reshapes a
+  registry-form id to `engine`'s native served id via `ModelEntry.engine_models`
+  (engine id → the id that engine serves), and
+  `registry.served_name_for(model_id, engine, aliases=…)` composes the two hops
+  (alias canonicalization → native reshape). Identity is the honest default at
+  both hops — an unaliased id and an entry with no native id for that engine
+  pass through unchanged, never a guessed translation. `model_forge_activate`'s
+  `activation_plan` now names the served model through `native_id_for` (single
+  source of truth, replacing an inline `engine_models.get(…)`).
+- **What would unblock it:** nothing further — the per-engine reshaping layer
+  is built. New native names land as `engine_models` data on the registry
+  entries (e.g. `{"maya": "deepseek-maya-s"}`) with no code change.
 
 ### B6. Local adapters for the Python audio engines
 
