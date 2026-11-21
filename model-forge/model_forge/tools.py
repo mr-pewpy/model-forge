@@ -3813,13 +3813,17 @@ _BENCH_INTERVAL_S = 0.5
 # bounded timeout, tolerant line parsing — read-only memory query.
 _NVIDIA_SMI_USED = ("nvidia-smi", "--query-gpu=memory.used",
                     "--format=csv,noheader,nounits")
+# AMD: rocm-smi reports "VRAM Used Memory (B)" per GPU (the same table the
+# hardware total probe reads); the amdgpu sysfs fallback reads
+# mem_info_vram_used per card (B3: non-NVIDIA samplers). Vendor id 0x1002.
+_ROCM_SMI_VRAM = ("rocm-smi", "--showmeminfo", "vram")
+_ROCM_USED_RE = re.compile(r"GPU\[(\d+)\]\s*:.*VRAM Used Memory \(B\):\s*(\d+)")
+_SYS_DRM = "/sys/class/drm"
+_AMD_PCI_VENDOR = "0x1002"
 
 
-def gpu_vram_used_gb() -> float:
-    """Live bench sampler: total GPU memory in use across NVIDIA GPUs, in GB
-    (the machine running Model Forge — the same probe scope as the hardware
-    report). Raises on failure; the bench window turns a failing sampler into
-    an honest row, never a guessed peak."""
+def _nvidia_vram_used_gb() -> float:
+    """Total GPU memory in use across NVIDIA GPUs, in GB. Raises on failure."""
     out = subprocess.run(
         _NVIDIA_SMI_USED, capture_output=True, text=True, timeout=10,
         check=True, env=_minimal_env()).stdout
@@ -3839,6 +3843,84 @@ def gpu_vram_used_gb() -> float:
     return total_mib / 1024.0
 
 
+def _amd_vram_used_gb() -> float:
+    """Total GPU memory in use across AMD GPUs, in GB (B3 non-NVIDIA sampler).
+
+    rocm-smi's VRAM table first (``--showmeminfo vram``, the same table the
+    hardware total probe reads), falling back to the amdgpu sysfs
+    ``mem_info_vram_used`` per card. Raises on failure — the bench window turns
+    a failing sampler into an honest row, never a guessed peak.
+    """
+    if shutil.which("rocm-smi") is not None:
+        try:
+            out = subprocess.run(
+                _ROCM_SMI_VRAM, capture_output=True, text=True, timeout=10,
+                check=True, env=_minimal_env()).stdout
+        except (subprocess.SubprocessError, OSError):
+            out = ""
+        used: dict[int, int] = {}
+        for match in _ROCM_USED_RE.finditer(out):
+            used[int(match.group(1))] = int(match.group(2))
+        if used:
+            return sum(used.values()) / (1024 ** 3)
+    # amdgpu sysfs fallback: mem_info_vram_used per card, AMD cards only.
+    try:
+        cards = sorted(
+            (e for e in os.listdir(_SYS_DRM)
+             if e.startswith("card") and e[4:].isdigit()),
+            key=lambda e: int(e[4:]),
+        )
+    except OSError:
+        cards = []
+    total = 0.0
+    seen = False
+    for card in cards:
+        dev = os.path.join(_SYS_DRM, card, "device")
+        try:
+            with open(os.path.join(dev, "vendor")) as fh:
+                vendor = fh.read().strip().lower()
+            if vendor != _AMD_PCI_VENDOR:
+                continue
+            with open(os.path.join(dev, "mem_info_vram_used")) as fh:
+                total += int(fh.read().strip())
+                seen = True
+        except (OSError, ValueError):
+            continue
+    if not seen:
+        raise ValueError("no AMD GPU memory reading (rocm-smi and amdgpu "
+                         "sysfs mem_info_vram_used both unavailable)")
+    return total / (1024 ** 3)
+
+
+def gpu_vram_used_gb() -> float:
+    """Live bench sampler: total GPU memory in use across the GPUs of the
+    machine running Model Forge (the same probe scope as the hardware report),
+    in GB. NVIDIA via nvidia-smi, AMD via rocm-smi / amdgpu sysfs (B3). Raises
+    on failure; the bench window turns a failing sampler into an honest row,
+    never a guessed peak."""
+    if shutil.which("nvidia-smi") is not None:
+        return _nvidia_vram_used_gb()
+    return _amd_vram_used_gb()
+
+
+def _bench_sampler_available() -> bool:
+    """True when this machine exposes a VRAM reading the bench can sample
+    (NVIDIA nvidia-smi, or AMD rocm-smi / amdgpu sysfs). Apple Silicon is
+    unified memory — no discrete VRAM-used counter — so it is honestly False
+    there and the bench states the reason instead of guessing."""
+    if shutil.which("nvidia-smi") is not None:
+        return True
+    if shutil.which("rocm-smi") is not None:
+        return True
+    try:
+        for card in os.listdir(_SYS_DRM):
+            if card.startswith("card") and card[4:].isdigit():
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def _live_bench_sampler():
     """(sampler, "") for the live bench window — or (None, honest reason)
     when this machine has no GPU memory the bench can sample. Fails soft:
@@ -3848,10 +3930,12 @@ def _live_bench_sampler():
         return None, ("bench measures real GPU memory and no GPU is present "
                       "on this machine — nothing to measure; run bench "
                       "where the model is loaded")
-    if shutil.which("nvidia-smi") is None:
+    if not _bench_sampler_available():
         return None, ("a GPU is present but bench samples GPU memory through "
-                      "nvidia-smi, which is not available on this machine — "
-                      "nothing to sample")
+                      "nvidia-smi (NVIDIA) or rocm-smi / amdgpu sysfs (AMD), "
+                      "none of which is available on this machine (Apple "
+                      "Silicon is unified memory with no discrete VRAM-used "
+                      "counter) — nothing to sample")
     return gpu_vram_used_gb, ""
 
 

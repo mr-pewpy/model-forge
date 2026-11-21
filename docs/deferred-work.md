@@ -365,19 +365,27 @@ The list is grouped as:
 
 ### B3. Bench sampling of remote compute targets
 
+**Partly implemented — non-NVIDIA samplers done; remote sampling still
+deferred.**
+
 - **What it is:** the `bench` VRAM measurement window samples the machine
-  Model Forge runs on (the same probe scope as the hardware report, NVIDIA
-  memory via the vendor's standard query); sampling a model loaded on a
-  remote compute target is deferred.
-- **Why:** a remote engine API exposes no reliable VRAM sampler, and a
-  booked ceiling must be an observation, never a guess — so bench fails soft
+  Model Forge runs on (the same probe scope as the hardware report). Sampling
+  a model loaded on a remote compute target is still deferred.
+- **Why:** a remote engine API exposes no reliable VRAM sampler, and a booked
+  ceiling must be an observation, never a guess — so remote bench fails soft
   with a stated reason instead of estimating ("run bench where the model is
   loaded").
-- **What exists today:** run `bench` on the machine where the model is
-  loaded; the recorded peak is booked as the model's nominal ceiling and
-  gates fit from then on.
-- **What would unblock it:** a per-target sampling path (and non-NVIDIA
-  samplers) that observes the real footprint remotely.
+- **What exists today:** the bench sampler is no longer NVIDIA-only: it reads
+  NVIDIA via `nvidia-smi`, AMD via `rocm-smi` (`--showmeminfo vram`, the same
+  table the hardware total probe reads) with an amdgpu sysfs
+  `mem_info_vram_used` fallback (`tools.gpu_vram_used_gb` /
+  `_amd_vram_used_gb`). Apple Silicon is honestly "no discrete VRAM-used
+  counter" (unified memory) and the bench states that instead of guessing.
+  Run `bench` on the machine where the model is loaded; the recorded peak is
+  booked as the model's nominal ceiling and gates fit from then on.
+- **What would unblock it:** a per-target sampling path that observes the real
+  footprint REMOTELY — no supported remote engine API exposes one today. The
+  non-NVIDIA local samplers are built; the remote half needs that API.
 
 ### B4. AMD marketing-name sampling
 
