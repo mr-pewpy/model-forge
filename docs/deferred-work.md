@@ -22,17 +22,30 @@ The list is grouped as:
 
 ### A1. Install resolves curated catalog entries only
 
+**Resolved — live rows are now installable after per-row vetting.**
+
 - **What it is:** `model_forge_install` installs models from the curated
-  catalog (`model_id`s in the registry). Live discovery rows are not install
-  targets.
+  catalog (`model_id`s in the registry) and, now, from the live discovery
+  layer after a per-row vet. Live rows were previously not install targets.
 - **Why:** live rows come from the public Hugging Face listing and carry no
   fit estimate, no engine mapping, and no verified file set — installing one
-  would mean guessing those.
-- **What exists today:** live rows are labeled *fresh/unvetted* and serve
-  discovery (date, downloads, pipeline tag, link); the curated catalog is the
-  install surface, and any curated entry can be added by the project.
-- **What would unblock it:** per-row vetting of live entries (fit data, file
-  resolution) before they become installable.
+  used to mean guessing those.
+- **What exists today:** `tools.vet_live_entry(repo_id)` performs the per-row
+  vet that makes a live row installable, observing instead of guessing: the
+  primary weights file is **resolved** from the repo's real file list (the
+  same resolver the curated install uses; a `multi_file`/`no_weights_found`
+  repo refuses), **engine candidates** come from the `pipeline_tag` HF reports
+  mapped to the registry's modality engines, and **fit** is honest — `size_gb`
+  is the resolved file's real byte size while `vram_gb_min` stays UNKNOWN (0),
+  so fit prices as a size advisory, never a guessed VRAM ceiling. `install`
+  routes an uncurated id through the vet (fail-closed on anything
+  unverifiable) and surfaces what was observed under `plan["vet"]`. Curated
+  ids resolve through the registry exactly as before.
+- **What would unblock it:** nothing further for the single-file case. A
+  multi-component repo (diffusers `model_index.json`, sharded weights) is
+  honestly refused as "not installable as a single file" — pass `engine_model=`
+  once per component; making multi-component installs first-class is a
+  separate, larger workflow.
 
 ### A2. File pulls fall back to an explicit file name
 

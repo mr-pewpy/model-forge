@@ -1960,14 +1960,29 @@ def model_forge_install(args: dict | None = None, **kwargs) -> str:
             return _dump({"error": "model_id required (or job_id to poll a "
                                    "download)"})
         entry = next((m for m in models_for() if m.id == model_id), None)
+        vet = None
         if entry is None:
-            return _dump({"error": f"unknown model_id: {model_id}"})
+            # A1: not a curated id — vet the LIVE row (file resolution + honest
+            # size-based fit + engine candidates) before it may be installed.
+            # Fail-closed: an unvettable row refuses with the reason, never a
+            # guessed entry.
+            vet = vet_live_entry(model_id)
+            if not vet.get("ok"):
+                return _dump({"ok": False, "action": "install_refused",
+                              "model_id": model_id, "vetted": False,
+                              "error": vet.get("detail"),
+                              "vet_action": vet.get("action")})
+            entry = vet["entry"]
         target = get_target(args.get("target"))
         if target is None:
             return _dump({"error": f"unknown target: {args.get('target')}"})
         base = "" if target.kind == "local" else target.base_url
         available = [e.id for e in _detect(base) if e.available]
         engine_model = str(args.get("engine_model") or "")
+        if vet is not None and not engine_model:
+            # The vet already resolved the primary weights file — use it rather
+            # than re-fetching the repo file list in the auto-resolve below.
+            engine_model = vet["resolution"].get("file", "")
         engine_arg = str(args.get("engine", ""))
         plan = install_plan(entry, target, engine_model=engine_model,
                             engine=engine_arg, available_engines=available)
@@ -2021,6 +2036,23 @@ def model_forge_install(args: dict | None = None, **kwargs) -> str:
                 "pulls are what the swap pre-flight trusts on remote "
                 "targets (recorded as your confirmation unless the engine "
                 "reports the pull complete)")
+        if vet is not None:
+            # A1: surface what the per-row vet OBSERVED (honest), so the
+            # caller sees why this live row is installable — never a guessed
+            # fit. VRAM floor stays unknown; fit prices on the real size.
+            plan["vetted"] = True
+            plan["live_entry"] = True
+            plan["vet"] = {
+                "pipeline_tag": vet.get("pipeline_tag", ""),
+                "modality": vet.get("modality", "unknown"),
+                "resolved_file": vet["resolution"].get("file", ""),
+                "size_gb": vet.get("size_gb", 0.0),
+                "engine_candidates": vet.get("engine_candidates", []),
+                "vram_gb_min": None,  # unknown — no published VRAM floor
+                "fit": ("size-advisory only (no published VRAM floor); "
+                        "run bench after first load to book a measured ceiling"),
+                "note": vet.get("detail", ""),
+            }
         return _dump(plan)
     except Exception as exc:
         return _err(exc)
@@ -2912,6 +2944,26 @@ def _weights_plan(files: list[tuple[str, int]]) -> dict:
             "detail": detail}
 
 
+def _siblings_to_files(rows) -> list[tuple[str, int]]:
+    """(path, size_bytes) rows from a model-info ``siblings`` list (pure).
+
+    Size comes from the row's ``size`` or its ``lfs.size``; a file with no
+    readable size is kept at 0 bytes (never dropped — its presence is real)."""
+    files: list[tuple[str, int]] = []
+    for row in (rows or []):
+        if not isinstance(row, dict):
+            continue
+        name = row.get("rfilename")
+        if not isinstance(name, str) or not name:
+            continue
+        size = row.get("size")
+        if not isinstance(size, int):
+            lfs = row.get("lfs")
+            size = lfs.get("size") if isinstance(lfs, dict) else None
+        files.append((name, size if isinstance(size, int) else 0))
+    return files
+
+
 def resolve_repo_weights(repo_id: str, fetch=None) -> dict:
     """Resolve the primary weights file of a Hugging Face repo from its file
     list (model-info API, blobs=true). stdlib urllib; pass fetch= to inject
@@ -2928,21 +2980,122 @@ def resolve_repo_weights(repo_id: str, fetch=None) -> dict:
     if not isinstance(rows, list):
         return {"ok": False, "action": "needs_engine_model",
                 "detail": "pass engine_model=" + _FILE_PULL_HINT}
-    files = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        name = row.get("rfilename")
-        if not isinstance(name, str) or not name:
-            continue
-        size = row.get("size")
-        if not isinstance(size, int):
-            lfs = row.get("lfs")
-            size = lfs.get("size") if isinstance(lfs, dict) else None
-        files.append((name, size if isinstance(size, int) else 0))
-    plan = _weights_plan(files)
+    plan = _weights_plan(_siblings_to_files(rows))
     plan["repo"] = repo_id
     return plan
+
+
+def _modality_for_pipeline_tag(tag: str) -> str:
+    """The registry modality a HF ``pipeline_tag`` belongs to ("" when the tag
+    is absent or not a lane the registry models). Data, not a guess: the map
+    is :data:`discovery.MODALITY_TAGS` inverted (a tag HF actually reports)."""
+    if not tag:
+        return ""
+    try:
+        from . import discovery
+    except Exception:  # noqa: BLE001 — without the seam, modality stays unknown
+        return ""
+    for modality, tags in discovery.MODALITY_TAGS.items():
+        if tag in tags:
+            return modality
+    return ""
+
+
+def _vet_engines_for_modality(modality: str) -> tuple[str, ...]:
+    """Engine candidates for a vetted live row (A1) — honest data, not a guess.
+
+    For a known modality these are the non-phantom engines the curated
+    registry assigns to that modality (``models_for(modality=…)``), narrowed to
+    the file-pull engines (``comfyui``/``vllm``/``sglang``) that install by
+    pulling a weights file from a source repo — the install path a live row
+    uses. When the modality is unknown, the full file-pull set is offered and
+    the caller names the engine (``engine=``)."""
+    file_pull = [e for e in _FILE_PULL_ENGINES]
+    if not modality:
+        return tuple(file_pull)
+    candidates = []
+    for m in models_for(modality=modality):
+        for e in m.engines:
+            if e in PHANTOM_ENGINES or e not in file_pull:
+                continue
+            if e not in candidates:
+                candidates.append(e)
+    return tuple(candidates) or tuple(file_pull)
+
+
+def vet_live_entry(repo_id: str, fetch=None) -> dict:
+    """Per-row vetting of a LIVE (non-curated) entry so it becomes installable
+    (A1). Live discovery rows carry no fit estimate, no engine mapping and no
+    verified file set — installing one used to mean guessing those. Vetting
+    replaces the guessing with observation:
+
+    - **file resolution** (verified): the primary weights file is resolved from
+      the repo's real file list (``_weights_plan`` over ``siblings``), exactly
+      the curated-install resolver. A repo that is not one installable file
+      (``multi_file``/``no_weights_found``) refuses here, never faked.
+    - **engine candidates** (data): derived from the ``pipeline_tag`` HF
+      actually reports, mapped to the registry's modality engines — not
+      invented.
+    - **fit** (honest): ``size_gb`` is the resolved file's real byte size and
+      ``vram_gb_min`` is left 0 (UNKNOWN — a live row publishes no VRAM floor),
+      so fit prices as a size advisory against the target budget, never a
+      guessed VRAM ceiling.
+
+    The ``pipeline_tag``/model-info fetch is injectable (``fetch=``). Returns
+    ``{"ok": True, "entry": <synthetic ModelEntry>, "resolution": <weights
+    plan>, ...}`` or ``{"ok": False, "action": <refusal>, "detail": …}`` —
+    fail-closed on anything unverifiable.
+    """
+    fetch = fetch or _fetch_hf_json
+    url = f"https://huggingface.co/api/models/{repo_id}?blobs=true"
+    try:
+        data = fetch(url)
+    except Exception as exc:  # noqa: BLE001 — honest refusal, never a raise
+        return {"ok": False, "action": "vet_failed", "model_id": repo_id,
+                "detail": (f"live row {repo_id!r} could not be fetched to vet "
+                           f"it ({type(exc).__name__}: {exc}) — refusing an "
+                           "unvetted id (fail-closed)")}
+    if not isinstance(data, dict):
+        return {"ok": False, "action": "vet_failed", "model_id": repo_id,
+                "detail": (f"live row {repo_id!r} returned no usable model "
+                           "info — refusing an unvetted id (fail-closed)")}
+    rows = data.get("siblings")
+    resolution = _weights_plan(
+        _siblings_to_files(rows if isinstance(rows, list) else []))
+    if not resolution.get("ok"):
+        return {"ok": False, "action": resolution.get("action", "vet_failed"),
+                "model_id": repo_id, "resolution": resolution,
+                "detail": (f"live row {repo_id!r} is not installable as a "
+                           f"single file: "
+                           f"{resolution.get('detail', 'no resolvable weights file')}"
+                           " — pass engine_model= to name a file per component")}
+    pipeline_tag = str(data.get("pipeline_tag") or "")
+    modality = _modality_for_pipeline_tag(pipeline_tag)
+    engines = _vet_engines_for_modality(modality)
+    size_gb = round(resolution.get("size_bytes", 0) / 1e9, 3)
+    entry = ModelEntry(
+        id=repo_id, name=repo_id,
+        modality=modality,  # "" = unknown (HF states no pipeline_tag) — honest
+        engines=engines, source=repo_id,
+        size_gb=size_gb,
+        vram_gb_min=0.0,  # UNKNOWN — never a guessed VRAM floor for a live row
+        ram_gb_min=0.0,
+        engine_managed_fit=False,
+        status="known",
+        note=("vetted live entry (A1): file set resolved from the repo file "
+              "list; no published VRAM floor — fit is a size advisory only"),
+    )
+    return {"ok": True, "action": "vetted", "model_id": repo_id,
+            "entry": entry, "resolution": resolution,
+            "pipeline_tag": pipeline_tag,
+            "modality": modality or "unknown",
+            "engine_candidates": list(engines),
+            "size_gb": size_gb,
+            "detail": (f"vetted: primary weights "
+                       f"{resolution['file']} ({size_gb:g} GB) resolved from "
+                       f"the {repo_id} file list; VRAM floor unknown (size-"
+                       "based fit only); engine candidates: "
+                       + (", ".join(engines) or "none"))}
 
 
 def _as_data_url(value: str) -> str:
