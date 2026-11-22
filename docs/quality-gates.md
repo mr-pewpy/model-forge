@@ -10,9 +10,9 @@ This document records an audit of the Model Forge repository against 10 numeric 
 | 2. Cognitive complexity | < 22 per function | 1 violation (generate(), 22) | 0 violations | pass |
 | 3. Halstead difficulty | < 80 per module | pass | pass | pass |
 | 4. Lines of code per file | < 500 | pass | pass (no production file over) | pass |
-| 5. Test coverage | 100% | 45% core, 0% providers | 93% core, 92% providers | fail (short of target) |
+| 5. Test coverage | 100% | 45% core, 0% providers | 91% core (829 tests) | fail (short of target, improved) |
 | 6. CRAP score | < 25 | 7 violations (worst 756) | 0 violations (worst 21.1) | pass |
-| 7. Surviving mutants | 0 | not measured | not measured | not measured |
+| 7. Surviving mutants | 0 | not measured | tool runs, not yet measured | in progress (see notes) |
 | 8. Dead code | 0 | pass | pass | pass |
 | 9. Duplicated code | 0 | ~4% | ~3% | fail (kept, see notes) |
 | 10. any/unknown types | 0 | low (Python Any in payload typing) | unchanged | fail (kept, see notes) |
@@ -28,9 +28,8 @@ This document records an audit of the Model Forge repository against 10 numeric 
 
 ## Notes and honest caveats
 
-- Coverage target is 100% (gate 5). Current is 93% core / 92% providers. The uncovered lines are mostly error-degradation branches that need a live engine to reach.
-- CRAP scores use file-level coverage as a proxy (function-level coverage is not instrumented). A function can score better or worse than its file.
-- Gate 7 (mutation testing) is not measured: the mutmut tool would not run in this environment.
+- Coverage target is 100% (gate 5). Current is 91% (829 tests, up from 45% at the first audit). The uncovered lines are mostly error-degradation branches that need a live engine to reach. A19 added live-engine fixtures (tests/test_degradation_fixtures.py, tests/test_tools_degradation.py) that inject engine/filesystem/config faults to OBSERVE those branches — credentials, discovery, storage, pull, targets, media and the tools refusal paths now degrade under test rather than staying uncovered. The residual gap is concentrated in tools.py / facade.py / broker.py engine-adjacent error paths that need a real engine to trigger.
+- Gate 7 (mutation testing) is no longer "would not run": mutmut installs, generates mutants (~8.6k across the tree) and the suite passes under its mutants/ copy — the path-anchored package/data loads were fixed to resolve the real repo root (tests/_repo.py), which was the original blocker. BUT mutmut's test-to-mutant coverage mapping does not correlate under this multi-package layout: `model_forge` is imported via pytest.ini `pythonpath = model-forge`, so coverage records the real module path while mutmut swaps code under mutants/ — it reports "no test case for any mutant." A surviving-mutant count needs mutmut to import through that pythonpath. Gate 7 is honestly "tool runs, not yet measured" — it is NEVER reported as 0 surviving mutants until a real count lands.
 - Gate 4: two test files exceed 500 lines (tests/test_tools.py, tests/test_providers.py). The gate targets production god-files and no production file is over.
 - Gate 9: the image and video providers share ~15 lines of similar adapter code. They are independent plugin packages (each loads standalone) and a shared base would break that property, so the duplication is kept and documented.
 - Gate 10: Python `Any` appears in JSON-payload type hints (`Dict[str, Any]`). This is idiomatic for OpenAI-style payloads and is kept. The JS desktop pane is clean.

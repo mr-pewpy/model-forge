@@ -1,0 +1,3802 @@
+"""Handler, schema, hardware, and pull tests.
+
+The ``model_forge_*`` tool handlers are thin JSON wrappers around the pure
+planners (covered in test_planners.py) plus lazy imports of Hermes internals
+(``plugins.plugin_storage``, ``hermes_cli.*``) and stdlib urllib. We stub those
+internals in ``sys.modules`` and point urllib at canned responses so no test
+touches the network, the real plugin data dir, or the live Hermes config.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import sys
+import tempfile
+import types
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+from model_forge import hardware, pull, schemas
+from model_forge.broker import EngineLifecycle
+from model_forge.registry import models_for
+from model_forge.targets import (
+    ComputeTarget,
+    add_target,
+    get_target,
+    load_targets,
+)
+
+_REMOTE = ComputeTarget(id="gpu-box", label="GPU Box", kind="lan",
+                     base_url="http://gpu-box.example.com:8080",
+                     vram_gb=48.0, ram_gb=96.0)
+_LOCAL = ComputeTarget(id="local", label="This machine",
+                       base_url="http://127.0.0.1:8080", kind="local")
+
+
+def _entry(mid):
+    return next(m for m in models_for() if m.id == mid)
+
+
+# --- shared stubs -----------------------------------------------------------
+
+def _stub_hermes_modules(monkeypatch, data_dir: Path):
+    """Point the lazy Hermes imports the handlers reach for at fakes, and
+    HOME at a temp dir so the storage inventory never scans the real home."""
+    plugins = types.ModuleType("plugins")
+    storage = types.ModuleType("plugins.plugin_storage")
+    storage.plugin_data_dir = lambda name: data_dir / name
+    plugins.plugin_storage = storage
+    monkeypatch.setitem(sys.modules, "plugins", plugins)
+    monkeypatch.setitem(sys.modules, "plugins.plugin_storage", storage)
+    monkeypatch.setenv("HOME", str(data_dir / "home"))
+    (data_dir / "home").mkdir(exist_ok=True)
+
+    cfg_mod = types.ModuleType("hermes_cli.config")
+    cfg_mod.load_config_readonly = lambda: {}
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", cfg_mod)
+
+    # agent.file_safety is the core read-block chokepoint: default it to a
+    # no-op (nothing blocked), monkeypatch raise to simulate blocked paths.
+    agent_pkg = sys.modules.get("agent") or types.ModuleType("agent")
+    fs_mod = types.ModuleType("agent.file_safety")
+    fs_mod.raise_if_read_blocked = lambda path: None
+    agent_pkg.file_safety = fs_mod
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.file_safety", fs_mod)
+
+
+def _ok_engine(monkeypatch, modalities=("chat",)):
+    """Make detect_engines report one available openai-compatible engine."""
+    from model_forge.engines import base
+
+    e = base.EngineStatus(id="openai-compatible", display_name="OpenAI-compat",
+                          available=True,
+                          endpoint="http://gpu-box.example.com:8080/v1",
+                          modalities=modalities)
+    monkeypatch.setattr(
+        "model_forge.tools.detect_engines",
+        lambda base_url="", **kw: [e],
+    )
+
+
+# --- schemas.py -------------------------------------------------------------
+
+def test_schema_shapes():
+    # every tool is named, described, and is a well-formed JSON-schema object
+    for name, spec in [("model_forge_status", schemas.STATUS),
+                       ("model_forge_browse", schemas.BROWSE),
+                       ("model_forge_target_add", schemas.TARGET_ADD),
+                       ("model_forge_install", schemas.INSTALL),
+                       ("model_forge_generate_media", schemas.GENERATE_MEDIA),
+                       ("model_forge_activate", schemas.ACTIVATE),
+                       ("model_forge_storage", schemas.STORAGE),
+                       ("model_forge_broker", schemas.BROKER)]:
+        assert spec["name"] == name
+        assert spec["description"].strip()
+        assert spec["parameters"]["type"] == "object"
+        assert isinstance(spec["parameters"].get("properties", {}), dict)
+
+
+def test_browse_modality_enum_is_complete():
+    from model_forge.registry import MODALITIES
+
+    enum = set(schemas.BROWSE["parameters"]["properties"]["modality"]["enum"])
+    assert set(MODALITIES) == enum
+
+
+def test_activate_requires_model_id():
+    assert schemas.ACTIVATE["parameters"]["required"] == ["model_id"]
+    assert schemas.GENERATE_MEDIA["parameters"]["required"] == ["modality"]
+    assert schemas.TARGET_ADD["parameters"]["required"] == ["id", "base_url"]
+
+
+def test_activate_schema_documents_the_facade_surface():
+    # facade=true is the model-forge-facade activation: it writes BOTH consumer
+    # surfaces (custom_providers + auxiliary.vision) with canonical ids.
+    assert "facade" in schemas.ACTIVATE["parameters"]["properties"]
+    assert "facade=true" in schemas.ACTIVATE["description"]
+    desc = schemas.ACTIVATE["parameters"]["properties"]["facade"]["description"]
+    assert "custom_providers" in desc and "auxiliary.vision" in desc
+    assert "canonical" in desc          # ids written as canonical facade ids
+    # additive: the required list is unchanged.
+    assert schemas.ACTIVATE["parameters"]["required"] == ["model_id"]
+
+
+def test_storage_schema_shape():
+    spec = schemas.STORAGE
+    props = spec["parameters"]["properties"]
+    assert props["action"]["enum"] == ["list", "delete", "resources"]
+    assert "entry" in props  # entry identifier or exact path for delete
+    assert "target" in props  # optional compute target filter for resources
+    assert spec["parameters"].get("required", []) == []  # list is the default
+    # resources is documented as explicit and on-demand
+    assert "on-demand" in spec["description"]
+    assert "resources" in props["action"]["description"]
+
+
+# --- hardware.py ------------------------------------------------------------
+
+def test_probe_hardware_returns_profile(monkeypatch):
+    monkeypatch.setattr(hardware.shutil, "which", lambda _: None)
+    prof = hardware.probe_hardware()
+    assert prof.gpus == ()
+    assert prof.total_vram_gb == 0.0
+    # platform labels may carry an arch suffix (e.g. "darwin-arm64")
+    assert prof.platform.split("-")[0] in ("linux", "darwin", "macos",
+                                           "windows")
+    assert prof.ram_gb >= 0.0
+
+
+def test_probe_hardware_parses_nvidia(monkeypatch):
+    import subprocess
+
+    monkeypatch.setattr(hardware.shutil, "which", lambda _: "/usr/bin/nvidia-smi")
+    fake = subprocess.CompletedProcess(args=hardware._NVIDIA_SMI,
+                                       stdout="NVIDIA A100, 40960\n",
+                                       stderr="", returncode=0)
+    monkeypatch.setattr(hardware.subprocess, "run", lambda *a, **k: fake)
+    prof = hardware.probe_hardware()
+    assert len(prof.gpus) == 1
+    assert prof.gpus[0]["name"] == "NVIDIA A100"
+    assert prof.gpus[0]["vram_gb"] == 40.0
+    assert prof.total_vram_gb == 40.0
+
+
+def test_probe_hardware_bad_nvidia_lines(monkeypatch):
+    import subprocess
+
+    monkeypatch.setattr(hardware.shutil, "which", lambda _: "/usr/bin/nvidia-smi")
+    fake = subprocess.CompletedProcess(
+        args=hardware._NVIDIA_SMI,
+        stdout="NotA,GPU,xx\nbad line without comma\n",
+        stderr="", returncode=0)
+    monkeypatch.setattr(hardware.subprocess, "run", lambda *a, **k: fake)
+    prof = hardware.probe_hardware()
+    # no line parses into a float VRAM -> no GPUs
+    assert prof.gpus == ()
+
+
+def test_probe_hardware_nvidia_error(monkeypatch):
+    import subprocess
+
+    monkeypatch.setattr(hardware.shutil, "which", lambda _: "/usr/bin/nvidia-smi")
+
+    def boom(*a, **k):
+        raise subprocess.SubprocessError("nvidia-smi died")
+    monkeypatch.setattr(hardware.subprocess, "run", boom)
+    prof = hardware.probe_hardware()
+    assert prof.gpus == ()
+
+
+def test_ram_gb_reads_sysconf(monkeypatch):
+    monkeypatch.setattr(hardware.os, "sysconf",
+                        lambda key: {"SC_PHYS_PAGES": 4194304,
+                                     "SC_PAGE_SIZE": 4096}[key])
+    assert hardware._ram_gb() == pytest.approx(16.0)
+
+
+def test_ram_gb_degrades_to_zero(monkeypatch):
+    def raise_oserror(key):
+        raise OSError("no sysconf here")
+    monkeypatch.setattr(hardware.os, "sysconf", raise_oserror)
+    assert hardware._ram_gb() == 0.0
+
+
+# --- pull.py ----------------------------------------------------------------
+
+def test_download_plan_validation():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        assert pull.download_plan("https://x/y.bin", str(root / "y.bin"),
+                                  allowed_roots=[root])["ok"] is True
+    assert pull.download_plan("ftp://x/y", "/abs/y.bin")["ok"] is False
+    assert pull.download_plan("https://x/y.bin", "rel/y.bin")["ok"] is False
+
+
+def test_download_plan_confinement(tmp_path):
+    root = tmp_path / "downloads"
+    root.mkdir()
+    # inside the root: fine
+    ok = pull.download_plan("https://x/y.bin", str(root / "a" / "y.bin"),
+                            allowed_roots=[root])
+    assert ok["ok"] is True
+    # outside the root: refused (this is the arbitrary-overwrite fix)
+    out = pull.download_plan("https://x/y.bin", str(tmp_path / "victim.bin"),
+                             allowed_roots=[root])
+    assert out["ok"] is False and "dest must be inside" in out["error"]
+    # traversal after the root is resolved and refused too
+    trav = pull.download_plan("https://x/y.bin",
+                              str(root / ".." / "victim.bin"),
+                              allowed_roots=[root])
+    assert trav["ok"] is False
+
+
+def test_download_plan_refuses_symlink_dest(tmp_path):
+    root = tmp_path / "downloads"
+    root.mkdir()
+    outside = tmp_path / "victim.bin"
+    outside.write_bytes(b"precious")
+    link = root / "y.bin"
+    link.symlink_to(outside)
+    res = pull.download_plan("https://x/y.bin", str(link),
+                             allowed_roots=[root])
+    assert res["ok"] is False
+
+
+def test_download_plan_refuses_symlink_parent_escape(tmp_path):
+    root = tmp_path / "downloads"
+    root.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    link_dir = root / "sub"
+    link_dir.symlink_to(outside_dir)
+    res = pull.download_plan("https://x/y.bin", str(link_dir / "y.bin"),
+                             allowed_roots=[root])
+    assert res["ok"] is False
+
+
+def test_download_plan_user_roots(tmp_path):
+    root = tmp_path / "downloads"
+    root.mkdir()
+    models = tmp_path / "models"
+    models.mkdir()
+    # a user-configured root accepts its subtree
+    ok = pull.download_plan("https://x/y.bin", str(models / "y.bin"),
+                            allowed_roots=[root, models])
+    assert ok["ok"] is True
+
+
+def test_job_status_invalid_ids(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    # job_id is model-supplied: only the 12-hex shape start_download makes
+    for bad in ("../../auth", "", "x" * 12, "AABBCCDD0011",
+                "aabbccdd001", "aabbccdd00112", "aabbccdd001a/../x",
+                "aabbccdd001a.json"):
+        got = pull.job_status(bad)
+        assert got["state"] == "unknown", bad
+        assert "invalid job id" in got["error"], bad
+
+
+def test_job_status_missing_valid_id(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    got = pull.job_status("aabbccdd0011")
+    assert got["state"] == "unknown"
+    assert "aabbccdd0011" in got["error"]
+
+
+def test_start_download_validates(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    # bad url is rejected before any thread is spawned
+    res = pull.start_download("not-a-url", "/tmp/x.bin")
+    assert res["ok"] is False
+
+
+def test_start_download_and_poll(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    # fake the network: urlopen returns a body of b"hello"
+    import io
+    import urllib.request
+
+    class _Resp(io.BytesIO):
+        status = 200
+
+        def __init__(self, data):
+            super().__init__(data)
+            self.headers = {"Content-Length": "5"}
+
+        def read(self, n=-1):
+            return super().read(n)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self.close()
+
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, timeout=None: _Resp(b"hello"))
+    # dest must sit inside the stubbed plugin downloads root
+    dest = tmp_path / "model-forge" / "downloads" / "y.bin"
+    res = pull.start_download("https://huggingface.co/x/y.bin", str(dest))
+    assert res["ok"] is True and res["job_id"]
+    import time
+    for _ in range(100):
+        st = pull.job_status(res["job_id"])
+        if st.get("state") in ("done", "error"):
+            break
+        time.sleep(0.02)
+    assert st["state"] == "done"
+    assert st["done_bytes"] == 5
+    assert dest.read_bytes() == b"hello"
+
+
+def test_run_sha256_mismatch(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    import io
+    import urllib.request
+
+    class _Resp(io.BytesIO):
+        status = 200
+
+        def __init__(self, data):
+            super().__init__(data)
+            self.headers = {"Content-Length": "5"}
+
+        def read(self, n=-1):
+            return super().read(n)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self.close()
+
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda req, timeout=None: _Resp(b"hello"))
+    dest = str(tmp_path / "m.bin")
+    pull._run("aabbccdd0011", "https://huggingface.co/x/y.bin", dest,
+              "0" * 64)  # wrong digest
+    st = pull.job_status("aabbccdd0011")
+    assert st["state"] == "error"
+    assert "sha256 mismatch" in st["error"]
+    assert not Path(dest).exists()
+
+
+def test_run_resume_range(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    import io
+    import urllib.request
+
+    seen = {}
+
+    class _Resp(io.BytesIO):
+        status = 206
+
+        def __init__(self, data):
+            super().__init__(data)
+            self.headers = {"Content-Length": "3"}
+
+        def read(self, n=-1):
+            return super().read(n)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self.close()
+
+    def _fake(req, timeout=None):
+        seen["range"] = req.headers.get("Range")
+        return _Resp(b"llo")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake)
+    dest = str(tmp_path / "r.bin")
+    Path(dest + ".part").write_bytes(b"he")  # pre-existing partial
+    pull._run("aabbccdd0022", "https://huggingface.co/x/y.bin", dest, "")
+    assert seen["range"] == "bytes=2-"
+    assert Path(dest).read_bytes() == b"hello"
+
+
+# --- tools.py: target_add ---------------------------------------------------
+
+def test_target_add_validation_and_persist(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    # id required / not 'local'
+    err = json.loads(tools.model_forge_target_add({"id": "local",
+                                                   "base_url": "http://x:1"}))
+    assert "error" in err
+    # base_url must be http(s)
+    err = json.loads(tools.model_forge_target_add(
+        {"id": "gpu-box", "base_url": "ftp://x:1"}))
+    assert "error" in err
+    # happy path persists to the stubbed data dir
+    out = json.loads(tools.model_forge_target_add(
+        {"id": "gpu-box", "label": "GPU Box",
+         "base_url": "http://gpu-box.example.com:8080", "vram_gb": "48"}))
+    assert out["added"] == "gpu-box"
+    assert any(t["id"] == "gpu-box" for t in out["targets"])
+
+
+# --- tools.py: browse -------------------------------------------------------
+
+def test_browse_unknown_target(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    out = json.loads(tools.model_forge_browse({"target": "nope",
+                                               "modality": "image"}))
+    assert "error" in out
+
+
+def test_browse_lists_and_prices(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    # point get_target at our temp store by monkeypatching the handler's view
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    out = json.loads(tools.model_forge_browse({"target": "gpu-box",
+                                               "modality": "image"}))
+    assert out["target"] == "gpu-box"
+    # budget = declared VRAM + (RAM - 8 GB) = 48 + (96 - 8) = 136
+    assert out["hardware_budget_gb"] == 136.0
+    assert isinstance(out["models"], list)
+    for m in out["models"]:
+        assert "id" in m and "fit" in m and "modality" in m
+
+
+# --- tools.py: status -------------------------------------------------------
+
+def test_status_lists_targets_and_engines(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "load_targets",
+                        lambda: load_targets(base_dir=tmp_path))
+    _ok_engine(monkeypatch, ("image", "video"))
+    out = json.loads(tools.model_forge_status())
+    assert isinstance(out["targets"], list)
+    assert out["pull_credentials"] == {"HF_TOKEN": False,
+                                       "MODELSCOPE_API_TOKEN": False}
+    by_id = {t["id"]: t for t in out["targets"]}
+    assert "local" in by_id and "gpu-box" in by_id
+    eng = by_id["gpu-box"]["engines"][0]
+    assert eng["available"] is True and "image" in eng["modalities"]
+
+
+def test_status_remote_hw_uses_declared_budget(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "load_targets",
+                        lambda: load_targets(base_dir=tmp_path))
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
+    out = json.loads(tools.model_forge_status())
+    remote = next(t for t in out["targets"] if t["id"] == "gpu-box")
+    # remote target -> declared VRAM, not a live probe
+    assert remote["hardware"]["total_vram_gb"] == 48.0
+    assert remote["hardware"]["ram_gb"] == 96.0
+
+
+def test_status_error_path(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    def boom():
+        raise RuntimeError("targets exploded")
+    monkeypatch.setattr(tools, "load_targets", boom)
+    out = json.loads(tools.model_forge_status())
+    assert "error" in out and "targets exploded" in out["error"]
+
+
+# --- tools.py: install ------------------------------------------------------
+
+def test_install_unknown_model(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    out = json.loads(tools.model_forge_install(
+        {"model_id": "nope", "target": "local"}))
+    assert "error" in out
+
+
+def test_install_job_id_poll(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    (tmp_path / "model-forge" / "jobs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "model-forge" / "jobs" / "aabbccdd0033.json").write_text(
+        json.dumps({"job_id": "aabbccdd0033", "state": "done"}))
+    out = json.loads(tools.model_forge_install({"job_id": "aabbccdd0033"}))
+    assert out["job_id"] == "aabbccdd0033" and out["state"] == "done"
+    # a traversal-shaped job_id is rejected before it reaches the jobs dir
+    bad = json.loads(tools.model_forge_install({"job_id": "../../auth"}))
+    assert bad["state"] == "unknown" and "invalid job id" in bad["error"]
+
+
+def test_install_strata_runs_cli(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_LOCAL, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    out = json.loads(tools.model_forge_install(
+        {"model_id": "qwen3.8-flash-next", "target": "local",
+         "engine_model": "deepseek41:ist-das-2.00bpw"}))
+    assert out["ok"] is True and out["action"] == "run_cli_on_target"
+
+
+def test_install_maya_pull(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    # stub the Maya HTTP pull to return a canned job row
+    monkeypatch.setattr(tools.maya_adapter, "pull",
+                        lambda model, detach=False, base_url="":
+                        {"ok": True, "job": "maya-1"})
+    out = json.loads(tools.model_forge_install(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box"}))
+    assert out["action"] == "maya_pull"
+    assert out["pull_response"] == {"ok": True, "job": "maya-1"}
+
+
+def test_install_maya_no_response(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools.maya_adapter, "pull",
+                        lambda model, detach=False, base_url="": None)
+    out = json.loads(tools.model_forge_install(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box"}))
+    assert out["ok"] is False and "pull_response" not in out
+
+
+# --- tools.py: activate -----------------------------------------------------
+
+def test_activate_unknown_model(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "nope", "target": "local"}))
+    assert "error" in out
+
+
+def test_activate_plan_only(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _ok_engine(monkeypatch, ("chat", "image"))
+    # the media hint is emitted only when the endpoint serves the route
+    monkeypatch.setattr(tools, "route_exists",
+                        lambda root, path, timeout=2.0: True)
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box"}))
+    assert out["ok"] is True and out["applied"] is False
+    assert "hint" in out
+    # image modality present AND the route served -> media setup hint
+    assert "media_setup" in out and "image_gen" in out["media_setup"]
+
+
+def test_activate_apply_writes(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _ok_engine(monkeypatch, ("chat",))
+    setup = types.ModuleType("hermes_cli.model_setup")
+    setup.persist_model_selection = (
+        lambda model, provider, base_url="", api_mode=None: {"model": model})
+    monkeypatch.setitem(sys.modules, "hermes_cli.model_setup", setup)
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box", "apply": True}))
+    assert out["applied"] is True
+    # engine_model not passed -> the plan's model is the registry entry id
+    assert out["saved_model_section"] == {"model": "glm-5.3-flash"}
+
+
+# --- tools.py: generate_media -----------------------------------------------
+
+def _fake_urlopen(monkeypatch, payload: bytes, status=200, exc=None):
+    import io
+    import urllib.request
+
+    class _Resp(io.BytesIO):
+        def __init__(self, data, status):
+            super().__init__(data)
+            self.status = status
+            self.headers = {}
+
+        def read(self, n=-1):
+            return super().read(n)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self.close()
+
+    def _fake(req, timeout=None):
+        if exc is not None:
+            raise exc
+        return _Resp(payload, status)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake)
+
+
+def test_generate_media_unknown_target(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "nope"}))
+    assert "error" in out
+
+
+def test_generate_media_3d_needs_args(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit_job",
+                         "submit": "http://gpu-box.example.com:8080/jobs"})
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box"}))
+    assert out["action"] == "needs_args"
+
+
+def test_generate_media_3d_submit(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit_job",
+                         "submit": "http://gpu-box.example.com:8080/jobs"})
+    _fake_urlopen(monkeypatch, json.dumps({"id": "3djob-1"}).encode())
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box", "model": "gen/3d",
+         "image": "https://example.com/x.png"}))
+    assert out["ok"] is True and out["action"] == "submitted"
+    assert out["submitted"]["id"] == "3djob-1"
+
+
+def test_generate_media_3d_submit_failure(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit_job",
+                         "submit": "http://gpu-box.example.com:8080/jobs"})
+    _fake_urlopen(monkeypatch, b"", exc=RuntimeError("conn refused"))
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box", "model": "gen/3d",
+         "image": "https://example.com/x.png"}))
+    assert out["action"] == "submit_failed"
+
+
+def test_generate_media_3d_http_error_surfaces_status_and_body(tmp_path,
+                                                               monkeypatch):
+    import io
+    import urllib.error
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit_job",
+                         "submit": "http://gpu-box.example.com:8080/jobs"})
+    exc = urllib.error.HTTPError(
+        "http://gpu-box.example.com:8080/jobs", 502, "Bad Gateway",
+        hdrs=None, fp=io.BytesIO(b'{"detail":"engine exploded"}'))
+    _fake_urlopen(monkeypatch, b"", exc=exc)
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box", "model": "gen/3d",
+         "image": "https://example.com/x.png"}))
+    # fail closed, but the detail names the HTTP status and a response
+    # snippet instead of a generic submit_failed
+    assert out["ok"] is False and out["action"] == "submit_failed"
+    assert out["http_status"] == 502
+    assert "502" in out["error"]
+    assert "engine exploded" in out["error"]
+    assert out["response_snippet"] == '{"detail":"engine exploded"}'
+
+
+def test_generate_media_music_http_error_surfaces_status_and_body(tmp_path,
+                                                                  monkeypatch):
+    import io
+    import urllib.error
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit",
+                         "submit": "http://gpu-box.example.com:8080"
+                                   "/v1/audio/music"})
+    exc = urllib.error.HTTPError(
+        "http://gpu-box.example.com:8080/v1/audio/music", 500,
+        "Internal Server Error", hdrs=None,
+        fp=io.BytesIO(b"<html>gateway refused the prompt</html>"))
+    _fake_urlopen(monkeypatch, b"", exc=exc)
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "music", "target": "gpu-box", "model": "gen/music",
+         "prompt": "lofi"}))
+    assert out["ok"] is False and out["action"] == "submit_failed"
+    assert out["http_status"] == 500
+    assert "500" in out["error"]
+    assert "gateway refused the prompt" in out["error"]
+
+
+def test_generate_media_music_needs_args(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit_job",
+                         "submit": "http://gpu-box.example.com:8080/audio"})
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "music", "target": "gpu-box"}))
+    assert out["action"] == "needs_args"
+
+
+def test_generate_media_music_done(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit_job",
+                         "submit": "http://gpu-box.example.com:8080/audio"})
+    _fake_urlopen(monkeypatch, json.dumps({"url": "http://x/a.mp3"}).encode())
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "music", "target": "gpu-box", "model": "gen/music",
+         "prompt": "lofi"}))
+    assert out["ok"] is True and out["action"] == "done"
+    assert out["result"]["url"] == "http://x/a.mp3"
+    # the synchronous wait is stated in the output
+    assert "blocked" in out["note"]
+
+
+def test_generate_media_route_missing(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": False, "action": "route_missing"})
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box", "model": "gen/3d",
+         "image": "https://example.com/x.png"}))
+    assert out["action"] == "route_missing"
+
+
+# --- tools.py: _as_data_url (confined) --------------------------------------
+
+def test_as_data_url_passthrough():
+    from model_forge import tools
+
+    assert tools._as_data_url("https://x/y.png") == "https://x/y.png"
+    assert tools._as_data_url("data:image/png;base64,AA") \
+        == "data:image/png;base64,AA"
+
+
+def _png(tmp_path, name="x.png", data=None):
+    p = tmp_path / name
+    p.write_bytes(data if data is not None
+                  else b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+    return p
+
+
+def test_as_data_url_local_file(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    p = _png(tmp_path)
+    got = tools._as_data_url(str(p))
+    assert got.startswith("data:image/png;base64,")
+    assert base64.b64decode(got.split(",", 1)[1]) == p.read_bytes()
+
+
+def test_as_data_url_jpeg_and_webp(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    j = tmp_path / "x.jpg"
+    j.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 8)
+    assert tools._as_data_url(str(j)).startswith("data:image/jpeg;base64,")
+    w = tmp_path / "x.webp"
+    w.write_bytes(b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 4)
+    assert tools._as_data_url(str(w)).startswith("data:image/webp;base64,")
+
+
+def test_as_data_url_missing_path_errors(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    # the old code passed raw strings through — that let any file be named
+    with pytest.raises(ValueError):
+        tools._as_data_url("/does/not/exist/x.png")
+
+
+def test_as_data_url_blocked_path_errors(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    import agent.file_safety as fs
+
+    def blocked(path):
+        raise ValueError("read blocked: secrets area")
+    monkeypatch.setattr(fs, "raise_if_read_blocked", blocked)
+    from model_forge import tools
+
+    with pytest.raises(ValueError, match="read blocked"):
+        tools._as_data_url(str(tmp_path / "auth.json"))
+
+
+def test_as_data_url_suffix_and_magic_enforced(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    # wrong suffix
+    bad_suffix = tmp_path / "x.txt"
+    bad_suffix.write_bytes(b"\x89PNG\r\n\x1a\n")
+    with pytest.raises(ValueError, match="unsupported image type"):
+        tools._as_data_url(str(bad_suffix))
+    # right suffix, wrong content (magic bytes)
+    fake = _png(tmp_path, "fake.png", data=b"#!/bin/sh\nrm -rf ~\n")
+    with pytest.raises(ValueError, match="magic bytes"):
+        tools._as_data_url(str(fake))
+
+
+def test_as_data_url_size_cap(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    big = _png(tmp_path, "big.png",
+               data=b"\x89PNG\r\n\x1a\n" + b"\x00" * 1024)
+    monkeypatch.setattr(tools, "_MAX_IMAGE_BYTES", 512)
+    with pytest.raises(ValueError, match="too large"):
+        tools._as_data_url(str(big))
+
+
+def test_as_data_url_file_scheme_validated(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    p = _png(tmp_path)
+    got = tools._as_data_url("file://" + str(p))
+    assert got.startswith("data:image/png;base64,")
+    # file:// does not smuggle past validation
+    with pytest.raises(ValueError):
+        tools._as_data_url("file:///does/not/exist/x.png")
+
+
+def test_generate_media_invalid_image(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit_job",
+                         "submit": "http://gpu-box.example.com:8080/jobs"})
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box", "model": "gen/3d",
+         "image": "/etc/shadow"}))
+    assert out["action"] == "invalid_image"
+
+
+# --- tools.py: policy_hook (approval gate) ----------------------------------
+
+def test_policy_hook_target_add_requires_approval():
+    from model_forge import tools
+
+    d = tools.policy_hook("model_forge_target_add",
+                          {"id": "evil", "label": "evil",
+                           "base_url": "https://evil.example:8080"})
+    assert d["action"] == "approve"
+    assert "https://evil.example:8080" in d["message"]
+    assert d["rule_key"] == "model-forge:target_add"
+
+
+def test_policy_hook_activate_apply_requires_approval():
+    from model_forge import tools
+
+    d = tools.policy_hook("model_forge_activate",
+                          {"model_id": "m1", "target": "gpu-box",
+                           "apply": True})
+    assert d["action"] == "approve"
+    assert "model_id" in d["message"]
+    assert d["rule_key"] == "model-forge:activate"
+
+
+def test_policy_hook_plan_only_passes():
+    from model_forge import tools
+
+    # plan-only activate and every other call need no approval
+    assert tools.policy_hook("model_forge_activate",
+                             {"model_id": "m1"}) is None
+    assert tools.policy_hook("model_forge_activate",
+                             {"model_id": "m1", "apply": False}) is None
+    assert tools.policy_hook("model_forge_status", {}) is None
+    assert tools.policy_hook("model_forge_browse", {}) is None
+    assert tools.policy_hook("terminal", {"command": "ls"}) is None
+    assert tools.policy_hook("model_forge_install", {"model_id": "m"}) is None
+
+
+def test_policy_hook_storage_delete_requires_approval(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    downloads = tmp_path / "model-forge" / "downloads"
+    downloads.mkdir(parents=True)
+    f = downloads / "weights.bin"
+    f.write_bytes(b"12345")
+    from model_forge import tools
+
+    # delete escalates with the exact path and size being deleted
+    for ref in (str(f), "plugin-downloads:weights.bin"):
+        d = tools.policy_hook("model_forge_storage",
+                              {"action": "delete", "entry": ref})
+        assert d["action"] == "approve", ref
+        assert str(f) in d["message"], ref
+        assert "5 bytes" in d["message"], ref
+        assert d["rule_key"] == "model-forge:storage_delete"
+    # an unlisted ref still escalates (fail closed); the handler refuses it
+    d = tools.policy_hook("model_forge_storage",
+                          {"action": "delete", "entry": "nope"})
+    assert d["action"] == "approve"
+    assert "nope" in d["message"]
+
+
+def test_policy_hook_storage_list_passes():
+    from model_forge import tools
+
+    # listing is read-only: no approval, and no storage walk either
+    assert tools.policy_hook("model_forge_storage", {}) is None
+    assert tools.policy_hook("model_forge_storage",
+                             {"action": "list"}) is None
+
+
+# --- honesty fixes: required args, job_id shape, fresh strings, modality ----
+
+def test_install_and_activate_require_model_id(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    # empty args must say what is required — never leak a literal 'None'
+    out = json.loads(tools.model_forge_install({}))
+    assert out["error"] == "model_id required (or job_id to poll a download)"
+    assert "None" not in json.dumps(out)
+    out = json.loads(tools.model_forge_install({"model_id": ""}))
+    assert "model_id required" in out["error"]
+    assert "None" not in json.dumps(out)
+    out = json.loads(tools.model_forge_activate({}))
+    assert "model_id required" in out["error"]
+    assert "None" not in json.dumps(out)
+
+
+def test_generate_media_3d_job_id_is_shape_validated(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit_job",
+                         "submit": "http://gpu-box.example.com:8080/jobs"})
+
+    def _no_call(req, timeout=None):
+        raise AssertionError("an invalid job_id must never reach the target")
+
+    monkeypatch.setattr("urllib.request.urlopen", _no_call)
+    for bad in ("../secret", "..", "a/b", "x" * 129, "id 1", "ünicode",
+                "job;rm", "a%2e%2e", "-bad\u2013dash"):
+        out = json.loads(tools.model_forge_generate_media(
+            {"modality": "3d", "target": "gpu-box", "job_id": bad}))
+        assert out["ok"] is False and out["action"] == "invalid_job_id", bad
+        assert "job_id" in out["error"]
+    # a well-formed id (letters, digits, _ and -) is forwarded and polled
+    _fake_urlopen(monkeypatch, json.dumps({"status": "done"}).encode())
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box", "job_id": "job-1_A"}))
+    assert out["job"] == {"status": "done"}
+
+
+def test_generate_media_music_audio_bytes_saved(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit",
+                         "submit": "http://gpu-box.example.com:8080"
+                                   "/v1/audio/music"})
+    wav = b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 8
+    _fake_urlopen(monkeypatch, wav)
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "music", "target": "gpu-box", "model": "gen/music",
+         "prompt": "lofi"}))
+    # audio bytes are saved under the plugin media dir, not JSON-decoded
+    assert out["ok"] is True and out["action"] == "done"
+    saved = Path(out["audio"])
+    assert saved.is_file() and saved.read_bytes() == wav
+    assert str(tmp_path / "model-forge" / "media") in out["audio"]
+    assert saved.suffix == ".wav"
+    assert out["bytes"] == len(wav)
+    assert "blocked" in out["note"] and str(saved) in out["note"]
+    # other non-JSON bodies are saved too (honest .bin, no JSONDecodeError)
+    _fake_urlopen(monkeypatch, b"<html>gateway error page</html>")
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "sfx", "target": "gpu-box", "model": "gen/sfx",
+         "prompt": "boom"}))
+    assert out["ok"] is True and out["action"] == "done"
+    saved = Path(out["audio"])
+    assert saved.suffix == ".bin"
+    assert saved.read_bytes() == b"<html>gateway error page</html>"
+
+
+def test_browse_fresh_falsey_strings_skip_network(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
+
+    def no_network(*a, **k):
+        raise AssertionError("the live layer must not run for a falsey arg")
+
+    monkeypatch.setattr("model_forge.discovery.fresh_models", no_network)
+    for falsey in (False, "false", "FALSE", "0", "no", " No "):
+        out = json.loads(tools.model_forge_browse(
+            {"target": "gpu-box", "modality": "3d", "fresh": falsey}))
+        assert out["live_discovery"] == "disabled", falsey
+        assert out["fresh"] == []
+    # a truthy string still enables the live layer
+    monkeypatch.setattr(
+        "model_forge.discovery.fresh_models",
+        lambda modality=None: {"live_discovery": "ok", "models": []})
+    out = json.loads(tools.model_forge_browse(
+        {"target": "gpu-box", "modality": "3d", "fresh": "true"}))
+    assert out["live_discovery"] == "ok"
+
+
+def test_browse_invalid_modality_names_valid_ones(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+
+    out = json.loads(tools.model_forge_browse({"modality": "banana"}))
+    assert "error" in out and "models" not in out
+    assert "banana" in out["error"]
+    assert "chat" in out["error"] and "music" in out["error"]
+
+
+def test_activate_apply_refuses_placeholder_ids(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _ok_engine(monkeypatch, ("chat",))
+
+    def _forbidden(*a, **k):
+        raise AssertionError("a placeholder id must never be persisted")
+
+    setup = types.ModuleType("hermes_cli.model_setup")
+    setup.persist_model_selection = _forbidden
+    monkeypatch.setitem(sys.modules, "hermes_cli.model_setup", setup)
+    # catalog marker: refuse apply with an honest message
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "core-gguf-catalog", "target": "gpu-box", "apply": True}))
+    assert out["ok"] is False
+    assert out["action"] == "placeholder_not_activatable"
+    assert "catalog marker" in out["detail"]
+    assert out["applied"] is False
+    # stub entries are refused the same way
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "world-model-slot", "target": "gpu-box", "apply": True}))
+    assert out["ok"] is False and out["action"] == "placeholder_not_activatable"
+    assert "placeholder" in out["detail"]
+    assert out["applied"] is False
+    assert "hint" not in out   # no 'apply=true' nudge on a refusal
+
+
+def test_activate_media_setup_gated_on_route_probe(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    # engine advertises image/video but the endpoint serves neither route
+    # (ComfyUI-style modality listing)
+    _ok_engine(monkeypatch, ("chat", "image", "video"))
+    monkeypatch.setattr(tools, "route_exists",
+                        lambda root, path, timeout=2.0: False)
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box"}))
+    assert out["ok"] is True
+    assert "media_setup" not in out
+    assert "/v1/images/generations" in out["media_setup_note"]
+    assert "/v1/videos/generations" in out["media_setup_note"]
+    # partial serving: only the image route answers the probe
+    monkeypatch.setattr(
+        tools, "route_exists",
+        lambda root, path, timeout=2.0: path == "/v1/images/generations")
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box"}))
+    assert "image_gen" in out["media_setup"]
+    assert "video_gen" not in out.get("media_setup", {})
+    assert "/v1/videos/generations" in out["media_setup_note"]
+
+
+# --- schema honesty ---------------------------------------------------------
+
+def test_generate_media_schema_honest_about_gateway():
+    schema = schemas.GENERATE_MEDIA
+    desc = schema["description"]
+    # the enum admits every modality the handler actually ships
+    enum = schema["parameters"]["properties"]["modality"]["enum"]
+    assert set(enum) == {"3d", "music", "sfx", "image", "video"}
+    # the gateway lanes for 3d/music/sfx are named
+    assert "media gateway" in desc
+    assert "/v1/videos/generations" in desc
+    assert "/v1/audio/music" in desc and "/v1/audio/sfx" in desc
+    # the shipped local ComfyUI runner path and facade video API are stated
+    assert "ComfyUI" in desc and "workflow runner" in desc
+    assert "/v1/images/generations" in desc
+    assert "/v1/videos" in desc
+    # the ComfyUI-native flow is a known limit ONLY for 3d/music/sfx
+    assert "not implemented" in desc
+    assert "3d/music/sfx" in desc
+
+
+def test_install_schema_example_is_a_real_repo_path():
+    desc = schemas.INSTALL["parameters"]["properties"]["engine_model"][
+        "description"]
+    assert "model.safetensors" not in desc    # the 404-prone example is gone
+    assert "diffusion_models/your-weights.safetensors" in desc
+    assert "omit engine_model" in desc
+
+
+# --- tools.py: engine_install (approved vendor installers) ------------------
+
+_OLLAMA_URL = "https://ollama.com/install.sh"
+_OLLAMA_SHA = ("25f64b810b947145095956533e1bdf56eacea2673c55a7e586be4515fc882c9f")
+_STRATA_URL = ("https://github.com/Niko1221/Strata/releases/download/v0.2.15/"
+               "install.sh")
+_STRATA_SHA = ("1fcfbab133880249b7a6eaefb643f25b29a9b8f45624d2d8673e35948c329eda")
+_MAYA_REPO = "https://github.com/mw00/project-maya"
+_MAYA_COMMIT = "56b5216ab4464ac41c26b1be32eb63b98de53d0a"
+
+
+def _plan_command(engine):
+    from model_forge import tools
+    return tools.engine_install_plan(engine)["command"]
+
+
+def _installer_spy(monkeypatch, result=None, raise_exc=None):
+    """Fake installer runner: records the exact commands it is asked to run.
+    Tests never run a real installer."""
+    calls = []
+
+    def runner(command, timeout_s):
+        calls.append(command)
+        if raise_exc is not None:
+            raise raise_exc
+        return result or {"returncode": 0, "output_tail": "install ok"}
+
+    monkeypatch.setattr("model_forge.tools._run_installer", runner)
+    return calls
+
+
+def _stage_spy(monkeypatch, tmp_path, ok=True, error="checksum mismatch"):
+    """Fake stager: pretends the pinned artifact verified (writing a local
+    file) or failed. Records nothing real and never downloads or clones."""
+    calls = []
+    artifact = tmp_path / "staged-install.sh"
+
+    def stager(engine):
+        calls.append(engine)
+        if not ok:
+            return {"ok": False, "error": f"{error} — nothing was run"}
+        artifact.write_text("#!/bin/sh\ntrue\n")
+        return {"ok": True, "artifact": str(artifact),
+                "command": f"sh {artifact}"}
+
+    monkeypatch.setattr("model_forge.tools._stage_installer", stager)
+    return calls
+
+
+def _simulate_approval_gate(tool_name, args, decision, dispatch):
+    """Emulate the Hermes human-approval gate contract for a pre_tool_call
+    approve directive: only an explicit user approval lets the call reach
+    the handler; denial, timeout or a gate error blocks the call BEFORE the
+    handler runs (fail closed) — nothing executes."""
+    from model_forge import tools
+    directive = tools.policy_hook(tool_name, args)
+    if directive is not None and directive.get("action") == "approve" \
+            and decision != "approve":
+        return {"blocked": True, "directive": directive}
+    return {"blocked": False, "result": dispatch(args)}
+
+
+def _poll_until_done(job_id, rounds=100):
+    import time
+    from model_forge import tools
+    st = {}
+    for _ in range(rounds):
+        st = json.loads(tools.model_forge_install({"job_id": job_id}))
+        if st.get("state") in ("done", "error", "timeout"):
+            return st
+        time.sleep(0.02)
+    return st
+
+
+def test_engine_install_plan_shows_pinned_command_before_execute(tmp_path,
+                                                                 monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    calls = _installer_spy(monkeypatch)
+    out = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "ollama"}))
+    # plan first: the pinned pipeline is described, and the exact command the
+    # runner will execute is shown — nothing ran
+    assert out["ok"] is True and out["action"] == "vendor_installer"
+    assert out["executed"] is False and "job_id" not in out
+    assert _OLLAMA_URL in out["pipeline"] and _OLLAMA_SHA in out["pipeline"]
+    assert "latest" not in out["pipeline"] and "latest" not in out["command"]
+    # the display is honest: no fake sha256sum pipeline, and the shown command
+    # is the literal staged command the runner runs
+    assert "sha256sum" not in out["pipeline"] and "sha256sum" not in out["command"]
+    assert out["command"].startswith("sh ") and "install.sh" in out["command"]
+    assert out["pinned"] == {"url": _OLLAMA_URL, "sha256": _OLLAMA_SHA}
+    assert any(_OLLAMA_SHA in s for s in out["steps"])
+    assert "execute=true" in out["hint"] and "denial" in out["hint"]
+    assert calls == []
+    # strata pins a fixed tag, never releases/latest
+    strata = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "strata"}))
+    assert "releases/download/v0.2.15/install.sh" in strata["pipeline"]
+    assert _STRATA_SHA in strata["pipeline"] and "latest" not in strata["pipeline"]
+    # maya pins a commit, and only then runs ./setup.sh in the checkout
+    maya = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "maya"}))
+    assert _MAYA_COMMIT in maya["pipeline"]
+    assert maya["command"].endswith("./setup.sh")
+    assert any(_MAYA_COMMIT in s for s in maya["steps"])
+    # planning is read-only: no approval gate for it
+    assert tools.policy_hook("model_forge_install",
+                             {"action": "engine_install",
+                              "engine": "ollama"}) is None
+    assert tools.policy_hook("model_forge_install",
+                             {"action": "engine_install", "engine": "ollama",
+                              "execute": False}) is None
+
+
+def test_policy_hook_engine_install_approve_directive():
+    from model_forge import tools
+    d = tools.policy_hook("model_forge_install",
+                          {"action": "engine_install", "engine": "ollama",
+                           "execute": True})
+    assert d["action"] == "approve"
+    assert d["rule_key"] == "model-forge:engine_install"
+    assert _plan_command("ollama") in d["message"]   # the exact command shown
+    assert _OLLAMA_SHA in d["message"]               # and its pin
+    assert "ollama" in d["message"]
+    # the Strata pinned tag and checksum appear verbatim as well
+    d = tools.policy_hook("model_forge_install",
+                          {"action": "engine_install", "engine": "strata",
+                           "execute": True})
+    assert d["rule_key"] == "model-forge:engine_install"
+    assert _plan_command("strata") in d["message"]
+    assert "v0.2.15" in d["message"] and "latest" not in d["message"]
+    # maya: the pinned commit is shown
+    d = tools.policy_hook("model_forge_install",
+                          {"action": "engine_install", "engine": "maya",
+                           "execute": True})
+    assert _MAYA_COMMIT in d["message"]
+    # a model-install call still needs no approval (historical contract)
+    assert tools.policy_hook("model_forge_install",
+                             {"model_id": "m"}) is None
+
+
+def test_engine_install_gate_denial_fails_closed(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    calls = _installer_spy(monkeypatch)
+    out = _simulate_approval_gate(
+        "model_forge_install",
+        {"action": "engine_install", "engine": "ollama", "execute": True},
+        "deny", tools.model_forge_install)
+    assert out["blocked"] is True
+    assert out["directive"]["rule_key"] == "model-forge:engine_install"
+    assert calls == []                        # denial runs nothing
+    jobs_dir = tmp_path / "model-forge" / "jobs"
+    assert not jobs_dir.exists() or list(jobs_dir.glob("*.json")) == []
+
+
+def test_engine_install_gate_timeout_fails_closed(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    calls = _installer_spy(monkeypatch)
+    for decision in ("timeout", "gate_error"):
+        out = _simulate_approval_gate(
+            "model_forge_install",
+            {"action": "engine_install", "engine": "strata", "execute": True},
+            decision, tools.model_forge_install)
+        assert out["blocked"] is True, decision
+    assert calls == []                        # a timed-out gate runs nothing
+
+
+def test_engine_install_approved_flow_runs_and_polls(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    from model_forge.engines.base import EngineStatus
+    calls = _installer_spy(monkeypatch)
+    staged = _stage_spy(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        tools, "detect_engines",
+        lambda base_url="", **kw: [EngineStatus(
+            id="ollama", display_name="Ollama", available=True,
+            endpoint="http://127.0.0.1:11434", detail="running")])
+    out = _simulate_approval_gate(
+        "model_forge_install",
+        {"action": "engine_install", "engine": "ollama", "execute": True},
+        "approve", tools.model_forge_install)
+    assert out["blocked"] is False
+    res = json.loads(out["result"])
+    assert res["ok"] is True and res["action"] == "engine_install_started"
+    assert res["executed"] is True and res["job_id"]
+    # the plan/job record shows the PINNED pipeline and the pinned tag
+    assert _OLLAMA_SHA in res["pipeline"] and "latest" not in res["command"]
+    # poll through the shared jobs store (model_forge_install job_id)
+    st = _poll_until_done(res["job_id"])
+    assert st["state"] == "done"
+    assert st["kind"] == "engine_install" and st["engine"] == "ollama"
+    assert st["command"] == res["command"]        # pinned command recorded
+    assert st["executed_command"] == calls[0]     # the staged, verified file
+    assert st["returncode"] == 0
+    assert st["executed_command"].startswith("sh ")
+    assert st["artifact"] in st["executed_command"]
+    # the runner seam was handed the VERIFIED LOCAL artifact, not a download
+    # pipeline
+    assert staged == ["ollama"]
+    # completion re-runs engine detection and reports it honestly
+    assert st["detection"]["detected"] is True
+    assert len(calls) == 1                        # one verified run only
+
+
+def test_engine_install_staging_failure_runs_nothing(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    calls = _installer_spy(monkeypatch)
+    _stage_spy(monkeypatch, tmp_path, ok=False,
+               error=f"checksum mismatch for {_OLLAMA_URL}")
+    res = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "ollama", "execute": True}))
+    st = _poll_until_done(res["job_id"])
+    assert st["state"] == "error"
+    assert "checksum mismatch" in st["error"] and "nothing was run" in st["error"]
+    assert st["command"] == res["command"]        # the pinned command is shown
+    assert calls == []                            # the runner never ran
+    assert "returncode" not in st
+
+
+def test_engine_install_failure_and_timeout_reported_honestly(tmp_path,
+                                                              monkeypatch):
+    import subprocess
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    # a non-zero installer exit is an error, never a false 'done'
+    _installer_spy(monkeypatch, result={"returncode": 2,
+                                       "output_tail": "permission denied"})
+    _stage_spy(monkeypatch, tmp_path)
+    res = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "ollama", "execute": True}))
+    st = _poll_until_done(res["job_id"])
+    assert st["state"] == "error" and "2" in st["error"]
+    assert st["output_tail"] == "permission denied"
+    assert "detection" not in st              # nothing is assumed installed
+    # the hard timeout kills the job record as 'timeout', not 'done'
+    _installer_spy(monkeypatch,
+                   raise_exc=subprocess.TimeoutExpired(cmd="installer",
+                                                       timeout=1.0))
+    _stage_spy(monkeypatch, tmp_path)
+    res = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "strata", "execute": True}))
+    st = _poll_until_done(res["job_id"])
+    assert st["state"] == "timeout"
+    assert "hard timeout" in st["error"] and "nothing is assumed installed" \
+        in st["error"]
+
+
+def test_engine_install_llamacpp_guides_to_core_runtime(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    calls = _installer_spy(monkeypatch)
+    monkeypatch.setattr(
+        tools, "_core_llamacpp_status",
+        lambda: {"present": True,
+                 "signals": ["the hermes CLI is on PATH (Hermes core is "
+                             "installed)"]})
+    out = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "llamacpp"}))
+    assert out["ok"] is True and out["action"] == "use_core_local_models"
+    assert out["executed"] is False and "command" not in out
+    assert "never installs llama.cpp binaries" in out["detail"]
+    assert "Local Models" in out["detail"] and "hermes model" in out["detail"]
+    assert out["core_runtime"]["present"] is True
+    # even with execute=true: no command exists, nothing executes, and the
+    # gate is not asked to approve an installer run
+    assert tools.policy_hook("model_forge_install",
+                             {"action": "engine_install", "engine": "llamacpp",
+                              "execute": True}) is None
+    out = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "llamacpp", "execute": True}))
+    assert out["executed"] is False and calls == []
+    # no managed runtime detected: honest absence, still core guidance
+    monkeypatch.setattr(tools, "_core_llamacpp_status",
+                        lambda: {"present": False, "signals": []})
+    out = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "llamacpp"}))
+    assert "No managed llama.cpp runtime was detected" in out["detail"]
+    assert "Local Models" in out["detail"]
+    assert calls == []
+
+
+def test_engine_install_unknown_engine_never_runs(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    calls = _installer_spy(monkeypatch)
+    for engine in ("banana", "ollama; rm -rf /", ""):
+        out = json.loads(tools.model_forge_install(
+            {"action": "engine_install", "engine": engine, "execute": True}))
+        assert out["ok"] is False, engine
+        assert out["action"] in ("unknown_engine", "needs_engine"), engine
+        # an unknown or malformed engine id escalates nothing and runs nothing
+        assert tools.policy_hook("model_forge_install",
+                                 {"action": "engine_install", "engine": engine,
+                                  "execute": True}) is None
+    assert calls == []
+    # unknown actions name the valid ones instead of falling through
+    out = json.loads(tools.model_forge_install({"action": "banana"}))
+    assert "error" in out and "engine_install" in out["error"]
+
+
+def test_minimal_env_forwards_no_credentials(monkeypatch):
+    from model_forge import tools
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
+    monkeypatch.setenv("HERMES_TOKEN", "tok-secret")
+    env = tools._minimal_env()
+    # exactly the four names an installer child needs — nothing else
+    assert set(env) == {"PATH", "HOME", "LANG", "TMPDIR"}
+    for leaked in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "HERMES_TOKEN"):
+        assert leaked not in env
+    assert "secret" not in json.dumps(env)
+
+
+def test_run_installer_popen_receives_minimal_env(monkeypatch):
+    from model_forge import tools
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        pid = 424242
+
+        def communicate(self, timeout=None):
+            return (b"install ok", None)
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr(tools.subprocess, "Popen", fake_popen)
+    out = tools._run_installer("sh /tmp/staged-install.sh", 5.0)
+    assert out["returncode"] == 0 and out["output_tail"] == "install ok"
+    assert captured["command"] == "sh /tmp/staged-install.sh"
+    env = captured["kwargs"]["env"]
+    assert set(env) == {"PATH", "HOME", "LANG", "TMPDIR"}
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert "OPENAI_API_KEY" not in env          # no keys reach the child
+    assert captured["kwargs"]["start_new_session"] is True
+
+
+def test_stage_installer_verifies_sha256_and_refuses_mismatch(tmp_path,
+                                                              monkeypatch):
+    import hashlib
+    from model_forge import tools
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    # checksum mismatch: nothing is written and nothing is run
+    out = tools._stage_installer("ollama",
+                                 downloader=lambda url: b"tampered payload")
+    assert out["ok"] is False
+    assert "checksum mismatch" in out["error"]
+    assert "nothing was run" in out["error"] and _OLLAMA_SHA in out["error"]
+    assert not (tmp_path / "model-forge-installers").exists()
+    # download failure fails closed, honestly
+    def boom(url):
+        raise OSError("connection refused")
+    out = tools._stage_installer("ollama", downloader=boom)
+    assert out["ok"] is False
+    assert "download of" in out["error"] and "nothing was run" in out["error"]
+    # a verified artifact: the local file is what the runner seam would get
+    good = b"#!/bin/sh\ntrue\n"
+    monkeypatch.setitem(tools._ENGINE_INSTALLERS["ollama"], "sha256",
+                        hashlib.sha256(good).hexdigest())
+    out = tools._stage_installer("ollama", downloader=lambda url: good)
+    assert out["ok"] is True
+    assert Path(out["artifact"]).read_bytes() == good
+    assert out["command"] == f"sh {out['artifact']}"
+
+
+def test_stage_installer_maya_runs_setup_only_from_pinned_checkout(tmp_path,
+                                                                   monkeypatch):
+    import types
+    from model_forge import tools
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    calls = []
+
+    def fake_git(args, cwd=None):
+        calls.append(list(args))
+        if "rev-parse" in args:
+            return types.SimpleNamespace(returncode=0,
+                                         stdout=_MAYA_COMMIT.encode())
+        return types.SimpleNamespace(returncode=0, stdout=b"")
+
+    monkeypatch.setattr(tools, "_git_run", fake_git)
+    out = tools._stage_installer("maya")
+    assert out["ok"] is True
+    assert out["command"] == f"cd {out['artifact']} && ./setup.sh"
+    # the pinned commit was checked out, and the checked-out HEAD re-verified
+    # before any part of setup runs
+    assert ["-C", out["artifact"], "checkout", _MAYA_COMMIT] in calls
+    assert ["-C", out["artifact"], "rev-parse", "HEAD"] in calls
+    assert calls[-1][2] == "rev-parse"
+
+    # a HEAD that does not match the pin runs nothing
+    def bad_git(args, cwd=None):
+        if "rev-parse" in args:
+            return types.SimpleNamespace(returncode=0, stdout=b"deadbeef")
+        return types.SimpleNamespace(returncode=0, stdout=b"")
+
+    monkeypatch.setattr(tools, "_git_run", bad_git)
+    out = tools._stage_installer("maya")
+    assert out["ok"] is False
+    assert "checkout mismatch" in out["error"] and "nothing was run" in out["error"]
+    assert _MAYA_COMMIT in out["error"]
+    assert "command" not in out                 # setup.sh is never reached
+
+
+def test_generate_media_3d_job_poll_http_error_surfaces_status_and_body(
+        tmp_path, monkeypatch):
+    import io
+    import urllib.error
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "media_plan",
+                        lambda modality, base_url:
+                        {"ok": True, "action": "submit_job",
+                         "submit": "http://gpu-box.example.com:8080/jobs"})
+    exc = urllib.error.HTTPError(
+        "http://gpu-box.example.com:8080/jobs/3djob-1", 503,
+        "Service Unavailable", hdrs=None,
+        fp=io.BytesIO(b'{"detail":"queue is full"}'))
+    _fake_urlopen(monkeypatch, b"", exc=exc)
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box", "job_id": "3djob-1"}))
+    # the poll path surfaces the HTTP status and a response snippet, the
+    # same honesty as the submit paths (not a generic error payload)
+    assert out["ok"] is False and out["action"] == "poll_failed"
+    assert out["http_status"] == 503
+    assert out["response_snippet"] == '{"detail":"queue is full"}'
+    assert "503" in out["error"] and "queue is full" in out["error"]
+
+
+# --- model_forge_broker: weight residency + workflow scopes ------------------
+
+class _RecordingAdapter(EngineLifecycle):
+    """Engine lifecycle adapter that records every call into a shared log."""
+
+    def __init__(self, engine_id, calls):
+        self.engine_id = engine_id
+        self.calls = calls
+
+    def ensure_loaded(self, model_id, **kwargs):
+        self.calls.append(("ensure_loaded", self.engine_id, model_id))
+        return {"ok": True, "reason": "warmed"}
+
+    def release(self, model_id):
+        self.calls.append(("release", self.engine_id, model_id))
+        return {"ok": True, "reason": "evicted"}
+
+    def probe(self):
+        return {"ok": True, "state": "observed", "resident": []}
+
+
+def _residency_stack(target, calls, budget=48.0, adapters=None):
+    """A real residency stack (bookings, policy, scopes) with recording
+    engine adapters — everything through the broker library's public API."""
+    from model_forge import tools
+    from model_forge.broker import EvictionPlanner, Orchestrator, ResidencyLedger
+    bookings = tools.bookings_from_registry()
+    ledger = ResidencyLedger(bookings=bookings)
+    ledger.set_budget(target.id, budget)
+    if adapters is None:
+        adapters = {engine: _RecordingAdapter(engine, calls)
+                    for engine in ("ollama", "comfyui", "media-gateway")}
+    planner = EvictionPlanner(ledger)
+    orchestrator = Orchestrator(ledger, planner, adapters)
+    return {"target_id": target.id, "ledger": ledger, "planner": planner,
+            "orchestrator": orchestrator, "bookings": bookings,
+            "budget_gb": budget}
+
+
+def _book_chat_resident(stack):
+    """A claim-time chat resident with its own honest booking (catalog ids
+    cover the registry; this fixture models a running chat model)."""
+    spec = {"vram_gb": 6.0, "source": "catalog-vram-floor", "load_s": None}
+    stack["ledger"].book("chat-a", spec)
+    stack["bookings"]["chat-a"] = spec
+    stack["ledger"].record_resident("gpu-box", "chat-a", engine="ollama",
+                                    lane="chat")
+
+
+def _broker_env(monkeypatch, tmp_path, stack):
+    """Shared handler environment: remote target, isolated scope state, and
+    the residency stack behind the broker_stack seam."""
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "broker_stack", lambda target, **kw: stack)
+    monkeypatch.setattr(tools, "_ACTIVE_SCOPES", {})
+    monkeypatch.setattr(tools, "_MEDIA_SCOPE_JOBS", {})
+    return tools
+
+
+def test_register_wires_broker_tool_and_hook(tmp_path, monkeypatch):
+    import importlib.util
+    try:
+        from _repo import repo_root as _root
+        _base = _root()
+    except Exception:  # noqa: BLE001 — keep the literal path as the fallback
+        _base = Path(__file__).resolve().parent.parent
+    init_path = _base / "model-forge" / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        "model_forge_plugin_pkg", init_path,
+        submodule_search_locations=[str(init_path.parent)])
+    mod = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "model_forge_plugin_pkg", mod)
+    spec.loader.exec_module(mod)
+
+    class _Ctx:
+        def __init__(self):
+            self.tools = {}
+            self.hooks = []
+            self.commands = {}
+
+        def register_tool(self, name, toolset=None, schema=None, handler=None):
+            self.tools[name] = (toolset, schema, handler)
+
+        def register_hook(self, name, handler):
+            self.hooks.append((name, handler))
+
+        def register_command(self, name, handler, description="", args_hint=""):
+            self.commands[name] = (handler, description, args_hint)
+
+    ctx = _Ctx()
+    mod.register(ctx)
+    assert len(ctx.tools) == 8
+    toolset, schema, handler = ctx.tools["model_forge_broker"]
+    assert toolset == "model_forge"
+    assert schema is mod.model_forge.schemas.BROKER
+    assert callable(handler)
+    assert ("pre_tool_call", mod.model_forge.tools.policy_hook) in ctx.hooks
+    # the read-only cockpit data command behind the Desktop pane
+    cmd = ctx.commands.get("model-forge")
+    assert cmd is not None and cmd[0] is mod.model_forge.tools.cockpit_command
+    # the catalog manifest lists the tool too
+    manifest = (init_path.parent / "plugin.yaml").read_text()
+    assert "model_forge_broker" in manifest
+
+
+def test_broker_schema_shape_is_verbs_not_knobs():
+    spec = schemas.BROKER
+    props = spec["parameters"]["properties"]
+    assert spec["name"] == "model_forge_broker"
+    assert props["action"]["enum"] == ["status", "claim", "release", "plan",
+                                      "swap", "bench"]
+    assert spec["parameters"]["required"] == ["action"]
+    # minimal, self-explanatory surface: the six verbs plus what to act on
+    # (release + dry_run exist only for swap)
+    assert set(props) == {"action", "model_id", "modality", "scope_id",
+                         "target", "release", "dry_run"}
+    assert "unload_policy" not in spec["description"]
+    # bench is a verb with a model id, nothing more — no window knobs
+    assert "bench" in spec["description"]
+    assert "bench" in props["action"]["description"]
+    # swap is the one-call exchange verb with measured timings, named as such
+    assert "swap" in spec["description"]
+    assert "measured" in spec["description"]
+    assert "swap" in props["action"]["description"]
+    assert "nothing was changed" in props["dry_run"]["description"]
+    assert props["release"]["type"] == "array"
+    assert props["dry_run"]["type"] == "boolean"
+
+
+def test_bookings_helper_maps_model_entry_footprints():
+    from model_forge import tools
+    from model_forge.broker import ResidencyLedger
+    from model_forge.registry import ModelEntry
+    entries = (
+        ModelEntry(id="fx-img", name="FX Image", modality="image",
+                   engines=("vllm",), source="x/fx-img", size_gb=20.0,
+                   vram_gb_min=16.0),
+        ModelEntry(id="fx-moe", name="FX MoE", modality="chat",
+                   engines=("maya",), source="x/fx-moe", size_gb=66.0,
+                   ram_gb_min=64.0, engine_managed_fit=True),
+    )
+    bookings = tools.bookings_from_registry(entries)
+    # the published VRAM floor becomes the nominal booked ceiling, honestly
+    # labeled as a published floor — never as a measured peak
+    assert bookings["fx-img"] == {"vram_gb": 16.0,
+                                 "source": tools.BOOKING_SOURCE,
+                                 "load_s": None}
+    # no declared floor -> stays unbooked: a guessed 0 GB would be a guessed
+    # fit, and the planner refuses to gate it until a measured peak lands
+    assert "fx-moe" not in bookings
+    # the dict is exactly what the residency layer takes
+    ledger = ResidencyLedger(bookings=bookings)
+    assert ledger.booked_vram_gb("fx-img") == 16.0
+    assert ledger.booked_vram_gb("fx-moe") is None
+    # the full catalog books every curated entry with a declared floor, and
+    # only those — engine-managed entries and stubs stay unbooked
+    all_bookings = tools.bookings_from_registry()
+    from model_forge.registry import models_for
+    assert set(all_bookings) == {m.id for m in models_for()
+                                 if float(m.vram_gb_min or 0.0) > 0}
+
+
+def test_broker_status_report_shape_with_fakes(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    _book_chat_resident(stack)
+    stack["ledger"].record_pull("gpu-box", "krea-2-turbo",
+                                "/models/krea.safetensors", 1234)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "status", "target": "gpu-box"}))
+    assert out["ok"] is True and out["action"] == "status"
+    assert out["pulled"] == [{"model_id": "krea-2-turbo",
+                              "path": "/models/krea.safetensors",
+                              "size_bytes": 1234, "source": ""}]
+    assert out["resident"] == [{"model_id": "chat-a", "engine": "ollama",
+                                "lane": "chat"}]
+    booked = {row["model_id"]: row for row in out["booked"]}
+    assert booked["krea-2-turbo"]["vram_gb"] == 16.0
+    assert booked["krea-2-turbo"]["source"] == tools.BOOKING_SOURCE
+    assert out["budget"] == {"nominal_gb": 48.0, "booked_now_gb": 6.0,
+                             "headroom_gb": 42.0}
+    assert out["unbooked_residents"] == []
+    # honest labels: published floors as ceilings, never a measured claim
+    assert "published" in out["note"] and "measured" in out["note"]
+    assert calls == []            # read-only: no engine call was driven
+
+
+def test_broker_status_marks_unbooked_engine_managed_rows(tmp_path,
+                                                          monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    _book_chat_resident(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "status", "target": "gpu-box"}))
+    rows = {row["model_id"]: row for row in out["unbooked"]}
+    # the engine-managed chat tiers declare no VRAM floor: they stay
+    # unbooked, with an honest hint instead of a guessed 0 GB ceiling
+    assert set(rows) == {"qwen3.8-flash-next", "deepseek-v4.1-flash",
+                         "minimax-m3.1-flash", "glm-5.3-flash"}
+    for row in rows.values():
+        assert row["vram_gb"] is None
+        assert row["hint"] == "unbooked — run bench after first load"
+        # the label names the missing booked ceiling — it never reuses the
+        # booking source token to mean its absence
+        assert row["label"] == "no booked ceiling (no VRAM floor declared)"
+        assert "catalog-vram-floor" not in row["label"]
+    # never presented as booked ceilings (and stubs/markers stay out)
+    booked_ids = {row["model_id"] for row in out["booked"]}
+    assert not set(rows) & booked_ids
+    assert "world-model-slot" not in rows and "core-gguf-catalog" not in rows
+
+    # a measured peak books one — the hint row is gone, the label is honest
+    stack["ledger"].record_measured_peak("glm-5.3-flash", 30.0)
+    out = json.loads(tools.model_forge_broker(
+        {"action": "status", "target": "gpu-box"}))
+    assert "glm-5.3-flash" not in {row["model_id"]
+                                   for row in out["unbooked"]}
+    booked = {row["model_id"]: row for row in out["booked"]}
+    assert booked["glm-5.3-flash"]["vram_gb"] == 30.0
+    assert booked["glm-5.3-flash"]["label"] == "measured peak (bench)"
+
+
+def test_broker_claim_runs_plan_steps_in_order_with_honest_progress(
+        tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=24.0)
+    _book_chat_resident(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo",
+         "scope_id": "shot-1"}))
+    assert out["ok"] is True and out["action"] == "claim"
+    assert out["scope_id"] == "shot-1"
+    # the plan steps run in order: releases first, then the pre-warm load
+    assert [(s["action"], s["model_id"]) for s in out["steps"]] == [
+        ("release", "chat-a"), ("load", "krea-2-turbo")]
+    assert calls == [("release", "ollama", "chat-a"),
+                     ("ensure_loaded", "comfyui", "krea-2-turbo")]
+    # honest progress states — plain 'loading' with no invented timing
+    assert [p["state"] for p in out["progress"]] == ["queued", "loading",
+                                                    "ready"]
+    assert out["progress"][-1]["scope_id"] == "shot-1"
+    # the policy reasons ride along
+    assert "image generation" in out["plan"]["release_steps"][0]["reason"]
+
+
+def test_broker_claim_by_modality_uses_first_curated_model(tmp_path,
+                                                           monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    out = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "modality": "image",
+         "scope_id": "shot-m"}))
+    assert out["ok"] is True
+    assert out["model_id"] == "krea-2-turbo"   # first curated image model
+    assert out["scope_id"] == "shot-m"
+
+
+def test_broker_claim_fails_closed_over_budget(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=8.0)
+    _book_chat_resident(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    assert out["ok"] is False and out["action"] == "claim_failed"
+    assert out["scope_id"] is None
+    assert "exceeds the nominal budget" in out["error"]
+    assert "fail-closed" in out["error"]
+    assert calls == []            # a refused claim executes nothing
+
+
+def test_broker_release_restores_claim_time_residents(tmp_path, monkeypatch):
+    # the vision gesture at handler level: with a chat model resident, claim
+    # image generation, then release — chat comes back, in order
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=24.0)
+    _book_chat_resident(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo",
+         "scope_id": "chat-to-image"}))
+    assert out["ok"] is True
+    out = json.loads(tools.model_forge_broker(
+        {"action": "release", "scope_id": "chat-to-image"}))
+    assert out["ok"] is True and out["action"] == "release"
+    assert calls == [
+        ("release", "ollama", "chat-a"),
+        ("ensure_loaded", "comfyui", "krea-2-turbo"),
+        ("release", "comfyui", "krea-2-turbo"),
+        ("ensure_loaded", "ollama", "chat-a")]
+    residents = {r.model_id for r in stack["ledger"].residents("gpu-box")}
+    assert residents == {"chat-a"}     # exactly the claim-time set is back
+
+
+def test_broker_plan_dry_run_executes_nothing(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=24.0)
+    _book_chat_resident(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "plan", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    assert out["ok"] is True and out["action"] == "plan"
+    assert out["dry_run"] is True
+    would = out["would"]
+    assert would["ok"] is True
+    assert [(s["action"], s["model_id"]) for s in would["release_steps"]] == \
+        [("release", "chat-a")]
+    assert [(s["action"], s["model_id"]) for s in would["load_steps"]] == \
+        [("load", "krea-2-turbo")]
+    assert would["release_steps"][0]["reason"]
+    assert calls == []            # dry run: nothing loaded, released, moved
+    assert stack["ledger"].is_resident("gpu-box", "chat-a")
+    assert not stack["ledger"].is_resident("gpu-box", "krea-2-turbo")
+    # an impossible claim previews the refusal instead of executing anything
+    stack["ledger"].set_budget("gpu-box", 2.0)
+    out = json.loads(tools.model_forge_broker(
+        {"action": "plan", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    assert out["would"]["ok"] is False
+    assert "exceeds the nominal budget" in out["would"]["reason"]
+    assert calls == []
+
+
+# --- model_forge_broker action=swap: the one-call exchange -------------------
+
+def _swap_ready(stack):
+    """Fixture state for a swap: the image model's weights are present on
+    disk (a swap never begins a download mid-flight) and a chat model is
+    resident (the eviction set)."""
+    _book_chat_resident(stack)
+    stack["ledger"].record_pull("gpu-box", "krea-2-turbo",
+                                "/models/krea.safetensors", 1234)
+
+
+def test_broker_swap_runs_measured_phases(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=24.0)
+    _swap_ready(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "swap", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    assert out["ok"] is True and out["action"] == "swap"
+    assert out["dry_run"] is False
+    assert out["model_id"] == "krea-2-turbo"
+    # phase breakdown: strict order, each phase named and measured
+    assert [out["phases"][k]["name"] for k in
+            ("preflight", "evict", "load", "ready")] == \
+        ["PREFLIGHT", "EVICT", "LOAD", "READY"]
+    assert out["phases"]["preflight"]["ok"] is True
+    assert out["phases"]["evict"]["ok"] is True
+    assert out["phases"]["load"]["ok"] is True
+    assert out["phases"]["ready"]["ok"] is True
+    # the eviction happened before the load, exactly one load
+    assert calls == [("release", "ollama", "chat-a"),
+                     ("ensure_loaded", "comfyui", "krea-2-turbo")]
+    assert out["evicted"] == ["chat-a"]
+    # measured timings ride along (values come from the injectable clock)
+    timings = out["timings"]
+    assert set(timings) == {"preflight_seconds", "evict_seconds",
+                            "load_seconds", "ready_seconds",
+                            "total_seconds"}
+    assert isinstance(timings["total_seconds"], float)
+    # the warm path that applied is recorded verbatim
+    assert out["warm_path"] and isinstance(out["warm_path"], str)
+    # measured swap stats are exposed on the row
+    assert out["swap_stats"]["count"] == 1
+    assert out["swap_stats"]["last_total_seconds"] == \
+        timings["total_seconds"]
+    # residency is now exactly the incoming model
+    assert out["resident_now"] == ["krea-2-turbo"]
+    assert out["resident_state"] == "krea-2-turbo"
+
+
+def test_broker_swap_dry_run_changes_nothing(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=24.0)
+    _swap_ready(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "swap", "target": "gpu-box", "model_id": "krea-2-turbo",
+         "dry_run": True}))
+    assert out["ok"] is True and out["dry_run"] is True
+    assert "nothing was changed" in out["note"]
+    # zero side effects: no evict, no load — and no history record either
+    assert [c for c in calls if c[0] in ("release", "ensure_loaded")] == []
+    assert stack["ledger"].is_resident("gpu-box", "chat-a")
+    assert not stack["ledger"].is_resident("gpu-box", "krea-2-turbo")
+    assert stack["ledger"].swap_history() == ()
+    assert out["swap_stats"]["count"] == 0
+    # the preflight plan rows come back
+    plan = out["phases"]["preflight"]
+    assert plan["ok"] is True
+    assert [r["model_id"] for r in plan["evict_plan"]] == ["chat-a"]
+    assert [r["model_id"] for r in plan["load_plan"]] == ["krea-2-turbo"]
+
+
+def test_broker_swap_refuses_when_weights_not_present(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=24.0)
+    _book_chat_resident(stack)          # no recorded pull for the incoming
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "swap", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    assert out["ok"] is False and out["action"] == "swap_failed"
+    assert "weights not present — run model_forge_install first" in out["error"]
+    # the pre-flight guarantee: nothing evicted, nothing loaded
+    assert calls == []
+    assert stack["ledger"].is_resident("gpu-box", "chat-a")
+    assert "resident now:" in out["reason"]
+
+
+def test_broker_swap_release_ids_and_unknown_action_message(tmp_path,
+                                                            monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=24.0)
+    _swap_ready(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    # explicit outgoing ids arrive as a comma-separated string and are
+    # normalized; an id that is not resident is skipped with a stated reason
+    out = json.loads(tools.model_forge_broker(
+        {"action": "swap", "target": "gpu-box", "model_id": "krea-2-turbo",
+         "release": "chat-a, ghost-model"}))
+    assert out["ok"] is True
+    assert out["evicted"] == ["chat-a"]
+    skipped_rows = [c for c in out["phases"]["preflight"]["checks"]
+                    if "skipped" in c.get("reason", "")]
+    assert skipped_rows and "ghost-model" in skipped_rows[0]["reason"]
+    # an unknown action names the valid verb set, swap included
+    out = json.loads(tools.model_forge_broker({"action": "warp"}))
+    assert "'swap'" in out["error"]
+    # swap needs an incoming model id
+    out = json.loads(tools.model_forge_broker({"action": "swap"}))
+    assert "model_id required for action=swap" in out["error"]
+
+
+def test_broker_status_exposes_measured_swap_stats(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=24.0)
+    _swap_ready(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "status", "target": "gpu-box"}))
+    assert out["swap_stats"] == {"count": 0, "last_total_seconds": None,
+                                 "average_total_seconds": None}
+    out = json.loads(tools.model_forge_broker(
+        {"action": "swap", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    assert out["ok"] is True
+    out = json.loads(tools.model_forge_broker(
+        {"action": "status", "target": "gpu-box"}))
+    stats = out["swap_stats"]
+    assert stats["count"] == 1
+    assert stats["last_total_seconds"] == stats["average_total_seconds"]
+    assert isinstance(stats["last_total_seconds"], float)
+
+
+def test_bench_records_measured_peak_and_gates_fit(tmp_path, monkeypatch):
+    # wiring: action=bench through the handler with an injected VRAM sampler
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    monkeypatch.setattr(tools, "_BENCH_INTERVAL_S", 0.0)
+    mid = "qwen3.8-flash-next"     # engine-managed: no published VRAM floor
+    from model_forge.broker import LoadRequest
+
+    def request():
+        return LoadRequest(model_id=mid, engine="strata", lane="chat",
+                           modality="chat")
+
+    # before: the planner refuses to gate it — no booked ceiling at all
+    plan = stack["planner"].plan_load(_REMOTE.id, request())
+    assert plan.ok is False and "no booked footprint" in plan.reason
+
+    readings = [4.0, 12.5, 9.0, 7.0, 12.4, 6.0]
+    seen = {"i": 0}
+
+    def fake_sampler():
+        value = readings[seen["i"] % len(readings)]
+        seen["i"] += 1
+        return value
+
+    out = json.loads(tools.model_forge_broker(
+        {"action": "bench", "model_id": mid, "target": "gpu-box"},
+        sampler=fake_sampler))
+    assert out["ok"] is True and out["action"] == "bench"
+    assert out["peak_gb"] == 12.5          # the peak, not the last reading
+    assert out["label"] == "measured peak (bench)"
+    assert out["booking"] == {"model_id": mid, "vram_gb": 12.5,
+                              "source": "measured",
+                              "label": "measured peak (bench)"}
+    assert out["gates_fit"] is True
+    assert "planner" in out["note"] and "never downgraded" in out["note"]
+    assert out["samples"] == len(readings)
+    # the measured peak is the booked ceiling and the planner gates fit on it
+    assert stack["ledger"].booked_vram_gb(mid) == 12.5
+    plan = stack["planner"].plan_load(_REMOTE.id, request())
+    assert plan.ok is True
+    # a measured peak is never downgraded by a published footprint
+    row = stack["ledger"].book(mid, {"vram_gb": 2.0,
+                                     "source": tools.BOOKING_SOURCE})
+    assert "kept" in row
+    assert stack["ledger"].booked_vram_gb(mid) == 12.5
+    assert calls == []            # bench drives no engine, only measures
+
+
+def test_bench_fails_soft_without_a_gpu(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    from model_forge.registry import HardwareProfile
+    monkeypatch.setattr(tools, "probe_hardware",
+                        lambda: HardwareProfile(gpus=(), total_vram_gb=0.0,
+                                                ram_gb=32.0,
+                                                platform="linux"))
+    out = json.loads(tools.model_forge_broker(
+        {"action": "bench", "model_id": "qwen3.8-flash-next",
+         "target": "gpu-box"}))
+    assert out["ok"] is False and out["action"] == "bench"
+    assert "no GPU is present" in out["error"]
+    # fail soft: nothing was measured and nothing was booked
+    assert stack["ledger"].booking("qwen3.8-flash-next") is None
+    assert calls == []
+
+
+def test_bench_window_without_a_valid_reading_fails_closed(tmp_path,
+                                                           monkeypatch):
+    # a booked ceiling must be an observation, never a guess
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    monkeypatch.setattr(tools, "_BENCH_INTERVAL_S", 0.0)
+    out = json.loads(tools.model_forge_broker(
+        {"action": "bench", "model_id": "krea-2-turbo", "target": "gpu-box"},
+        sampler=lambda: None))
+    assert out["ok"] is False
+    assert "no valid VRAM readings" in out["error"]
+    # the published booking is untouched — no guessed peak was booked
+    booking = stack["ledger"].booking("krea-2-turbo")
+    assert booking.source == tools.BOOKING_SOURCE
+
+
+def test_bench_requires_a_model_id(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    out = json.loads(tools.model_forge_broker({"action": "bench",
+                                               "target": "gpu-box"}))
+    assert "model_id" in out["error"] and "bench" in out["error"]
+
+
+def test_live_bench_sampler_parses_nvidia_smi_used_memory(monkeypatch):
+    # the live sampler reads real GPU memory in the hardware-probe style:
+    # nvidia-smi CSV query, MiB readings summed across GPUs into GB
+    import subprocess
+    from model_forge import tools
+    monkeypatch.setattr(tools.shutil, "which",
+                        lambda _: "/usr/bin/nvidia-smi")
+    fake = subprocess.CompletedProcess(args=tools._NVIDIA_SMI_USED,
+                                       stdout="1024\n2048\n",
+                                       stderr="", returncode=0)
+    monkeypatch.setattr(tools.subprocess, "run",
+                        lambda *a, **kw: fake)
+    assert tools.gpu_vram_used_gb() == 3.0
+
+
+def test_generate_media_claims_and_releases_lane(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    _book_chat_resident(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    monkeypatch.setattr(
+        tools, "media_plan",
+        lambda modality, base_url: {"ok": True, "action": "submit",
+                                    "submit": "http://gpu-box.example.com"
+                                              ":8080/v1/audio/music"})
+    _fake_urlopen(monkeypatch, json.dumps({"url": "http://x/a.mp3"}).encode())
+
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "music", "target": "gpu-box", "model": "gen/music",
+         "prompt": "lofi"}))
+    assert out["ok"] is True and out["action"] == "done"
+    # one workflow scope around the job: claim the lane, release on completion
+    assert calls == [("ensure_loaded", "media-gateway", "gen/music"),
+                     ("release", "media-gateway", "gen/music")]
+    lane = out["lane_claim"]
+    assert lane["state"] == "released"
+    assert [p["state"] for p in lane["progress"]] == ["queued", "loading",
+                                                     "ready"]
+    # the gateway model books the modality's largest published floor as its
+    # nominal stand-in ceiling — honestly labeled as a stand-in
+    spec = stack["bookings"]["gen/music"]
+    assert spec["vram_gb"] == 20.0
+    assert "stand-in" in spec["source"] and "ace-step" in spec["source"]
+
+
+def test_generate_media_releases_lane_on_submit_failure(tmp_path, monkeypatch):
+    # failure-path release: the scope ends and claim-time residents return
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    _book_chat_resident(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    monkeypatch.setattr(
+        tools, "media_plan",
+        lambda modality, base_url: {"ok": True, "action": "submit",
+                                    "submit": "http://gpu-box.example.com"
+                                              ":8080/v1/audio/music"})
+    _fake_urlopen(monkeypatch, b"", exc=RuntimeError("conn refused"))
+
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "music", "target": "gpu-box", "model": "gen/music",
+         "prompt": "lofi"}))
+    assert out["ok"] is False and out["action"] == "submit_failed"
+    assert out["lane_claim"]["state"] == "released"
+    assert calls == [("ensure_loaded", "media-gateway", "gen/music"),
+                     ("release", "media-gateway", "gen/music")]
+    assert stack["ledger"].is_resident("gpu-box", "chat-a")
+    assert not stack["ledger"].is_resident("gpu-box", "gen/music")
+
+
+def test_generate_media_claim_failure_fails_closed(tmp_path, monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=5.0)   # over budget
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    monkeypatch.setattr(
+        tools, "media_plan",
+        lambda modality, base_url: {"ok": True, "action": "submit",
+                                    "submit": "http://gpu-box.example.com"
+                                              ":8080/v1/audio/music"})
+
+    def _no_call(req, timeout=None):
+        raise AssertionError("a refused claim must never reach the target")
+
+    monkeypatch.setattr("urllib.request.urlopen", _no_call)
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "music", "target": "gpu-box", "model": "gen/music",
+         "prompt": "lofi"}))
+    assert out["ok"] is False and out["action"] == "claim_failed"
+    assert "exceeds the nominal budget" in out["error"]
+    assert "nothing was submitted" in out["detail"]
+    assert calls == []
+
+
+def test_generate_media_3d_holds_scope_until_job_completes(tmp_path,
+                                                           monkeypatch):
+    calls = []
+    stack = _residency_stack(_REMOTE, calls, budget=48.0)
+    _book_chat_resident(stack)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    monkeypatch.setattr(
+        tools, "media_plan",
+        lambda modality, base_url: {"ok": True, "action": "submit_job",
+                                    "submit": "http://gpu-box.example.com"
+                                              ":8080/jobs"})
+    _fake_urlopen(monkeypatch, json.dumps({"id": "3djob-9"}).encode())
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box", "model": "gen/3d",
+         "image": "https://example.com/x.png"}))
+    assert out["ok"] is True and out["action"] == "submitted"
+    assert out["lane_claim"]["state"] == "held"
+    assert "3djob-9" in tools._MEDIA_SCOPE_JOBS
+
+    # a still-running job keeps the lane claimed (never guess completion)
+    _fake_urlopen(monkeypatch, json.dumps({"status": "running"}).encode())
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box", "job_id": "3djob-9"}))
+    assert out["lane_claim"]["state"] == "held"
+    assert "release" not in [c[0] for c in calls]
+    assert "3djob-9" in tools._MEDIA_SCOPE_JOBS
+
+    # terminal state: the scope releases and claim-time residents return
+    _fake_urlopen(monkeypatch, json.dumps({"status": "done"}).encode())
+    out = json.loads(tools.model_forge_generate_media(
+        {"modality": "3d", "target": "gpu-box", "job_id": "3djob-9"}))
+    assert out["job"] == {"status": "done"}
+    assert out["lane_claim"]["state"] == "released"
+    assert "3djob-9" not in tools._MEDIA_SCOPE_JOBS
+    assert calls == [("ensure_loaded", "media-gateway", "gen/3d"),
+                     ("release", "media-gateway", "gen/3d")]
+    assert {r.model_id for r in stack["ledger"].residents("gpu-box")} == \
+        {"chat-a"}
+
+
+def test_broker_stack_threads_injectable_engine_seams(tmp_path, monkeypatch):
+    # the engine adapters take injectable HTTP/process seams — the real
+    # stack wires them through, so nothing here touches the network
+    from model_forge import tools
+    http_calls = []
+
+    def fake_http(method, url, body=None, timeout=None):
+        http_calls.append((method, url, body))
+        if url.endswith("/system_stats"):
+            # ComfyUI readiness fingerprint
+            return {"system": {"comfyui_version": "test"}, "devices": []}
+        return {"models": []}
+
+    spawn_calls = []
+
+    class _Proc:
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+        def poll(self):
+            return None
+
+    def fake_runner(argv, env=None):
+        # engine processes may only be spawned through this seam — recorded,
+        # never real
+        spawn_calls.append(list(argv))
+        return _Proc()
+
+    stack = tools.broker_stack(_REMOTE, http=fake_http, runner=fake_runner,
+                               which=lambda binary: "/fake/" + binary,
+                               fresh=True)
+    assert stack["budget_gb"] == 48.0
+    assert stack["ledger"].booked_vram_gb("krea-2-turbo") == 16.0
+    _book_chat_resident(stack)
+    tools_env = _broker_env(monkeypatch, tmp_path, stack)
+
+    # claim image generation: the resident chat model is evicted through the
+    # Ollama adapter's real warm/evict call shape, on the fake HTTP seam
+    out = json.loads(tools_env.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo",
+         "scope_id": "seam-1"}))
+    assert out["ok"] is True
+    evict = [body for _, url, body in http_calls
+             if isinstance(body, dict) and body.get("keep_alive") == 0]
+    assert evict and evict[0]["model"] == "chat-a"
+    # release: the claim-time chat model is warmed back through the same seam
+    out = json.loads(tools_env.model_forge_broker(
+        {"action": "release", "scope_id": "seam-1"}))
+    assert out["ok"] is True
+    warm = [body for _, url, body in http_calls
+            if isinstance(body, dict) and body.get("model") == "chat-a"
+            and body.get("keep_alive") not in (0, None)]
+    assert warm
+    # krea-2-turbo is ComfyUI-served: its readiness + cache-free contract
+    # rides the HTTP seam and spawns no engine process
+    assert any(url.endswith("/system_stats") for _, url, _ in http_calls)
+    assert spawn_calls == []
+
+# --- settings: declared engine endpoints (extra_roots seam) -------------------
+
+def _stub_settings(monkeypatch, settings: dict):
+    """Point hermes_cli.config at a config carrying the plugin's settings."""
+    cfg_mod = types.ModuleType("hermes_cli.config")
+    cfg_mod.load_config_readonly = lambda: {
+        "plugins": {"entries": {"model-forge": {"settings": settings}}}}
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", cfg_mod)
+
+
+def test_declared_engines_feed_detection_extra_roots(tmp_path, monkeypatch):
+    # settings engines_json -> every detection call carries extra_roots
+    # (the engines.detect_engines seam), with rows normalized and labeled.
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    _stub_settings(monkeypatch, {"engines_json": [
+        {"label": "Workstation vLLM", "base_url": "http://gpu-box.example.com:8000"},
+        {"label": "Trailing slash", "base_url": "http://gpu-box-2.example.com:8080/"},
+        {"label": "Bad row", "base_url": "ftp://nope"},
+        "not-a-dict",
+    ]})
+    from model_forge import tools
+    seen = []
+
+    def fake_detect(base_url="", **kw):
+        seen.append((base_url, kw.get("extra_roots")))
+        return []
+
+    monkeypatch.setattr(tools, "detect_engines", fake_detect)
+    out = json.loads(tools.model_forge_status())
+    assert seen, "detection ran"
+    for base, extra in seen:
+        assert extra == ["http://gpu-box.example.com:8000", "http://gpu-box-2.example.com:8080"]
+    rows = out["declared_engines"]
+    assert [r["label"] for r in rows] == ["Workstation vLLM", "Trailing slash"]
+    assert [r["base_url"] for r in rows] == ["http://gpu-box.example.com:8000",
+                                             "http://gpu-box-2.example.com:8080"]
+    assert all(r["source"] == "user-declared" for r in rows)
+
+
+def test_declared_engines_reach_browse_detection(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    _stub_settings(monkeypatch, {"engines_json": [
+        {"label": "Box", "base_url": "http://gpu-box-3.example.com:8000"}]})
+    from model_forge import tools
+    seen = []
+
+    def fake_detect(base_url="", **kw):
+        seen.append(kw.get("extra_roots"))
+        return []
+
+    monkeypatch.setattr(tools, "detect_engines", fake_detect)
+    out = json.loads(tools.model_forge_browse({"modality": "image",
+                                               "fresh": False}))
+    assert seen and all(extra == ["http://gpu-box-3.example.com:8000"] for extra in seen)
+    assert "models" in out
+
+
+def test_no_declared_engines_passes_no_extra_roots(tmp_path, monkeypatch):
+    # the zero-config path stays exactly the plain auto-detection call
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    seen = []
+
+    def fake_detect(base_url="", **kw):
+        seen.append(kw)
+        return []
+
+    monkeypatch.setattr(tools, "detect_engines", fake_detect)
+    json.loads(tools.model_forge_status())
+    assert seen and all(kw == {} for kw in seen)
+
+
+# --- guided pointing invitation ----------------------------------------------
+
+_NO_GPU = None
+_GPU = None
+
+
+def _profiles():
+    global _NO_GPU, _GPU
+    from model_forge.registry import HardwareProfile
+    if _NO_GPU is None:
+        _NO_GPU = HardwareProfile(gpus=(), total_vram_gb=0.0, ram_gb=0.0,
+                                  platform="linux")
+        _GPU = HardwareProfile(
+            gpus=({"name": "RTX 4090", "vram_gb": 24.0},),
+            total_vram_gb=24.0, ram_gb=64.0, platform="linux")
+    return _NO_GPU, _GPU
+
+
+def test_status_invitation_when_no_gpu_and_no_targets(tmp_path, monkeypatch):
+    # hardware detection finds no GPU and no targets exist -> the tools
+    # return the pointing invitation naming the exact next steps
+    no_gpu, _ = _profiles()
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "probe_hardware", lambda: no_gpu)
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
+    out = json.loads(tools.model_forge_status())
+    inv = out["invitation"]
+    joined = " ".join(inv["next_steps"])
+    assert "model_forge_target_add" in joined
+    assert "cloud GPU" in joined and "another machine" in joined
+    assert "Declared engine endpoints" in joined and "engines_json" in joined
+    assert "no gpu" in inv["reason"].lower()
+    # browse carries the same honest invitation
+    out2 = json.loads(tools.model_forge_browse({"modality": "image",
+                                                "fresh": False}))
+    assert out2["invitation"]["next_steps"] == inv["next_steps"]
+
+
+def test_no_invitation_when_gpu_present(tmp_path, monkeypatch):
+    _, gpu = _profiles()
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "probe_hardware", lambda: gpu)
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
+    out = json.loads(tools.model_forge_status())
+    assert "invitation" not in out
+
+
+def test_no_invitation_when_targets_registered(tmp_path, monkeypatch):
+    no_gpu, _ = _profiles()
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "load_targets",
+                        lambda: load_targets(base_dir=tmp_path))
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    monkeypatch.setattr(tools, "probe_hardware", lambda: no_gpu)
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
+    out = json.loads(tools.model_forge_status())
+    assert "invitation" not in out
+    out2 = json.loads(tools.model_forge_browse({"target": "gpu-box",
+                                                "modality": "image",
+                                                "fresh": False}))
+    assert "invitation" not in out2
+
+
+def test_pointing_invitation_notes_declared_engines():
+    from model_forge.registry import HardwareProfile
+    from model_forge.tools import pointing_invitation
+    no_gpu = HardwareProfile(gpus=(), total_vram_gb=0.0, ram_gb=0.0,
+                             platform="linux")
+    inv = pointing_invitation([_LOCAL], no_gpu,
+                              declared=[{"label": "X",
+                                         "base_url": "http://x:1"}])
+    assert inv is not None
+    assert "already declared" in inv["next_steps"][1]
+    # a GPU or a user target suppresses the invitation entirely
+    assert pointing_invitation([_LOCAL, _REMOTE], no_gpu) is None
+    gpu = HardwareProfile(gpus=({"name": "GPU", "vram_gb": 8.0},),
+                          total_vram_gb=8.0, ram_gb=16.0, platform="linux")
+    assert pointing_invitation([_LOCAL], gpu) is None
+
+
+# --- cockpit data path (the /model-forge command and the Desktop pane) -------
+
+def test_cockpit_command_snapshot_shapes(tmp_path, monkeypatch):
+    no_gpu, _ = _profiles()
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    downloads = tmp_path / "model-forge" / "downloads"
+    model_dir = downloads / "model-a"
+    model_dir.mkdir(parents=True)
+    (model_dir / "w.bin").write_bytes(b"1" * 7)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "probe_hardware", lambda: no_gpu)
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
+    out = json.loads(tools.cockpit_command("cockpit"))
+    assert out["ok"] is True
+    assert isinstance(out["targets"], list) and out["targets"][0]["id"] == "local"
+    assert out["targets"][0]["engines"] == []
+    assert out["declared_engines"] == []
+    # the model section reuses the browse fit data
+    rows = out["models"]
+    assert rows
+    for r in rows:
+        assert "fit" in r and "verdict" in r["fit"] and "modality_label" in r
+    # the storage section is the model_forge_storage list shape
+    by_name = {e["name"]: e for e in out["storage"]["entries"]}
+    entry = by_name["model-a"]
+    assert {"id", "name", "path", "root", "type", "size_bytes",
+            "last_modified"} <= set(entry)
+    assert entry["size_bytes"] == 7
+    assert isinstance(entry["size_bytes"], int)
+    # deletion is named honestly (a tool verb behind the approval gate)
+    assert "model_forge_storage" in out["delete_note"]
+    assert "action=delete" in out["delete_note"]
+    assert "approval" in out["delete_note"]
+
+
+def test_cockpit_residency_carries_broker_weight_residency_rows(
+        tmp_path, monkeypatch):
+    # B2: the residency data door carries the broker's honest weight
+    # residency rows (pulled / resident / booked / unbooked / budget) — the
+    # data the Desktop pane and dashboard tab render.
+    no_gpu, _ = _profiles()
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    downloads = tmp_path / "model-forge" / "downloads"
+    model_dir = downloads / "model-a"
+    model_dir.mkdir(parents=True)
+    (model_dir / "w.bin").write_bytes(b"1" * 7)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "probe_hardware", lambda: no_gpu)
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
+    res = tools.cockpit_residency()
+    assert res["ok"] is True
+    assert {"pulled", "resident", "booked", "unbooked", "budget"} <= set(res)
+    assert isinstance(res["pulled"], list)
+    assert isinstance(res["resident"], list)
+    assert isinstance(res["booked"], list)
+    assert isinstance(res["unbooked"], list)
+    assert {"nominal_gb", "booked_now_gb", "headroom_gb"} <= set(res["budget"])
+    # booked rows carry an honest provenance label (measured vs published)
+    for row in res["booked"]:
+        assert {"model_id", "vram_gb", "source", "label"} <= set(row)
+    # the cockpit snapshot exposes the same residency for the surfaces
+    out = tools.cockpit_data()
+    assert "residency" in out
+    assert {"pulled", "resident", "booked", "unbooked",
+            "budget"} <= set(out["residency"])
+
+
+def test_cockpit_residency_fails_soft_with_a_stated_reason(tmp_path,
+                                                          monkeypatch):
+    # a broken broker stack degrades to a stated reason, never a raise
+    no_gpu, _ = _profiles()
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "probe_hardware", lambda: no_gpu)
+
+    def _boom(_target, **_kw):
+        raise RuntimeError("stack down")
+
+    monkeypatch.setattr(tools, "broker_stack", _boom)
+    res = tools.cockpit_residency()
+    assert res["ok"] is False
+    assert "residency snapshot unavailable" in res["error"]
+    assert "stack down" in res["error"]
+
+
+def test_cockpit_command_models_and_storage_subcommands(tmp_path, monkeypatch):
+    no_gpu, _ = _profiles()
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    from model_forge import tools
+    monkeypatch.setattr(tools, "probe_hardware", lambda: no_gpu)
+    monkeypatch.setattr(tools, "detect_engines", lambda base_url="", **kw: [])
+    models = json.loads(tools.cockpit_command("models image"))
+    assert models["models"]
+    assert all(m["modality"] == "image" for m in models["models"])
+    assert all("fit" in m for m in models["models"])
+    # curated catalog only: the pane read never triggers live discovery
+    bad = json.loads(tools.cockpit_command("models nope"))
+    assert "error" in bad
+    storage = json.loads(tools.cockpit_command("storage"))
+    assert storage["ok"] is True
+    assert isinstance(storage["entries"], list)
+    assert "delete_note" in storage
+    # the cockpit has no delete verb — it names the tool verb instead
+    refused = json.loads(tools.cockpit_command("delete model-a"))
+    assert "error" in refused and "usage" in refused
+    help_text = tools.cockpit_command("help")
+    assert "model_forge_storage" in help_text
+    default = json.loads(tools.cockpit_command(""))
+    assert default["ok"] is True
+
+
+# --- manifest config_schema shapes (Desktop Settings rows) --------------------
+
+def _config_schema_fields(text: str) -> dict:
+    """Stdlib parse of plugin.yaml's config_schema block -> {key: block}."""
+    fields, current = {}, None
+    in_schema = False
+    for line in text.splitlines():
+        if line.startswith("config_schema:"):
+            in_schema = True
+            continue
+        if not in_schema:
+            continue
+        if line and not line.startswith(" "):
+            break
+        if line.startswith("  ") and not line.startswith("   ") \
+                and line.strip().endswith(":"):
+            current = line.strip()[:-1]
+            fields[current] = []
+        elif current is not None:
+            fields[current].append(line)
+    return {k: "\n".join(v) for k, v in fields.items()}
+
+
+def test_config_schema_settings_shapes():
+    try:
+        from _repo import repo_root as _root
+        _base = _root()
+    except Exception:  # noqa: BLE001 — keep the literal path as the fallback
+        _base = Path(__file__).resolve().parent.parent
+    manifest = (_base
+                / "model-forge" / "plugin.yaml").read_text(encoding="utf-8")
+    fields = _config_schema_fields(manifest)
+    # declared engine endpoints: the bring-your-own-engine list field
+    engines = fields["engines_json"]
+    assert "type: list" in engines
+    assert "default: []" in engines
+    assert "label: \"Declared engine endpoints\"" in engines
+    assert "base_url" in engines and "label" in engines
+    # compute targets stay, and point at the engine field for engine URLs
+    assert "type: list" in fields["targets_json"]
+    assert "Declared engine endpoints" in fields["targets_json"]
+    # optional tokens: secret fields with required: false and env key names;
+    # labels/descriptions say plainly that a token can be pasted or provided
+    # through the Hermes secret store
+    for key, env in (("hf_token", "HF_TOKEN"),
+                     ("modelscope_token", "MODELSCOPE_API_TOKEN")):
+        block = fields[key]
+        assert "type: secret" in block
+        assert "required: false" in block
+        assert f"env: {env}" in block
+        assert "secret store" in block
+        assert "(optional)" in block
+
+
+# --- /model integration: custom_providers registration ----------------------
+
+def _config_stub(monkeypatch, cfg=None, save_error=None):
+    """hermes_cli.config fake whose load/save round-trip a real dict — the
+    exact surface write_custom_provider_entry exercises."""
+    mod = types.ModuleType("hermes_cli.config")
+    state = json.loads(json.dumps(cfg or {}))
+
+    def _load():
+        return json.loads(json.dumps(state))
+
+    def _save(new_cfg):
+        if save_error is not None:
+            raise save_error
+        mod.saved.append(json.loads(json.dumps(new_cfg)))
+        state.clear()
+        state.update(json.loads(json.dumps(new_cfg)))
+
+    mod.load_config_readonly = _load
+    mod.load_config = _load
+    mod.save_config = _save
+    mod.saved = []
+    mod.state = state
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", mod)
+    return mod
+
+
+def _persist_stub(monkeypatch):
+    """hermes_cli.model_setup fake matching the documented helper signature
+    (persist_model_selection(model, provider, *, base_url, api_mode))."""
+    mod = types.ModuleType("hermes_cli.model_setup")
+
+    def persist_model_selection(model, provider, *, base_url=None,
+                                api_mode=None):
+        mod.calls.append({"model": model, "provider": provider,
+                          "base_url": base_url, "api_mode": api_mode})
+        return {"default": model, "provider": provider,
+                "base_url": base_url, "api_mode": api_mode}
+
+    mod.persist_model_selection = persist_model_selection
+    mod.calls = []
+    monkeypatch.setitem(sys.modules, "hermes_cli.model_setup", mod)
+    return mod
+
+
+def _resolvable(slug, providers=()):
+    """The model-selection-integration.md identity rule for persisted
+    provider slugs: custom, custom:<name>, registered provider slugs, and
+    the llamacpp aliases. Engine codenames are never resolvable."""
+    s = str(slug)
+    if s == "custom":
+        return True
+    if s.startswith("custom:"):
+        names = {"custom:" + str(e.get("name") or "").strip().lower()
+                       .replace(" ", "-")
+                 for e in providers if isinstance(e, dict)}
+        return s in names
+    return s in {"strata", "maya", "model-forge",
+                 "llamacpp", "llama.cpp", "llama-cpp"}
+
+
+def test_activate_plan_shows_custom_provider_entry(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _ok_engine(monkeypatch, ("chat",))
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box"}))
+    assert out["ok"] is True
+    cp = out["custom_provider"]
+    assert cp["slug"] == "custom:gpu-box"
+    assert cp["applied"] is False          # plan-only: nothing written yet
+    entry = cp["entry"]
+    assert entry["name"] == "gpu-box"
+    assert entry["base_url"] == "http://gpu-box.example.com:8080/v1"
+    assert entry["api_mode"] == "chat_completions"
+    assert entry["models"] == {"glm-5.3-flash": {}}
+    assert "/model" in cp["write"]
+    # plan detail names the same slug and the shared state vocabulary
+    assert cp["slug"] in out["detail"]
+    assert tools._NEXT_SESSION_NOTE in out["detail"]
+
+
+def test_activate_apply_registers_custom_provider_roundtrip(tmp_path,
+                                                            monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _ok_engine(monkeypatch, ("chat",))
+    cfg_mod = _config_stub(monkeypatch)
+    setup = _persist_stub(monkeypatch)
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box", "apply": True}))
+    assert out["applied"] is True
+    assert out["custom_provider"]["applied"] is True
+    # persist_model_selection per the reference: model + resolvable slug
+    # provider + the endpoint; api_mode set explicitly
+    call = setup.calls[0]
+    assert call["model"] == "glm-5.3-flash"
+    assert call["provider"] == "custom"       # generic engine -> custom class
+    assert call["base_url"] == "http://gpu-box.example.com:8080/v1"
+    assert call["api_mode"] == "chat_completions"
+    # the custom_providers entry round-trips through the reference's identity
+    # rule: legacy entries key their slug on the normalized display name
+    rows = cfg_mod.state["custom_providers"]
+    assert len(rows) == 1
+    saved = rows[0]
+    slug = "custom:" + saved["name"].lower().replace(" ", "-")
+    assert slug == out["custom_provider"]["slug"] == "custom:gpu-box"
+    assert "glm-5.3-flash" in saved["models"]
+    assert _resolvable(slug, rows)
+
+
+def test_activate_custom_provider_merge_declares_models(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _ok_engine(monkeypatch, ("chat",))
+    cfg_mod = _config_stub(monkeypatch, {
+        "custom_providers": [{
+            "name": "gpu-box",
+            "base_url": "http://old-endpoint.example.com:9000/v1",
+            "api_key": "kept-secret",
+            "models": {"older-model": {"context_length": 4096}},
+        }]})
+    _persist_stub(monkeypatch)
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box", "apply": True}))
+    rows = cfg_mod.state["custom_providers"]
+    assert len(rows) == 1                    # merged, never duplicated
+    saved = rows[0]
+    # declared models merge: a later activation never drops an earlier id
+    assert set(saved["models"]) == {"older-model", "glm-5.3-flash"}
+    assert saved["models"]["older-model"] == {"context_length": 4096}
+    # the slug identity moved with its target; other keys survive
+    assert saved["base_url"] == "http://gpu-box.example.com:8080/v1"
+    assert saved["api_key"] == "kept-secret"
+    assert out["custom_provider"]["applied"] is True
+
+
+def test_activate_apply_custom_provider_failure_is_honest(tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _ok_engine(monkeypatch, ("chat",))
+    _config_stub(monkeypatch, save_error=OSError("config is read-only"))
+    _persist_stub(monkeypatch)
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box", "apply": True}))
+    # per-write honest state: the model section persisted, the registration
+    # failed — and the failure is reported, never folded into the other state
+    assert out["applied"] is True
+    assert out["custom_provider"]["applied"] is False
+    assert "OSError" in out["custom_provider"]["error"]
+
+
+def test_activate_persisted_slugs_are_resolvable():
+    from model_forge.registry import ModelEntry
+    from model_forge.tools import activation_plan
+
+    cases = [
+        ("glm-5.3-flash", ["maya"], "maya"),
+        ("qwen3.8-flash-next", ["strata"], "strata"),
+        ("minicpm-v-4.6", ["vllm"], "custom"),
+        ("qwen3.8-flash-next", ["openai-compatible"], "custom"),
+    ]
+    for mid, available, want_provider in cases:
+        entry = next(m for m in models_for() if m.id == mid)
+        plan = activation_plan(entry, _REMOTE, available)
+        assert plan["ok"] is True and plan["provider"] == want_provider, mid
+        assert _resolvable(plan["provider"]), plan["provider"]
+        slug = plan["custom_provider"]["slug"]
+        assert _resolvable(slug, [plan["custom_provider"]["entry"]]), slug
+        # round-trip: the slug resolves to an entry declaring the model that
+        # would be persisted as model.default
+        assert plan["model"] in plan["custom_provider"]["entry"]["models"]
+    # an unregistered engine codename maps to the custom class, never its own
+    # invented slug
+    ollama = ModelEntry(id="ollama-chat", name="Ollama chat", modality="chat",
+                        engines=("ollama",), source="a/b")
+    plan = activation_plan(ollama, _REMOTE, ["ollama"])
+    assert plan["provider"] == "custom"
+    assert plan["custom_provider"]["slug"] == "custom:gpu-box"
+    # the local target keeps its own resolvable identity
+    plan = activation_plan(
+        next(m for m in models_for() if m.id == "glm-5.3-flash"),
+        _LOCAL, ["openai-compatible"])
+    assert plan["custom_provider"]["slug"] == "custom:local"
+    assert _resolvable(plan["custom_provider"]["slug"],
+                       [plan["custom_provider"]["entry"]])
+
+
+# --- tools.py: facade activation writes BOTH consumer surfaces --------------
+
+def _real_config_store(monkeypatch, tmp_path, *, initial=None):
+    """``hermes_cli.config`` fake backed by a REAL config file under an
+    isolated ``HERMES_HOME``. ``load_config``/``save_config`` round-trip the
+    file, so the shape the facade write path produces on disk is the real
+    list/dict semantics Hermes reads — not a recorder's fiction. This is the
+    seam the in-process write path is exercised through (the bug this guards:
+    dotted ``hermes config set`` index writes corrupt custom_providers)."""
+    home = tmp_path / "hermes_home"
+    home.mkdir(exist_ok=True)
+    cfg_path = home / "config.json"
+    cfg_path.write_text(json.dumps(initial or {}))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    mod = types.ModuleType("hermes_cli.config")
+
+    def _load():
+        return json.loads(cfg_path.read_text())
+
+    def _save(cfg):
+        cfg_path.write_text(json.dumps(cfg))
+
+    mod.load_config = _load
+    mod.load_config_readonly = _load
+    mod.save_config = _save
+    mod.path = cfg_path
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", mod)
+    return mod
+
+
+def _facade_target(monkeypatch, tmp_path, *, initial=None):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    cfg_mod = _real_config_store(monkeypatch, tmp_path, initial=initial)
+    return tools, cfg_mod
+
+
+def test_activation_plan_facade_lists_both_surfaces(tmp_path, monkeypatch):
+    tools, _ = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat", "vision"))
+    monkeypatch.setattr(
+        tools, "_fetch_facade_models",
+        lambda base, timeout=2.0: ["Qwen/Qwen3.8-27B-FP8", "extra/model"])
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "minicpm-v-4.6", "target": "gpu-box", "facade": True}))
+    assert out["ok"] is True and out["facade"] is True
+    assert out["applied"] is False
+    # surface (a): custom_providers — the entry is MERGED into the list from
+    # the declared models, refreshed from /v1/models (no dotted index writes).
+    cp = out["custom_provider"]
+    assert cp["slug"] == "custom:gpu-box"
+    assert set(cp["entry"]["models"]) == {
+        "minicpm-v-4.6", "Qwen/Qwen3.8-27B-FP8", "extra/model"}
+    assert cp["merged"]["name"] == "gpu-box"           # merge applied
+    assert "models_note" not in cp          # /v1/models answered -> refreshed
+    # surface (b): auxiliary.vision — model + base_url
+    av = out["auxiliary_vision"]
+    assert av["model"] == "minicpm-v-4.6"
+    assert av["base_url"] == "http://gpu-box.example.com:8080/v1"
+
+
+def test_activate_facade_apply_writes_both_surfaces_real_config(tmp_path,
+                                                                monkeypatch):
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat", "vision"))
+    _persist_stub(monkeypatch)
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: [])
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box",
+         "facade": True, "apply": True}))
+    assert out["applied"] is True
+    assert out["custom_provider"]["applied"] is True
+    assert out["auxiliary_vision"]["applied"] is True
+
+    # REAL config semantics — read back the on-disk config the way Hermes does.
+    saved = json.loads(cfg_mod.path.read_text())
+    rows = saved.get("custom_providers") or []
+    assert isinstance(rows, list) and len(rows) == 1     # a LIST, not a mapping
+    row = rows[0]
+    assert row["name"] == "gpu-box"
+    assert row["base_url"] == "http://gpu-box.example.com:8080/v1"
+    assert row["api_mode"] == "chat_completions"
+    assert "glm-5.3-flash" in row["models"]
+    # auxiliary.vision landed as the flat model + base_url Hermes reads
+    assert saved["auxiliary"]["vision"]["model"] == "glm-5.3-flash"
+    assert saved["auxiliary"]["vision"]["base_url"] == \
+        "http://gpu-box.example.com:8080/v1"
+    # both surfaces reported honestly in the summary
+    written = {w["key"] for w in out["config_writes"]}
+    assert {"custom_providers", "auxiliary.vision.model",
+            "auxiliary.vision.base_url"} <= written
+    assert all(w["ok"] for w in out["config_writes"])
+
+
+def test_activate_facade_apply_appends_to_existing_list(tmp_path, monkeypatch):
+    # An already-present custom_providers list: the append case index writes
+    # could not do (hermes_cli never grows a list -> IndexError). The new entry
+    # is appended and the untouched provider at index 0 is left intact.
+    tools, cfg_mod = _facade_target(
+        monkeypatch, tmp_path,
+        initial={"custom_providers": [
+            {"name": "other", "base_url": "http://other.example:9/v1",
+             "api_mode": "chat_completions"}]})
+    _ok_engine(monkeypatch, ("chat",))
+    _persist_stub(monkeypatch)
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: [])
+    tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box",
+         "facade": True, "apply": True})
+    rows = json.loads(cfg_mod.path.read_text())["custom_providers"]
+    assert isinstance(rows, list) and len(rows) == 2
+    assert rows[0] == {"name": "other", "base_url": "http://other.example:9/v1",
+                       "api_mode": "chat_completions"}      # byte-for-byte
+    assert rows[1]["name"] == "gpu-box"
+    assert "glm-5.3-flash" in rows[1]["models"]
+
+
+def test_activate_facade_alias_writes_canonical_id(tmp_path, monkeypatch):
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat", "vision"))
+    _persist_stub(monkeypatch)
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: ["Qwen/Qwen3.8-27B-FP8"])
+    canonical = "Qwen/Qwen3.8-27B-FP8"
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "minicpm-v-4.6", "target": "gpu-box", "facade": True,
+         "engine_model": "vision/minicpm-v-4.6",   # legacy alias
+         "apply": True}))
+    assert out["model"] == canonical
+    assert out["auxiliary_vision"]["model"] == canonical
+    saved = json.loads(cfg_mod.path.read_text())
+    assert saved["auxiliary"]["vision"]["model"] == canonical
+    # the canonical id survives as ONE key in the models mapping. A dotted CLI
+    # write would have shattered it into {"Qwen/Qwen3": {"8-27B-FP8": {}}}.
+    models = saved["custom_providers"][0]["models"]
+    assert canonical in models
+    assert "Qwen/Qwen3" not in models
+    # the alias never appears anywhere in the written config
+    assert "vision/minicpm-v-4.6" not in json.dumps(saved)
+
+
+def test_activate_facade_plan_only_writes_nothing_and_gate_unchanged(
+        tmp_path, monkeypatch):
+    from model_forge import tools as _tools
+
+    # the human-approval gate still escalates apply=true for a facade activate
+    d = _tools.policy_hook("model_forge_activate",
+                           {"apply": True, "facade": True, "target": "gpu-box",
+                            "model_id": "glm-5.3-flash"})
+    assert d is not None and d["action"] == "approve"
+    assert d["rule_key"] == "model-forge:activate"
+    assert _tools.policy_hook("model_forge_activate",
+                              {"facade": True, "model_id": "glm-5.3-flash"}) is None
+
+    # plan-only (approval not granted / apply absent): nothing is written
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat", "vision"))
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: [])
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box", "facade": True}))
+    assert out["applied"] is False
+    assert out["auxiliary_vision"]["applied"] is False
+    # fail closed: the isolated config file is untouched
+    assert json.loads(cfg_mod.path.read_text()) == {}
+
+
+def test_activate_facade_unreachable_models_degrades_honest(tmp_path,
+                                                            monkeypatch):
+    tools, _ = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat",))
+
+    def _boom(base, timeout=2.0):
+        raise OSError("connection refused")
+    monkeypatch.setattr(tools, "_fetch_facade_models", _boom)
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box", "facade": True}))
+    assert out["ok"] is True
+    note = out["custom_provider"]["models_note"]
+    assert "models not refreshed" in note and "OSError" in note
+    # the entry still declares the activated model, no hang, no raise
+    assert "glm-5.3-flash" in out["custom_provider"]["entry"]["models"]
+    # the probe carries a short timeout so an unreachable endpoint cannot hang
+    import inspect
+    default = inspect.signature(
+        tools._fetch_facade_models).parameters["timeout"].default
+    assert default <= 5.0
+
+
+def test_activate_facade_surface_failure_is_honest(tmp_path, monkeypatch):
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat", "vision"))
+    _persist_stub(monkeypatch)
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: [])
+
+    def boom(model, base_url):
+        # the auxiliary.vision write fails; custom_providers still lands
+        raise OSError("auxiliary.vision is read-only")
+    monkeypatch.setattr(tools, "write_auxiliary_vision", boom)
+
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box",
+         "facade": True, "apply": True}))
+    assert out["custom_provider"]["applied"] is True
+    assert out["auxiliary_vision"]["applied"] is False
+    assert "OSError" in out["auxiliary_vision"]["error"]
+    # the honest failure never folded into the other surface's state
+    assert (json.loads(cfg_mod.path.read_text()).get("custom_providers") or [])
+
+
+def test_policy_hook_activate_approval_shows_custom_provider_write():
+    from model_forge import tools
+
+    d = tools.policy_hook("model_forge_activate",
+                          {"model_id": "m1", "target": "gpu-box",
+                           "apply": True})
+    assert d["action"] == "approve"
+    assert d["rule_key"] == "model-forge:activate"
+    # the approval prompt shows the custom_providers write and its slug —
+    # the same slug the plan and the write use
+    assert "custom_providers" in d["message"]
+    assert "custom:gpu-box" in d["message"]
+    assert "custom:gpu-box" == tools.custom_provider_slug_for("gpu-box")
+    # gating unchanged: plan-only still needs no approval
+    assert tools.policy_hook("model_forge_activate",
+                             {"model_id": "m1"}) is None
+
+
+def test_activate_media_setup_provider_strings_use_shared_vocabulary(
+        tmp_path, monkeypatch):
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    add_target(_REMOTE, base_dir=tmp_path)
+    from model_forge import tools
+
+    monkeypatch.setattr(tools, "get_target",
+                        lambda tid: get_target(tid, base_dir=tmp_path))
+    _ok_engine(monkeypatch, ("chat", "image", "video"))
+    monkeypatch.setattr(tools, "route_exists",
+                        lambda root, path, timeout=2.0: True)
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "glm-5.3-flash", "target": "gpu-box"}))
+    media = out["media_setup"]
+    # the provider token and settings paths are the exact strings the media
+    # providers register and read (cross-checked in test_capability)
+    assert media["image_gen"] == (
+        "hermes config set plugins.entries.model-forge-image.settings"
+        ".base_url http://gpu-box.example.com:8080/v1 && hermes config set "
+        "image_gen.provider " + tools._MEDIA_PROVIDER_NAME)
+    assert media["video_gen"] == (
+        "hermes config set plugins.entries.model-forge-video.settings"
+        ".base_url http://gpu-box.example.com:8080/v1 && hermes config set "
+        "video_gen.provider " + tools._MEDIA_PROVIDER_NAME)
+
+
+# --- model_forge_broker: starting an engine server needs approval ------------
+# A model-callable claim/swap that would START a server process (the vLLM and
+# llama.cpp lifecycles) must ride the human-approval gate, exactly like
+# engine_install — the server binds loopback only, and an unapproved server
+# start is the bug this gate prevents.
+
+def _policy_hook_env(monkeypatch, tmp_path, resident=()):
+    """Handler environment for the broker policy cases: a real residency stack
+    behind the broker_stack seam, with the named models already resident."""
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    stack = _residency_stack(_REMOTE, [])
+    for model_id in resident:
+        stack["ledger"].record_resident(_REMOTE.id, model_id, engine="vllm",
+                                        lane="vision")
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    return tools, stack
+
+
+def test_policy_hook_escalates_a_claim_that_starts_a_server(tmp_path,
+                                                            monkeypatch):
+    tools, _ = _policy_hook_env(monkeypatch, tmp_path)
+    # minicpm-v-4.6 is a vLLM (process) model; not resident -> a claim starts
+    # the server process, so the gate must see it.
+    d = tools.policy_hook("model_forge_broker",
+                          {"action": "claim", "target": "gpu-box",
+                           "model_id": "minicpm-v-4.6"})
+    assert d is not None and d["action"] == "approve"
+    assert d["rule_key"] == "model-forge:broker_server_start"
+    assert "minicpm-v-4.6" in d["message"]
+    assert "vllm" in d["message"]
+    assert "gpu-box" in d["message"]
+    assert "port: 8000" in d["message"]
+    assert "127.0.0.1" in d["message"]
+    assert "starts nothing" in d["message"]
+
+
+def test_policy_hook_escalates_a_swap_that_starts_a_server(tmp_path,
+                                                           monkeypatch):
+    tools, _ = _policy_hook_env(monkeypatch, tmp_path)
+    d = tools.policy_hook("model_forge_broker",
+                          {"action": "swap", "target": "gpu-box",
+                           "model_id": "minicpm-v-4.6"})
+    assert d["action"] == "approve"
+    assert d["rule_key"] == "model-forge:broker_server_start"
+    assert "minicpm-v-4.6" in d["message"]
+
+
+def test_policy_hook_passes_when_the_model_is_already_resident(tmp_path,
+                                                               monkeypatch):
+    # A claim over an already-resident, already-running model starts nothing.
+    tools, _ = _policy_hook_env(monkeypatch, tmp_path,
+                                resident=("minicpm-v-4.6",))
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "claim", "target": "gpu-box",
+                              "model_id": "minicpm-v-4.6"}) is None
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "swap", "target": "gpu-box",
+                              "model_id": "minicpm-v-4.6"}) is None
+
+
+def test_policy_hook_ignores_dry_run_swap(tmp_path, monkeypatch):
+    # dry_run changes nothing and starts nothing — no approval.
+    tools, _ = _policy_hook_env(monkeypatch, tmp_path)
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "swap", "target": "gpu-box",
+                              "model_id": "minicpm-v-4.6",
+                              "dry_run": True}) is None
+
+
+def test_policy_hook_passes_for_non_process_engines(tmp_path, monkeypatch):
+    # comfyui is HTTP-native — a claim/swap starts no process.
+    tools, _ = _policy_hook_env(monkeypatch, tmp_path)
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "claim", "target": "gpu-box",
+                              "model_id": "krea-2-turbo"}) is None
+    # a modality claim resolving to the curated HTTP-engine model too
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "claim", "target": "gpu-box",
+                              "modality": "image"}) is None
+
+
+def test_policy_hook_passes_for_read_only_broker_verbs(tmp_path, monkeypatch):
+    tools, _ = _policy_hook_env(monkeypatch, tmp_path)
+    for action in ("status", "plan", "release", "bench"):
+        assert tools.policy_hook("model_forge_broker",
+                                 {"action": action, "target": "gpu-box",
+                                  "model_id": "minicpm-v-4.6"}) is None
+
+
+def test_policy_hook_denial_blocks_a_server_starting_claim(tmp_path,
+                                                           monkeypatch):
+    tools, _ = _policy_hook_env(monkeypatch, tmp_path)
+    ran = []
+
+    def dispatch(_args):
+        ran.append("ran")
+        return {"ok": True}
+
+    args = {"action": "claim", "target": "gpu-box",
+            "model_id": "minicpm-v-4.6"}
+    denied = _simulate_approval_gate("model_forge_broker", args,
+                                     decision="deny", dispatch=dispatch)
+    assert denied["blocked"] is True
+    assert denied["directive"]["rule_key"] == "model-forge:broker_server_start"
+    assert ran == []                        # the handler never ran
+    approved = _simulate_approval_gate("model_forge_broker", args,
+                                       decision="approve", dispatch=dispatch)
+    assert approved["blocked"] is False and ran == ["ran"]
+
+
+# --- broker release / media lane: restoring a server needs approval ---------
+# A release restores what was resident at claim time. When that restore loads
+# a NON-resident process-engine model (llama.cpp / vLLM), the release SPAWNS a
+# server process — the reviewer-reproduced hole: the claim that evicted the
+# model needed no approval (an HTTP engine), yet its later release started a
+# server. The gate must see it, exactly like a starting claim. A release that
+# restores nothing, restores an already-resident model, or restores only
+# HTTP-native engines starts nothing and must NOT prompt.
+
+def _process_resident(stack, model_id, *, vram=6.0, engine="llamacpp",
+                      lane="chat"):
+    """A claim-time resident on a (possibly process) engine, with its booking."""
+    spec = {"vram_gb": vram, "source": "catalog-vram-floor", "load_s": None}
+    stack["ledger"].book(model_id, spec)
+    stack["bookings"][model_id] = spec
+    stack["ledger"].record_resident("gpu-box", model_id, engine=engine,
+                                    lane=lane)
+
+
+def _release_stack(monkeypatch, tmp_path, budget=24.0):
+    calls = []
+    adapters = {e: _RecordingAdapter(e, calls)
+                for e in ("ollama", "comfyui", "llamacpp", "media-gateway")}
+    stack = _residency_stack(_REMOTE, calls, budget=budget, adapters=adapters)
+    tools = _broker_env(monkeypatch, tmp_path, stack)
+    return tools, stack, calls
+
+
+def test_policy_hook_passes_release_of_an_unknown_scope(tmp_path, monkeypatch):
+    tools, _, _ = _release_stack(monkeypatch, tmp_path)
+    # an unknown scope is refused by the handler before any start — no prompt
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "release", "target": "gpu-box",
+                              "scope_id": "never-claimed"}) is None
+    # and a release with no scope_id is refused too
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "release", "target": "gpu-box"}) is None
+
+
+def test_policy_hook_escalates_a_release_that_restores_a_process_server(
+        tmp_path, monkeypatch):
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=6.0, engine="llamacpp")
+    # an image-generation claim evicts the whole card (chat-a goes) with NO
+    # approval — comfyui is HTTP-native and starts no server
+    claimed = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    assert claimed["ok"] is True
+    scope_id = claimed["scope_id"]
+    assert not stack["ledger"].is_resident("gpu-box", "chat-a")
+    # releasing the scope would RE-LOAD chat-a on llama.cpp -> a server start
+    d = tools.policy_hook("model_forge_broker",
+                          {"action": "release", "scope_id": scope_id,
+                           "target": "gpu-box"})
+    assert d is not None and d["action"] == "approve"
+    assert d["rule_key"] == "model-forge:broker_server_start"
+    assert "chat-a" in d["message"] and "llamacpp" in d["message"]
+    assert "RE-START" in d["message"] and "127.0.0.1" in d["message"]
+    assert "port: 8080" in d["message"]
+
+
+def test_policy_hook_resolves_release_target_from_the_active_scope(
+        tmp_path, monkeypatch):
+    # the release handler resolves the target from the active scope when none
+    # is passed; the gate must resolve it the same way to see the restore.
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=6.0, engine="llamacpp")
+    claimed = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    scope_id = claimed["scope_id"]
+    d = tools.policy_hook("model_forge_broker",
+                          {"action": "release", "scope_id": scope_id})
+    assert d is not None and d["rule_key"] == "model-forge:broker_server_start"
+
+
+def test_policy_hook_passes_a_release_restoring_only_http_engine(
+        tmp_path, monkeypatch):
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-b", vram=6.0, engine="ollama")
+    claimed = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    scope_id = claimed["scope_id"]
+    assert not stack["ledger"].is_resident("gpu-box", "chat-b")
+    # restoring an HTTP-native engine (ollama) starts no process -> no prompt
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "release", "scope_id": scope_id,
+                              "target": "gpu-box"}) is None
+
+
+def test_policy_hook_passes_a_release_whose_restore_is_still_resident(
+        tmp_path, monkeypatch):
+    # a restore set whose process model is already resident loads nothing
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=6.0, engine="llamacpp")
+    claimed = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    scope_id = claimed["scope_id"]
+    # chat-a comes back resident before the release (e.g. another path)
+    _process_resident(stack, "chat-a", vram=6.0, engine="llamacpp")
+    assert tools.policy_hook("model_forge_broker",
+                             {"action": "release", "scope_id": scope_id,
+                              "target": "gpu-box"}) is None
+
+
+def test_policy_hook_escalates_a_media_submit_with_a_process_resident(
+        tmp_path, monkeypatch):
+    # a media job claims the lane and releases it later; a resident
+    # process-engine model could be evicted and re-started on that release
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=6.0, engine="llamacpp")
+    d = tools.policy_hook("model_forge_generate_media",
+                          {"modality": "3d", "target": "gpu-box",
+                           "model": "gen/3d"})
+    assert d is not None and d["action"] == "approve"
+    assert d["rule_key"] == "model-forge:broker_server_start"
+    assert "chat-a" in d["message"] and "llamacpp" in d["message"]
+
+
+def test_policy_hook_passes_a_media_submit_without_a_process_resident(
+        tmp_path, monkeypatch):
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=6.0, engine="ollama")
+    assert tools.policy_hook("model_forge_generate_media",
+                             {"modality": "3d", "target": "gpu-box",
+                              "model": "gen/3d"}) is None
+    # an unknown target is refused by the handler before any start
+    assert tools.policy_hook("model_forge_generate_media",
+                             {"modality": "3d", "target": "nope",
+                              "model": "gen/3d"}) is None
+    # needs_args (no model): the handler submits nothing
+    assert tools.policy_hook("model_forge_generate_media",
+                             {"modality": "3d", "target": "gpu-box"}) is None
+
+
+def test_policy_hook_a_media_poll_of_a_running_job_does_not_escalate(
+        tmp_path, monkeypatch):
+    # A poll performs no release while the job still runs — the handler only
+    # releases the held scope on a terminal record. Polling a long-running job
+    # must therefore NOT prompt on every poll (the regression this guards).
+    from model_forge.broker import LoadRequest
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=18.0, engine="llamacpp")
+    stack["ledger"].book("gen/3d", {"vram_gb": 20.0, "source": "stand-in"})
+    # an open media scope (3d) whose claim evicted chat-a (18 + 20 > 24)
+    claimed = stack["orchestrator"].claim(
+        "media-x", "gpu-box",
+        LoadRequest("gen/3d", "media-gateway", lane="3d", modality="3d"))
+    assert claimed["ok"] is True
+    assert not stack["ledger"].is_resident("gpu-box", "chat-a")
+    tools._MEDIA_SCOPE_JOBS["job-9"] = {
+        "scope_id": "media-x", "target_id": "gpu-box",
+        "model_id": "gen/3d", "modality": "3d"}
+    # the job record reads back as still running -> this poll releases nothing
+    monkeypatch.setattr(tools, "_fetch_media_job",
+                        lambda target, job_id: {"status": "running"})
+    assert tools.policy_hook("model_forge_generate_media",
+                             {"modality": "3d", "target": "gpu-box",
+                              "job_id": "job-9"}) is None
+
+
+def test_policy_hook_escalates_a_media_poll_release_restoring_a_server(
+        tmp_path, monkeypatch):
+    from model_forge.broker import LoadRequest
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=18.0, engine="llamacpp")
+    stack["ledger"].book("gen/3d", {"vram_gb": 20.0, "source": "stand-in"})
+    # an open media scope (3d) whose claim evicted chat-a (18 + 20 > 24)
+    claimed = stack["orchestrator"].claim(
+        "media-x", "gpu-box",
+        LoadRequest("gen/3d", "media-gateway", lane="3d", modality="3d"))
+    assert claimed["ok"] is True
+    assert not stack["ledger"].is_resident("gpu-box", "chat-a")
+    tools._MEDIA_SCOPE_JOBS["job-9"] = {
+        "scope_id": "media-x", "target_id": "gpu-box",
+        "model_id": "gen/3d", "modality": "3d"}
+    # the job record is terminal: this poll releases the scope, and that
+    # restore re-loads chat-a on llama.cpp -> it must prompt
+    monkeypatch.setattr(tools, "_fetch_media_job",
+                        lambda target, job_id: {"status": "done"})
+    d = tools.policy_hook("model_forge_generate_media",
+                          {"modality": "3d", "target": "gpu-box",
+                           "job_id": "job-9"})
+    assert d is not None and d["rule_key"] == "model-forge:broker_server_start"
+    assert "chat-a" in d["message"] and "llamacpp" in d["message"]
+
+
+def test_policy_hook_a_media_poll_fails_safe_when_the_job_record_is_unreadable(
+        tmp_path, monkeypatch):
+    # an unreadable/missing job record is uncertainty about whether this poll
+    # releases -> escalate (the over-approximation is deliberate)
+    from model_forge.broker import LoadRequest
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=18.0, engine="llamacpp")
+    stack["ledger"].book("gen/3d", {"vram_gb": 20.0, "source": "stand-in"})
+    stack["orchestrator"].claim(
+        "media-x", "gpu-box",
+        LoadRequest("gen/3d", "media-gateway", lane="3d", modality="3d"))
+    tools._MEDIA_SCOPE_JOBS["job-9"] = {
+        "scope_id": "media-x", "target_id": "gpu-box",
+        "model_id": "gen/3d", "modality": "3d"}
+
+    def boom(target, job_id):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(tools, "_fetch_media_job", boom)
+    d = tools.policy_hook("model_forge_generate_media",
+                          {"modality": "3d", "target": "gpu-box",
+                           "job_id": "job-9"})
+    assert d is not None and d["rule_key"] == "model-forge:broker_server_start"
+
+
+def test_policy_hook_release_denial_blocks_the_restore(tmp_path, monkeypatch):
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    _process_resident(stack, "chat-a", vram=6.0, engine="llamacpp")
+    claimed = json.loads(tools.model_forge_broker(
+        {"action": "claim", "target": "gpu-box", "model_id": "krea-2-turbo"}))
+    scope_id = claimed["scope_id"]
+    ran = []
+
+    def dispatch(_args):
+        ran.append("ran")
+        return {"ok": True}
+
+    args = {"action": "release", "scope_id": scope_id, "target": "gpu-box"}
+    denied = _simulate_approval_gate("model_forge_broker", args,
+                                     decision="deny", dispatch=dispatch)
+    assert denied["blocked"] is True
+    assert denied["directive"]["rule_key"] == "model-forge:broker_server_start"
+    assert ran == []          # the restore never ran without approval
+
+
+# --- _git_run / hardware probes: minimal child environment ------------------
+
+def test_git_run_child_gets_minimal_env_and_no_credential_prompt(monkeypatch):
+    from model_forge import tools
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
+    monkeypatch.setenv("HF_TOKEN", "hf-secret")
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = b""
+
+    def fake_run(argv, **kw):
+        captured["argv"] = list(argv)
+        captured["kw"] = kw
+        return _Proc()
+
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+    tools._git_run(["clone", "https://github.com/mw00/project-maya", "/tmp/x"])
+    assert captured["argv"][0] == "git"
+    env = captured["kw"]["env"]
+    # no pins can hang the clone, and no Hermes credentials reach git
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert set(env) == {"PATH", "HOME", "LANG", "TMPDIR",
+                        "GIT_TERMINAL_PROMPT"}
+    assert "OPENAI_API_KEY" not in env and "HF_TOKEN" not in env
+
+
+def test_hardware_probe_children_get_minimal_env(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret2")
+    captured = []
+
+    class _Proc:
+        returncode = 0
+        stdout = "GPU0, 8192\n"
+
+    def fake_run(argv, **kw):
+        captured.append((list(argv), dict(kw)))
+        return _Proc()
+
+    monkeypatch.setattr(hardware.subprocess, "run", fake_run)
+    monkeypatch.setattr(hardware.shutil, "which",
+                        lambda name: f"/usr/bin/{name}")
+    hardware._probe_nvidia()
+    hardware._probe_amd_rocm()
+    assert len(captured) == 2
+    for _, kw in captured:
+        env = kw.get("env")
+        assert env is not None
+        assert set(env) == {"PATH", "HOME", "LANG", "TMPDIR"}
+        assert "OPENAI_API_KEY" not in env and "ANTHROPIC_API_KEY" not in env
+
+
+def test_policy_hook_release_fails_safe_when_uncertain(tmp_path, monkeypatch):
+    # if the restore cannot be inspected, escalate — an extra approval is
+    # acceptable; an unapproved start is the bug
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+    tools._ACTIVE_SCOPES["s-x"] = {"target_id": "gpu-box"}
+
+    def boom(target, **kw):
+        raise RuntimeError("broker stack unavailable")
+
+    monkeypatch.setattr(tools, "broker_stack", boom)
+    d = tools.policy_hook("model_forge_broker",
+                          {"action": "release", "scope_id": "s-x",
+                           "target": "gpu-box"})
+    assert d is not None and d["rule_key"] == "model-forge:broker_server_start"
+
+
+def test_policy_hook_media_fails_safe_when_uncertain(tmp_path, monkeypatch):
+    tools, stack, _ = _release_stack(monkeypatch, tmp_path)
+
+    def boom(target, **kw):
+        raise RuntimeError("broker stack unavailable")
+
+    monkeypatch.setattr(tools, "broker_stack", boom)
+    d = tools.policy_hook("model_forge_generate_media",
+                          {"modality": "3d", "target": "gpu-box",
+                           "model": "gen/3d"})
+    assert d is not None and d["rule_key"] == "model-forge:broker_server_start"
+
+
+# --- engine_install approval: the exact executed command is shown -----------
+
+def test_engine_install_approval_shows_the_exact_executed_command(
+        tmp_path, monkeypatch):
+    import hashlib
+    import types
+    from model_forge import tools
+    from model_forge.tools import engine_install_plan
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    # The stager is the single source of the executed command. Run it with
+    # fakes (nothing is downloaded or cloned) and compare what the plan and the
+    # approval message show against what the runner is actually handed.
+    good = b"#!/bin/sh\ntrue\n"
+    monkeypatch.setitem(tools._ENGINE_INSTALLERS["ollama"], "sha256",
+                        hashlib.sha256(good).hexdigest())
+    staged = tools._stage_installer("ollama", downloader=lambda url: good)
+    assert staged["ok"] is True
+    executed = staged["command"]
+
+    def fake_git(args, cwd=None):
+        if "rev-parse" in args:
+            return types.SimpleNamespace(returncode=0,
+                                         stdout=_MAYA_COMMIT.encode())
+        return types.SimpleNamespace(returncode=0, stdout=b"")
+
+    monkeypatch.setattr(tools, "_git_run", fake_git)
+    maya = tools._stage_installer("maya")
+    assert maya["ok"] is True
+
+    # script installer: the plan and the approved text show the SAME string
+    # the stager produced — byte-identical, not merely shell-equivalent
+    plan = engine_install_plan("ollama")
+    d = tools.policy_hook("model_forge_install",
+                          {"action": "engine_install", "engine": "ollama",
+                           "execute": True})
+    assert d["rule_key"] == "model-forge:engine_install"
+    assert plan["command"] == executed
+    assert f"command: {executed}" in d["message"]
+    assert f"acquire: {plan['pipeline']}" in d["message"]
+    assert "sha256sum" not in d["message"]
+    # git installer: same single source of truth, ./setup.sh inside the pin
+    maya_plan = engine_install_plan("maya")
+    d_maya = tools.policy_hook("model_forge_install",
+                               {"action": "engine_install", "engine": "maya",
+                                "execute": True})
+    assert maya_plan["command"] == maya["command"]
+    assert maya_plan["command"].endswith("./setup.sh")
+    assert f"command: {maya['command']}" in d_maya["message"]
+    assert f"acquire: {maya_plan['pipeline']}" in d_maya["message"]
+
+    # the plan's command IS what the background job records as executed — one
+    # string from the stager, shown and run
+    calls = _installer_spy(monkeypatch)
+    spy_stage = _stage_spy(monkeypatch, tmp_path)
+    _stub_hermes_modules(monkeypatch, tmp_path)
+    started = json.loads(tools.model_forge_install(
+        {"action": "engine_install", "engine": "ollama", "execute": True}))
+    st = _poll_until_done(started["job_id"])
+    assert spy_stage == ["ollama"]
+    assert calls[0] == st["executed_command"]
+
+
+# --- tools.py: facade activation of cataloged-but-unregistered ids (P5 §8) ---
+#
+# The facade chat id Qwen/Qwen3.8-27B-FP8 is a /v1/models catalog id with no
+# curated-registry entry, so facade=true used to refuse it and activation fell
+# back to manual operator steps. For FACADE activations, an id the target's own
+# /v1/models advertises (or one aliases.resolve maps to such an id) must plan +
+# write; anything else still refuses honestly. The human-approval gate
+# (policy_hook) is unchanged and stays fail-closed.
+
+_FACADE_CHAT_ID = "Qwen/Qwen3.8-27B-FP8"
+
+
+def test_activate_facade_accepts_cataloged_but_unregistered_id(tmp_path,
+                                                               monkeypatch):
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat", "vision"))
+    _persist_stub(monkeypatch)
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: [_FACADE_CHAT_ID])
+    # premise: the id is genuinely absent from the curated registry
+    assert all(m.id != _FACADE_CHAT_ID for m in models_for())
+
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": _FACADE_CHAT_ID, "target": "gpu-box", "facade": True,
+         "apply": True}))
+    assert out["ok"] is True and out["facade"] is True
+    assert out["applied"] is True
+    assert out["custom_provider"]["applied"] is True
+    assert out["auxiliary_vision"]["applied"] is True
+    # canonical-id-on-write: the requested id IS its canonical form here
+    assert out["model"] == _FACADE_CHAT_ID
+    saved = json.loads(cfg_mod.path.read_text())
+    assert saved["auxiliary"]["vision"]["model"] == _FACADE_CHAT_ID
+    assert _FACADE_CHAT_ID in saved["custom_providers"][0]["models"]
+
+
+def test_activate_facade_accepts_alias_that_resolves_to_cataloged_id(
+        tmp_path, monkeypatch):
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat", "vision"))
+    _persist_stub(monkeypatch)
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: [_FACADE_CHAT_ID])
+    legacy = "vision/minicpm-v-4.6"          # aliases.resolve -> canonical
+    assert all(m.id != legacy for m in models_for())
+
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": legacy, "target": "gpu-box", "facade": True,
+         "apply": True}))
+    assert out["ok"] is True and out["applied"] is True
+    assert out["model"] == _FACADE_CHAT_ID   # canonical-id-on-write
+    saved = json.loads(cfg_mod.path.read_text())
+    assert saved["auxiliary"]["vision"]["model"] == _FACADE_CHAT_ID
+    assert legacy not in json.dumps(saved)   # the alias is never written
+
+
+def test_activate_facade_id_absent_everywhere_refuses_honestly(tmp_path,
+                                                               monkeypatch):
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat",))
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: [_FACADE_CHAT_ID])
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": "totally/unknown-id", "target": "gpu-box",
+         "facade": True, "apply": True}))
+    assert "error" in out
+    assert "unknown model_id" in out["error"] and "totally/unknown-id" in \
+        out["error"]
+    assert json.loads(cfg_mod.path.read_text()) == {}      # nothing written
+
+
+def test_activate_facade_unverifiable_catalog_refuses_fail_closed(
+        tmp_path, monkeypatch):
+    # the catalog fetch is fail-soft for the plan's model LIST, but an
+    # unverifiable id must never be activated: refuse honestly instead.
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat",))
+
+    def _boom(base, timeout=2.0):
+        raise OSError("connection refused")
+    monkeypatch.setattr(tools, "_fetch_facade_models", _boom)
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": _FACADE_CHAT_ID, "target": "gpu-box", "facade": True,
+         "apply": True}))
+    assert "error" in out
+    assert "connection refused" in out["error"]   # honest reason, named cause
+    assert json.loads(cfg_mod.path.read_text()) == {}
+
+
+def test_activate_facade_unregistered_id_gate_is_fail_closed(tmp_path,
+                                                             monkeypatch):
+    from model_forge import tools as _tools
+    args = {"model_id": _FACADE_CHAT_ID, "target": "gpu-box", "facade": True,
+            "apply": True}
+    # the human-approval gate escalates apply=true for the unregistered id
+    # exactly as for a registry id — a denial blocks the call BEFORE the
+    # handler runs (fail-closed), so nothing is ever written.
+    d = _tools.policy_hook("model_forge_activate", args)
+    assert d is not None and d["action"] == "approve"
+    assert d["rule_key"] == "model-forge:activate"
+    assert _FACADE_CHAT_ID in d["message"]
+    # plan-only needs no approval and writes nothing even for this id
+    tools, cfg_mod = _facade_target(monkeypatch, tmp_path)
+    _ok_engine(monkeypatch, ("chat", "vision"))
+    monkeypatch.setattr(tools, "_fetch_facade_models",
+                        lambda base, timeout=2.0: [_FACADE_CHAT_ID])
+    out = json.loads(tools.model_forge_activate(
+        {"model_id": _FACADE_CHAT_ID, "target": "gpu-box", "facade": True}))
+    assert out["ok"] is True and out["applied"] is False
+    assert json.loads(cfg_mod.path.read_text()) == {}

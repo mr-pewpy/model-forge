@@ -1,0 +1,19 @@
+# Mutation testing (quality gate 7) — mutmut config.
+#
+# Scope: the pure core modules where coverage is near-total, so a run there is
+# a meaningful measurement. The full tree is ~8.6k mutants (each a test-suite
+# run), so a complete run is a multi-hour CI job, not an interactive one.
+#
+# KNOWN GAP (documented in docs/quality-gates.md, gate 7): mutmut's
+# test-to-mutant coverage mapping does not link under this multi-package
+# layout. `model_forge` is imported via pytest.ini's `pythonpath = model-forge`
+# (the package lives under model-forge/, not the repo root), so coverage
+# records the REAL module path while mutmut swaps code under mutants/ — the
+# two never correlate, and mutmut reports "no test case for any mutant." The
+# tool runs (generates mutants, the suite passes) but a surviving-mutant count
+# needs mutmut to import through the same pythonpath. Until that lands, gate 7
+# is "tool runs, not yet measured" — never reported as 0 surviving mutants.
+
+[tool.mutmut]
+source_paths = ["model-forge/model_forge/"]
+runner = "python -m pytest -q tests/"

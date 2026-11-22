@@ -37,6 +37,11 @@ from model_forge.targets import ComputeTarget, get_target
 from model_forge.workflows import load_templates
 
 _REPO = Path(__file__).resolve().parent.parent
+try:
+    from _repo import repo_root as _repo_root
+    _REPO = _repo_root()
+except Exception:  # noqa: BLE001 — keep the literal path as the fallback
+    pass
 _IMAGE_PKG = _REPO / "model-forge-image" / "__init__.py"
 _VIDEO_PKG = _REPO / "model-forge-video" / "__init__.py"
 

@@ -23,6 +23,11 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
+try:
+    from _repo import repo_root as _repo_root
+    REPO = _repo_root()
+except Exception:  # noqa: BLE001 — keep the literal path as the fallback
+    pass
 PLUGIN_DIR = REPO / "model-forge"
 DESKTOP_PLUGIN_PATH = REPO / "model-forge-desktop" / "desktop" / "plugin.js"
 DASH_DIR = PLUGIN_DIR / "dashboard"

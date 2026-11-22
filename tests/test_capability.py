@@ -766,6 +766,11 @@ def test_cockpit_models_reuses_browse_fit_data(tmp_path, monkeypatch):
 # --- model-forge-providers: native /model provider registration -------------
 
 _REPO = Path(__file__).resolve().parent.parent
+try:
+    from _repo import repo_root as _repo_root
+    _REPO = _repo_root()
+except Exception:  # noqa: BLE001 — keep the literal path as the fallback
+    pass
 
 
 def _load_providers_pkg(monkeypatch):

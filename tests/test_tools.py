@@ -1721,8 +1721,12 @@ def _broker_env(monkeypatch, tmp_path, stack):
 
 def test_register_wires_broker_tool_and_hook(tmp_path, monkeypatch):
     import importlib.util
-    init_path = (Path(__file__).resolve().parent.parent
-                 / "model-forge" / "__init__.py")
+    try:
+        from _repo import repo_root as _root
+        _base = _root()
+    except Exception:  # noqa: BLE001 — keep the literal path as the fallback
+        _base = Path(__file__).resolve().parent.parent
+    init_path = _base / "model-forge" / "__init__.py"
     spec = importlib.util.spec_from_file_location(
         "model_forge_plugin_pkg", init_path,
         submodule_search_locations=[str(init_path.parent)])
@@ -2704,7 +2708,12 @@ def _config_schema_fields(text: str) -> dict:
 
 
 def test_config_schema_settings_shapes():
-    manifest = (Path(__file__).resolve().parent.parent
+    try:
+        from _repo import repo_root as _root
+        _base = _root()
+    except Exception:  # noqa: BLE001 — keep the literal path as the fallback
+        _base = Path(__file__).resolve().parent.parent
+    manifest = (_base
                 / "model-forge" / "plugin.yaml").read_text(encoding="utf-8")
     fields = _config_schema_fields(manifest)
     # declared engine endpoints: the bring-your-own-engine list field

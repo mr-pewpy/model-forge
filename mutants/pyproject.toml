@@ -1,0 +1,4 @@
+[tool.mutmut]
+source_paths = ["model-forge/model_forge/schemas.py"]
+tests_dirs = ["tests/"]
+runner = "python -m pytest -q tests/test_capability.py -k schema"
