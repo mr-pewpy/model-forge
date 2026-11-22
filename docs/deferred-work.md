@@ -394,27 +394,29 @@ The list is grouped as:
 
 ### B3. Bench sampling of remote compute targets
 
-**Partly implemented — non-NVIDIA samplers done; remote sampling still
-deferred.**
+**Implemented — non-NVIDIA local samplers and remote engine-reported sampling.**
 
-- **What it is:** the `bench` VRAM measurement window samples the machine
-  Model Forge runs on (the same probe scope as the hardware report). Sampling
-  a model loaded on a remote compute target is still deferred.
-- **Why:** a remote engine API exposes no reliable VRAM sampler, and a booked
-  ceiling must be an observation, never a guess — so remote bench fails soft
-  with a stated reason instead of estimating ("run bench where the model is
-  loaded").
-- **What exists today:** the bench sampler is no longer NVIDIA-only: it reads
-  NVIDIA via `nvidia-smi`, AMD via `rocm-smi` (`--showmeminfo vram`, the same
-  table the hardware total probe reads) with an amdgpu sysfs
-  `mem_info_vram_used` fallback (`tools.gpu_vram_used_gb` /
-  `_amd_vram_used_gb`). Apple Silicon is honestly "no discrete VRAM-used
-  counter" (unified memory) and the bench states that instead of guessing.
-  Run `bench` on the machine where the model is loaded; the recorded peak is
-  booked as the model's nominal ceiling and gates fit from then on.
-- **What would unblock it:** a per-target sampling path that observes the real
-  footprint REMOTELY — no supported remote engine API exposes one today. The
-  non-NVIDIA local samplers are built; the remote half needs that API.
+- **What it is:** the `bench` VRAM measurement window observes a model's
+  footprint. It now samples locally across vendors AND remotely from a
+  target engine's own memory report.
+- **Why:** a booked ceiling must be an observation, never a guess — so every
+  reading is real (vendor-sampled or the engine's own report) and labeled
+  with honest provenance, never estimated.
+- **What exists today:**
+  - *Local (non-NVIDIA):* NVIDIA via `nvidia-smi`, AMD via `rocm-smi` with an
+    amdgpu sysfs `mem_info_vram_used` fallback; Apple Silicon is honestly "no
+    discrete VRAM-used counter" (unified memory).
+  - *Remote (B3):* `tools.engine_reported_vram_gb(target)` reads a REMOTE
+    engine's own memory report — Ollama/Maya `/api/ps` (`size_vram`), ComfyUI
+    `/system_stats` (device VRAM). It is booked with the distinct
+    `engine-reported (remote)` provenance label (lower-trust than a local
+    bench). The booking trust ranking is measured > engine_reported > registry,
+    so a higher-trust figure is never downgraded. Fail-soft: an engine that
+    reports no memory gets an honest reason and no booking.
+- **What would unblock it:** nothing further. The only remaining case is an
+  engine that reports no memory figure at all — that fails soft with a stated
+  reason ("run bench on the machine where the model is loaded"), never a
+  guessed footprint.
 
 ### B4. AMD marketing-name sampling
 
