@@ -230,8 +230,11 @@ class Booking:
     """The nominal footprint booked for a model, in GB.
 
     ``source="registry"`` is a published footprint (advisory);
-    ``source="measured"`` is a peak sampled during a bench — measured peaks
-    are the booking numbers and never get downgraded by a registry value."""
+    ``source="measured"`` is a peak sampled during a bench on the machine —
+    measured peaks are the booking numbers and never get downgraded by a
+    registry value; ``source="engine_reported"`` is a remote engine's own
+    memory report (B3) — a real observation, but lower-trust than a
+    vendor-sampled local bench, and labeled so."""
     vram_gb: float
     source: str = "registry"
     load_s: float | None = None     # honest load-duration estimate, when known
@@ -244,10 +247,20 @@ class Booking:
     @property
     def label(self) -> str:
         """Honest provenance label for ledger reports: a measured peak is
-        never presented as an advisory published figure, or vice versa."""
+        never presented as an advisory published figure, or vice versa, and a
+        remote engine report is never presented as a local bench."""
         if self.source == "measured":
             return "measured peak (bench)"
+        if self.source == "engine_reported":
+            return "engine-reported (remote)"
         return "published footprint (advisory)"
+
+
+# Booking trust ranking: a higher-trust booking is never downgraded by a
+# lower-trust one. measured (local vendor-sampled) > engine_reported (remote
+# engine's own figure) > registry (published advisory). A newer booking of
+# EQUAL trust replaces an older one (the latest bench wins).
+_BOOKING_TRUST = {"measured": 3, "engine_reported": 2, "registry": 1}
 
 
 @dataclass(frozen=True)
@@ -318,8 +331,10 @@ class ResidencyLedger:
         """Book a nominal footprint for a model (GB).
 
         ``vram_gb`` may also be a booking dict (``{"vram_gb": …, "source": …,
-        "load_s": …}``) or a ``Booking``. A measured booking always wins: a
-        registry footprint never downgrades a measured peak."""
+        "load_s": …}``) or a ``Booking``. A higher-trust booking is never
+        downgraded by a lower-trust one: measured (local bench) > engine
+        reported (remote) > registry (advisory). A newer booking of equal
+        trust replaces an older one (the latest bench wins)."""
         if isinstance(vram_gb, Booking):
             raw, source, load_s = vram_gb.vram_gb, vram_gb.source, load_s
             if load_s is None:
@@ -337,13 +352,16 @@ class ResidencyLedger:
         spec = Booking(vram_gb=gb, source=source, load_s=load_s)
         with self._lock:
             existing = self._bookings.get(model_id)
-            if (existing is not None and existing.source == "measured"
-                    and spec.source != "measured"):
-                return {"ok": True, "model_id": model_id,
-                        "vram_gb": existing.vram_gb, "source": existing.source,
-                        "label": existing.label,
-                        "kept": "measured booking kept — published footprints "
-                                "are advisory"}
+            if existing is not None:
+                old_t = _BOOKING_TRUST.get(existing.source, 1)
+                new_t = _BOOKING_TRUST.get(source, 1)
+                if new_t < old_t:
+                    return {"ok": True, "model_id": model_id,
+                            "vram_gb": existing.vram_gb,
+                            "source": existing.source,
+                            "label": existing.label,
+                            "kept": f"{existing.label} kept — a "
+                                    f"{spec.label} figure is lower trust"}
             self._bookings[model_id] = spec
         return {"ok": True, "model_id": model_id, "vram_gb": spec.vram_gb,
                 "source": spec.source, "label": spec.label}
@@ -359,13 +377,15 @@ class ResidencyLedger:
         b = self._bookings.get(model_id)
         return b.load_s if b else None
 
-    def record_measured_peak(self, model_id, peak_gb, load_s=None) -> dict:
+    def record_measured_peak(self, model_id, peak_gb, load_s=None,
+                             source="measured") -> dict:
         """The measured-footprint write path: book an observed bench peak as
-        this model's MEASURED ceiling. Routed through ``book`` so the
-        no-downgrade invariant holds — a later published footprint never
-        replaces a measured peak — while a newer measured peak may (the
-        latest bench wins over an older one)."""
-        return self.book(model_id, peak_gb, source="measured", load_s=load_s)
+        this model's ceiling. Routed through ``book`` so the no-downgrade
+        invariant holds — a later lower-trust figure never replaces it. The
+        default ``source="measured"`` is a local vendor-sampled bench;
+        ``source="engine_reported"`` (B3) books a remote engine's own figure
+        with its distinct provenance label."""
+        return self.book(model_id, peak_gb, source=source, load_s=load_s)
 
     def booking_report(self) -> tuple[dict, ...]:
         """Every booked ceiling with an honest provenance label —
@@ -568,11 +588,12 @@ class MeasuredFootprintRecorder:
     row, never a raise; a window with no valid reading fails closed — a
     booked ceiling must be an observation, never a guess."""
 
-    def __init__(self, sampler, model_id, ledger, clock=None):
+    def __init__(self, sampler, model_id, ledger, clock=None, source="measured"):
         self._sampler = sampler
         self._model_id = model_id
         self._ledger = ledger
         self._clock = clock or ledger.clock
+        self._source = source
         self._peak: float | None = None
         self._samples = 0
         self._recorded: dict | None = None
@@ -630,7 +651,8 @@ class MeasuredFootprintRecorder:
             self._recorded = row
             return row
         row = self._ledger.record_measured_peak(self._model_id, self._peak,
-                                                load_s=load_s)
+                                                load_s=load_s,
+                                                source=self._source)
         self._recorded = row
         return row
 

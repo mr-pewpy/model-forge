@@ -172,7 +172,7 @@ def test_measured_booking_replaces_registry_but_never_downgraded():
     assert ledger.estimated_load_s("m-c") == 12.0
     # A registry footprint never downgrades a measured peak.
     row = ledger.book("m", 8.0, source="registry")
-    assert row["ok"] and row["kept"].startswith("measured booking kept")
+    assert row["ok"] and "kept" in row["kept"] and "measured peak" in row["kept"]
     assert ledger.booked_vram_gb("m") == 9.5
 
 
@@ -1328,7 +1328,7 @@ def test_measured_booking_is_never_downgraded_by_published_updates():
     assert ledger.booked_vram_gb("chat-a") == 9.5
     # a later published-footprint update must not downgrade the measured peak
     row = ledger.book("chat-a", {"vram_gb": 7.5, "source": "published"})
-    assert row["ok"] is True and row["kept"].startswith("measured booking kept")
+    assert row["ok"] is True and "kept" in row["kept"] and "measured peak" in row["kept"]
     assert ledger.booked_vram_gb("chat-a") == 9.5
     assert ledger.estimated_load_s("chat-a") == 35.0
     # …including a whole-dict refresh (the registry-to-bookings path)

@@ -4092,6 +4092,73 @@ def _live_bench_sampler():
     return gpu_vram_used_gb, ""
 
 
+def _fetch_json_url(url: str, timeout: float = 5.0):
+    """GET a JSON document (stdlib urllib). Raises on any network/parse error
+    — callers treat exceptions as 'this surface reports nothing'."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "model-forge"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def engine_reported_vram_gb(target, fetch=None) -> float | None:
+    """A remote engine's own reported GPU memory in use, in GB (B3).
+
+    This is an OBSERVATION — the engine reports its own footprint — but it is
+    lower-trust than a vendor-sampled local bench, so it is booked with the
+    distinct ``engine-reported (remote)`` provenance label. Reads the known
+    memory-reporting surfaces: Ollama/Maya ``/api/ps`` (sum of ``size_vram``)
+    and ComfyUI ``/system_stats`` (device VRAM total-free). An engine that
+    reports no memory yields None (fail-soft) — never a guessed figure.
+    """
+    fetch = fetch or _fetch_json_url
+    root = root_url(target.base_url)
+    # Ollama / Maya: /api/ps -> models[].size_vram (bytes)
+    try:
+        data = fetch(root + "/api/ps")
+        models = data.get("models") if isinstance(data, dict) else None
+        if isinstance(models, list):
+            total, seen = 0, False
+            for m in models:
+                if isinstance(m, dict) and isinstance(m.get("size_vram"), int):
+                    total += m["size_vram"]
+                    seen = True
+            if seen and total > 0:
+                return total / (1024 ** 3)
+    except Exception:  # noqa: BLE001 — this surface reports nothing
+        pass
+    # ComfyUI: /system_stats -> devices[].gpu_total / gpu_free (bytes)
+    try:
+        data = fetch(root + "/system_stats")
+        devices = data.get("devices") if isinstance(data, dict) else None
+        if isinstance(devices, list):
+            used, seen = 0, False
+            for d in devices:
+                if isinstance(d, dict):
+                    t, f = d.get("gpu_total"), d.get("gpu_free")
+                    if isinstance(t, int) and isinstance(f, int):
+                        used += max(0, t - f)
+                        seen = True
+            if seen and used > 0:
+                return used / (1024 ** 3)
+    except Exception:  # noqa: BLE001 — this surface reports nothing
+        pass
+    return None
+
+
+def engine_reported_vram_sampler(target, fetch=None):
+    """(sampler, "") for a remote engine's self-reported VRAM — or (None,
+    honest reason) when the target's engine reports no memory figure."""
+    gb = engine_reported_vram_gb(target, fetch=fetch)
+    if gb is None:
+        return None, ("this target's engine reports no GPU-memory figure "
+                      "(no /api/ps size_vram or /system_stats device VRAM) — "
+                      "nothing to observe; run bench on the machine where the "
+                      "model is loaded")
+    # Sample the same reading each poll: the engine's report IS the observation.
+    return (lambda: engine_reported_vram_gb(target, fetch=fetch)), ""
+
+
 def _broker_bench(stack: dict, target, model_id: str, sampler=None) -> dict:
     """Bench one model's VRAM footprint: measure what runs, book the peak.
 
@@ -4105,12 +4172,21 @@ def _broker_bench(stack: dict, target, model_id: str, sampler=None) -> dict:
     reason; with no valid reading in the window it fails closed — a booked
     ceiling must be an observation, never a guess."""
     ledger = stack["ledger"]
+    engine_reported = False
+    if sampler is None and getattr(target, "kind", "") != "local":
+        # B3: a REMOTE target — try the engine's own memory report first (an
+        # observation, booked as engine-reported), before falling back to the
+        # local probe (which samples the wrong machine for a remote model).
+        sampler, remote_reason = engine_reported_vram_sampler(target)
+        engine_reported = sampler is not None
     if sampler is None:
         sampler, reason = _live_bench_sampler()
         if sampler is None:
             return {"ok": False, "action": "bench", "target": target.id,
                     "model_id": model_id, "error": reason}
-    recorder = MeasuredFootprintRecorder(sampler, model_id, ledger)
+    recorder = MeasuredFootprintRecorder(
+        sampler, model_id, ledger,
+        source="engine_reported" if engine_reported else "measured")
     with recorder:
         for _ in range(_BENCH_SAMPLES):
             recorder.sample()
@@ -4138,10 +4214,13 @@ def _broker_bench(stack: dict, target, model_id: str, sampler=None) -> dict:
                     "source": row["source"], "label": row["label"]},
         "gates_fit": True,
         "resident": ledger.is_resident(target.id, model_id),
-        "note": (f"measured peak {row['vram_gb']:g} GB booked as this "
-                 f"model's nominal ceiling ({row['label']}) — the planner "
-                 f"now gates fit on it; measured peaks replace published "
-                 f"estimates and are never downgraded by them"),
+        "note": (f"{row['label']} {row['vram_gb']:g} GB booked as this "
+                 f"model's nominal ceiling — the planner now gates fit on it; "
+                 f"higher-trust figures replace lower-trust estimates and are "
+                 f"never downgraded by them"
+                 + (" (a remote engine's self-report, lower trust than a "
+                    "local vendor-sampled bench)"
+                    if row.get("source") == "engine_reported" else "")),
     }
 
 
