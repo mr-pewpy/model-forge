@@ -291,8 +291,8 @@ The list is grouped as:
 
 ### A19. Automated quality gates are partly short of their own targets
 
-**Partly improved — coverage up and mutation tooling unblocked; both gates
-still short of the 100% / 0-mutant targets.**
+**Gate 7 now measured (100% on the pure modules); coverage still short of
+100%.**
 
 - **What it is:** the project's code-quality audit reports test coverage
   against a 100% target and mutation testing as not measured
@@ -300,22 +300,25 @@ still short of the 100% / 0-mutant targets.**
 - **Why:** the uncovered branches are mostly error-degradation paths that
   need a live engine to reach, and the mutation-testing tool did not run in
   the audit environment; the audit records both gaps rather than hiding them.
-- **What exists today:** coverage is 91% (829 tests). A19 added live-engine
-  fixtures (`tests/test_degradation_fixtures.py`,
-  `tests/test_tools_degradation.py`) that inject engine/filesystem/config
-  faults to OBSERVE the degradation branches — credentials, discovery,
-  storage, pull, targets, media and the tools refusal paths now degrade under
-  test. Mutation testing is no longer "would not run": mutmut installs,
-  generates mutants and the suite passes under its `mutants/` copy (the
-  path-anchored package/data loads were fixed via `tests/_repo.py`).
-  Honest residual: mutmut's test-to-mutant mapping does not correlate under
-  this multi-package layout (coverage records the real `model_forge` path
-  while mutmut swaps code under `mutants/`), so gate 7 is "tool runs, not yet
-  measured" — never reported as 0 surviving mutants until a real count lands.
+- **What exists today:**
+  - *Coverage (gate 5):* 92% (871 tests). Live-engine fixtures
+    (`tests/test_degradation_fixtures.py`, `tests/test_tools_degradation.py`,
+    `tests/test_facade_degradation.py`, `tests/test_comfyui_serve_fixtures.py`)
+    inject engine/filesystem/config faults to OBSERVE the degradation branches
+    — facade, comfyui, credentials, discovery, storage, pull, targets, media
+    and the tools refusal paths now degrade under test. The residual is
+    engine-adjacent error paths in tools/broker needing a real engine.
+  - *Mutation testing (gate 7):* now MEASURED. A custom harness
+    (`tests/mutation_harness.py`) mutates the pure core modules (aliases/
+    registry/schemas) in place with AST operator swaps and runs the suite per
+    mutant: 94 mutants, **0 surviving, 100% mutation score**
+    (`tests/test_mutation_kill.py` pins the exact defaults/branches the
+    mutants altered). This replaces mutmut, whose test-to-mutant mapping does
+    not correlate under this multi-package layout. Scope is the pure modules
+    (fast, meaningful); a full-tree run is a follow-up CI job.
 - **What would unblock it:** live-engine fixtures for the remaining
-  engine-adjacent error paths in tools/facade/broker, and a mutation-testing
-  run whose test-to-mutant mapping imports through the pytest `pythonpath`
-  (see docs/quality-gates.md gate 7).
+  engine-adjacent error paths in tools/broker (toward the 100% coverage
+  target), and extending the mutation harness to the full tree.
 
 ### A20. The approval gate and the release handler re-evaluate the restore separately
 
