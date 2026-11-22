@@ -1,28 +1,30 @@
-"""Service assembly + entrypoint for the .62 inference-host facade.
+"""Service assembly + entrypoint for the single-host inference facade.
 
 WHY this module exists: ``facade.py`` (routes), ``broker.py`` (residency policy),
 ``engines/comfyui.py`` (the workflow runner) and ``registry.py`` (footprints) are
 each correct and tested in isolation, but nothing yet *assembles* them into the
-single process that replaces the production weights broker on the .62 LXC. That
+single process that replaces a predecessor self-hosted weight broker. That
 assembly — and only that — is this file. It binds no policy of its own: the
-bookings describe the .62 hardware honestly, the lifecycles come from the
+bookings describe the declared hardware honestly, the lifecycles come from the
 runtime declarations, and the orchestrator/planner are the tested broker core.
 
-The .62 topology this file encodes (two RTX 3090s, one LXC with the host docker
-CLI):
+The reference topology this file encodes (one host, two accelerators, one
+container runtime):
 
-* **chat lane** — a vLLM ``TP2`` server owning BOTH cards (container
-  ``vllm-server``). It books 22.8 GB/card (the broker's 0.95-utilization
-  figure) => 45.6 GB total.
-* **gen lane** — the ai-dock ComfyUI sidecar pinned to ONE card (container
-  ``weights-broker-comfyui-1``). Each gen workflow books at most the 24 GB card
-  ceiling; a registry footprint is used where the registry declares one.
+* **chat lane** — a tensor-parallel chat server owning BOTH accelerators
+  (the ``chat_container``, default ``chat-engine``). It books 0.95 of each
+  accelerator's memory (the booking figure).
+* **gen lane** — the ComfyUI sidecar pinned to ONE accelerator (the
+  ``gen_container``, default ``gen-engine``). Each gen workflow books at
+  most one accelerator's memory; a registry footprint is used where the
+  registry declares one.
 
-Both lanes contend for the same physical VRAM, so they share ONE ledger target
-(the facade's gen target id). A chat claim brings the vLLM container up; a gen
-claim evicts the chat resident (it cannot fit beside a TP2 model) and starts
-ComfyUI; releasing the gen scope restores the chat lane. That contention is the
-whole reason the two lanes are assembled into one orchestrator rather than two.
+Both lanes contend for the same physical memory, so they share ONE ledger
+target (the facade's gen target id). A chat claim brings the chat container
+up; a gen claim evicts the chat resident (it cannot fit beside a full-size
+chat model) and starts ComfyUI; releasing the gen scope restores the chat
+lane. That contention is the whole reason the two lanes are assembled into
+one orchestrator rather than two.
 
 Everything external is a seam: the docker CLI runner, the container health
 probe, the ComfyUI HTTP client and the clock are all injectable, so the tests
@@ -68,7 +70,7 @@ __all__ = [
 ]
 
 # ---------------------------------------------------------------------------
-# the .62 topology
+# the reference topology
 # ---------------------------------------------------------------------------
 
 # One RTX 3090 = 24 GB. The machine has two of them; the chat lane (TP2) owns
@@ -87,7 +89,7 @@ GEN_CARD_CEILING_GB = CARD_VRAM_GB             # a gen lane never exceeds one ca
 CHAT_BOOT_S = 480.0
 GEN_BOOT_S = 600.0
 
-# The registry ``runtime`` entries for the .62 topology. They are declared
+# The registry ``runtime`` entries for the reference topology. They are declared
 # here (not in registry.py, which lists *installable* models) because they
 # describe THIS host's running containers. ``runtime_lifecycle_for`` turns each
 # into a DockerContainerLifecycle; the engine id is the entry's first engine
@@ -98,9 +100,9 @@ GEN_BOOT_S = 600.0
 # ``FacadeConfig`` (see ``topology_entries``), so a stub or shadow deployment
 # can point the lanes at throwaway containers without touching this file. With
 # the config defaults the result is byte-identical to the former hardcoded
-# tuple (vllm-server / weights-broker-comfyui-1).
+# tuple (chat-engine / gen-engine).
 def topology_entries(config: "FacadeConfig | None" = None) -> tuple[ModelEntry, ...]:
-    """The .62 lane runtime entries, resolved from ``config`` (defaults when
+    """The lane runtime entries, resolved from ``config`` (defaults when
     ``config`` is None)."""
     config = config or FacadeConfig()
     return (
@@ -151,7 +153,7 @@ GEN_WORKFLOW_IDS: tuple[str, ...] = tuple(
 
 
 def topology_bookings(config: "FacadeConfig | None" = None) -> dict[str, dict]:
-    """The nominal booked ceilings for the .62 topology (ledger booking shape).
+    """The nominal booked ceilings for the reference topology (ledger booking shape).
 
     Honest provenance: every figure here is a published/advisory ceiling (the
     broker's utilization-derived vLLM number, registry footprints, the card
@@ -191,7 +193,7 @@ def topology_bookings(config: "FacadeConfig | None" = None) -> dict[str, dict]:
 def build_stack(config: FacadeConfig | None = None, *,
                 docker_runner=None, health=None, sleep=None, clock=None,
                 http=None, comfy_runner=None) -> dict:
-    """Assemble the running .62 facade from the tested parts (no side effects
+    """Assemble the running facade from the tested parts (no side effects
     beyond installing the optional health seam).
 
     ``docker_runner`` / ``sleep`` / ``clock`` are the docker CLI seams threaded
@@ -230,7 +232,7 @@ def build_stack(config: FacadeConfig | None = None, *,
     adapters: dict = {}
     for entry in entries:
         lifecycle = runtime_lifecycle_for(entry, **seams)
-        if lifecycle is not None:                 # all .62 lanes are containers
+        if lifecycle is not None:                 # all reference lanes are containers
             adapters[lifecycle.engine_id] = lifecycle
 
     orchestrator = Orchestrator(ledger, planner, adapters, clock=clock)
@@ -255,7 +257,7 @@ def build_stack(config: FacadeConfig | None = None, *,
 # config: env + optional JSON file (file overrides env; explicit wins)
 # ---------------------------------------------------------------------------
 
-_DEFAULT_HOST = "0.0.0.0"       # consumers are LAN-wide on .62
+_DEFAULT_HOST = "0.0.0.0"       # consumers may be LAN-wide
 _DEFAULT_PORT = 8080
 _DEFAULT_LLM_BASE_URL = "http://127.0.0.1:8000/v1"
 _DEFAULT_COMFYUI_BASE_URL = "http://127.0.0.1:18188"
@@ -280,7 +282,7 @@ _ENV_TO_FIELD = {
     # These let a deployment point the two lanes at alternate containers,
     # health URLs, cold-boot budgets and an alternate runner output dir —
     # the same seam a stub-based acceptance run needs. Absent any override,
-    # the production .62 defaults apply (see FacadeConfig).
+    # the packaged defaults apply (see FacadeConfig).
     "CHAT_CONTAINER": "chat_container",
     "CHAT_HEALTH_URL": "chat_health_url",
     "GEN_CONTAINER": "gen_container",
@@ -333,18 +335,18 @@ def resolve_settings(env: dict | None = None, config_file: str | None = None,
     # serve-owned defaults for the facade fields it names (lowest precedence);
     # env vars, the JSON file and explicit kwargs each override in turn. The
     # defaults are applied explicitly rather than left to FacadeConfig so the
-    # .62 host's asset volume wins over the package default.
+    # deployment's asset volume wins over the package default.
     merged: dict = {
         "llm_base_url": _DEFAULT_LLM_BASE_URL,
         "llm_served_id": CHAT_MODEL_ID,
         "comfy_base_url": _DEFAULT_COMFYUI_BASE_URL,
         "assets_dir": _DEFAULT_ASSETS_DIR,
         "public_base_url": _DEFAULT_PUBLIC_BASE_URL,
-        # topology / runtime defaults (production .62 containers + budgets);
+        # topology / runtime defaults (default container names + budgets);
         # a stub/shadow deployment overrides these via env or FACADE_CONFIG.
-        "chat_container": "vllm-server",
+        "chat_container": "chat-engine",
         "chat_health_url": "http://127.0.0.1:8000/health",
-        "gen_container": "weights-broker-comfyui-1",
+        "gen_container": "gen-engine",
         "gen_health_url": "http://127.0.0.1:18188/",
         "chat_boot_s": 480.0,
         "gen_boot_s": 600.0,
@@ -409,10 +411,9 @@ def _log(message: str) -> None:
 def preflight_comfy_args(config: FacadeConfig, *, log=_log) -> str:
     """Startup preflight for the ComfyUI args file (``COMFY_ARGS_FILE``).
 
-    The h3 video models REQUIRE ``--novram`` on a 24 GB card and the args file
-    on .62 (``/data/broker/comfy_args.conf``, bind-mounted read-only at
-    ``/etc/comfyui_args.conf``) was silently emptied 2026-09-22 — every h3 run
-    OOMd afterwards and nothing surfaced the drift. This check exists so that
+    The h3 video models REQUIRE ``--novram`` on smaller cards, and the args
+    file has been silently emptied in a real deployment — every h3 run OOMd
+    afterwards and nothing surfaced the drift. This check exists so that
     drift is LOUD: a file present without the flag logs an honest WARNING
     naming the file and the consequence (video OOM risk); a named file that is
     missing logs an honest note (the flag can be neither confirmed nor

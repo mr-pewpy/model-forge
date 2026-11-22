@@ -149,7 +149,7 @@ class StagedDockerRunner:
 
 
 def _container(**overrides):
-    kwargs = dict(engine_id="comfyui", container="weights-broker-comfyui-1",
+    kwargs = dict(engine_id="comfyui", container="gen-engine",
                   health_url="http://127.0.0.1:18188/system_stats",
                   boot_budget_s=120.0)
     kwargs.update(overrides)
@@ -194,7 +194,7 @@ def test_ensure_loaded_starts_container_and_confirms_health(health):
     assert res["ok"] is True
     assert res["engine"] == "comfyui"
     assert res["state"] == "ready"
-    assert ["start", "weights-broker-comfyui-1"] in runner.calls
+    assert ["start", "gen-engine"] in runner.calls
     assert health.calls == 1              # health checked, no sleep needed
     assert "loading (~120s)" == res["loading_state"]
     # A second ensure on an already-running container issues no new start.
@@ -215,7 +215,7 @@ def test_ensure_loaded_times_out_on_the_cold_boot_budget(monkeypatch):
     assert res["ok"] is False
     assert "cold-boot budget" in res["reason"]
     assert "8s" in res["reason"]
-    assert ["start", "weights-broker-comfyui-1"] in runner.calls
+    assert ["start", "gen-engine"] in runner.calls
     # budget honoured exactly: slept up to (not past) the budget window
     assert 8.0 <= clock.now - 1_000.0 < 10.0
 
@@ -283,7 +283,7 @@ def test_release_issues_docker_stop_and_frees_the_gpu(health):
     res = dcl.release("krea-2-turbo")
     assert res["ok"] is True
     assert res["state"] == "released"
-    assert ["stop", "weights-broker-comfyui-1"] in runner.calls
+    assert ["stop", "gen-engine"] in runner.calls
     assert "instantly" in res["reason"]
 
 
@@ -307,7 +307,7 @@ def test_release_waits_until_the_container_reports_stopped():
                      stop_budget_s=30.0)
     res = dcl.release("krea-2-turbo")
     assert res["ok"] is True and res["state"] == "released"
-    assert ["stop", "weights-broker-comfyui-1"] in runner.calls
+    assert ["stop", "gen-engine"] in runner.calls
     assert "confirmed stopped" in res["reason"]
     # it kept asking docker until stopped was reported: 3 inspect reads.
     assert runner.inspect_calls == 3

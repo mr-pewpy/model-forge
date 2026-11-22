@@ -1,13 +1,12 @@
 """ComfyUI workflow templates + the gen-lane registry.
 
-The production weights broker on .62 drove every generative lane through a
-ComfyUI (ai-dock, GPU 1) *workflow template*: a JSON graph in ComfyUI's API
-format plus a small config that says which node/field each request parameter
-lands on. Model Forge ports that lane here so the same seven lanes keep
-working once the broker is replaced.
+A predecessor self-hosted broker drove every generative lane through a
+ComfyUI *workflow template*: a JSON graph in ComfyUI's API format plus a
+small config that says which node/field each request parameter lands on.
+Model Forge ports that lane here so the same seven lanes keep working.
 
 This package holds only data + the registry: the seven template JSONs are
-copied VERBATIM from the broker's ``workflows/`` directory (byte-identical,
+copied VERBATIM from the predecessor's ``workflows/`` directory (byte-identical,
 sha256-checked during the port) and ``WORKFLOWS`` mirrors the broker's
 ``config.yaml`` ``workflows:`` block. Keeping the templates as package files
 (not paths into another checkout) means the runner is self-contained: it does

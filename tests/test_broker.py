@@ -1638,7 +1638,7 @@ def test_claim_heals_a_container_stopped_outside_the_broker():
     ledger.record_resident("local", "chat", engine="vllm", lane="chat")
     docker = _Docker(running=False)              # externally stopped
     adapter = broker.DockerContainerLifecycle(
-        "vllm", container="vllm-server",
+        "vllm", container="chat-engine",
         health_url="http://127.0.0.1:8000/health", boot_budget_s=30.0,
         runner=docker, sleep=clock.advance, clock=clock)
     orch = Orchestrator(ledger, EvictionPlanner(ledger, clock=clock),
@@ -1654,7 +1654,7 @@ def test_claim_heals_a_container_stopped_outside_the_broker():
 
     assert res["ok"] is True
     assert [s.model_id for s in res["plan"].load_steps] == ["chat"]
-    assert ["start", "vllm-server"] in docker.calls
+    assert ["start", "chat-engine"] in docker.calls
 
 
 # --- orchestrator: the P4 adapters as plan steps -----------------------------

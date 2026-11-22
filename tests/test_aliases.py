@@ -1,7 +1,7 @@
 """Alias seam tests (model_forge/aliases.py) — parity + resolve semantics.
 
 The alias map is a contract with live pre-rename clients (Hermes providers, the
-image plugin, OpenViking .63), so parity is asserted against the broker's
+image plugin, other local consumers), so parity is asserted against the predecessor broker's
 config.yaml ``aliases:`` entries explicitly, not against whatever the module
 happens to contain. Resolve is pinned to the broker's flat one-hop lookup.
 """

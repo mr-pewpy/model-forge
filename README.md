@@ -356,7 +356,8 @@ alternative, and what would unblock each item — is in
 - **Network:** probes engine endpoints you configured — compute targets and
   the user-declared engine endpoints from settings (`engines_json`) —
   with engine-specific reads: llama-server `/props`,
-  Ollama `/api/tags`, Maya `/api/catalog`, ComfyUI `/system_stats`, vLLM
+  Ollama `/api/tags`, Maya `/api/catalog`, Ollama/Maya `/api/ps` (the bench
+  action's remote memory report), ComfyUI `/system_stats`, vLLM
   `/version`, SGLang `/get_model_info`, and OpenAI-compatible
   `/v1/models` + image-route existence. Model discovery queries the public HuggingFace API
   (`huggingface.co/api/models`, newest-first per modality; disabled with
@@ -365,8 +366,10 @@ alternative, and what would unblock each item — is in
   resolve links); install plans may also query the HuggingFace API for a
   repository's file list when no file is named. Media jobs (`model_forge_generate_media`) POST prompts and
   image bytes to user-configured compute targets, and Maya pulls POST to the
-  target's `/api/pull`; 3D media jobs poll the gateway's `/jobs/<id>` route
-  until the job settles. Weight residency claims and releases
+  target's `/api/pull`; image and video jobs may also run through a
+  configured ComfyUI endpoint's workflow queue (`POST /prompt`,
+  `GET /history/<id>`), with output files read via `/view`; 3D media jobs
+  poll the gateway's `/jobs/<id>` route until the job settles. Weight residency claims and releases
   (`model_forge_broker`, and the automatic scope around
   `model_forge_generate_media` jobs) drive engine load and unload calls on
   your user-configured compute-target endpoints — for example an Ollama
@@ -408,8 +411,11 @@ alternative, and what would unblock each item — is in
   server processes on this machine; every such START (including a release
   whose restore re-loads a non-resident process-engine model, and a media
   job's lane claim/release) rides the human-approval gate
-  (`model-forge:broker_server_start`) and binds `127.0.0.1` only. Outside
-  those gated starts, no engine launcher is run by the plugin.
+  (`model-forge:broker_server_start`) and binds `127.0.0.1` only; stopping a
+  server the plugin did not start is gated the same way (server provenance
+  is tracked honestly, and otherwise the plugin stops only what it started).
+  Outside those gated starts and stops, no engine launcher is run by the
+  plugin.
 - **Background:** long model downloads and approved engine installs run on
   a daemon background thread (job records are pollable with
   `model_forge_install` `job_id`); installer jobs carry a hard timeout (900

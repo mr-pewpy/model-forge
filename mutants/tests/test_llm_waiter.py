@@ -3,9 +3,9 @@
 The rule: while a chat request waits on a lane wake, new generative jobs
 are refused — the waiter owns the wake. These tests pin the Orchestrator
 waiter seam (``waiter_enter`` / ``waiter_exit`` / ``admit_gen`` /
-``llm_waiters``) whose counter semantics mirror the production broker's
-``Lifecycle.llm_waiters`` (weights-broker ``broker/main.py``,
-``prepare_llm`` / ``prepare_gen``), and the pure-data expression of the
+``llm_waiters``) whose counter semantics mirror the predecessor broker's
+``Lifecycle.llm_waiters`` (its ``prepare_llm`` / ``prepare_gen``), and the
+pure-data expression of the
 same rule inside ``EvictionPlanner``.
 
 Everything is injected — fake clock, recording engine adapters — so the

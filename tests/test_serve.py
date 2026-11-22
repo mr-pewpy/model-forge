@@ -83,13 +83,13 @@ def test_build_stack_wires_container_lifecycles_per_runtime_entries():
     assert set(adapters) == {"vllm", "comfyui"}
 
     vllm = adapters["vllm"]
-    assert vllm._container == "vllm-server"
+    assert vllm._container == "chat-engine"
     assert vllm._health_url == "http://127.0.0.1:8000/health"
     assert vllm._boot_budget_s == 480.0
     assert vllm._gpu_count == 2                     # TP2: both 3090s
 
     comfy = adapters["comfyui"]
-    assert comfy._container == "weights-broker-comfyui-1"
+    assert comfy._container == "gen-engine"
     assert comfy._health_url == "http://127.0.0.1:18188/"
     assert comfy._boot_budget_s == 600.0
     assert comfy._gpu_count == 1                    # single card
@@ -101,9 +101,9 @@ def test_build_stack_wires_container_lifecycles_per_runtime_entries():
 
 def test_topology_entries_are_the_documented_runtimes():
     by_engine = {e.engines[0]: e.runtime for e in TOPOLOGY_ENTRIES}
-    assert by_engine["vllm"]["name"] == "vllm-server"
+    assert by_engine["vllm"]["name"] == "chat-engine"
     assert by_engine["vllm"]["gpu_count"] == 2
-    assert by_engine["comfyui"]["name"] == "weights-broker-comfyui-1"
+    assert by_engine["comfyui"]["name"] == "gen-engine"
     assert by_engine["comfyui"]["gpu_count"] == 1
 
 
@@ -183,7 +183,7 @@ def test_facade_config_file_overrides_env_and_explicit_wins(tmp_path):
         "llm_served_id": "file-served",
         "COMFYUI_BASE_URL": "http://file-comfy:18188",   # env-name spelling
         "FACADE_PORT": 7000,
-        "host": "10.0.0.5",
+        "host": "198.51.100.7",
     }))
 
     env = {
@@ -195,14 +195,14 @@ def test_facade_config_file_overrides_env_and_explicit_wins(tmp_path):
     config, host, port = resolve_settings(env=env, config_file=str(cfg_path))
     assert config.llm_served_id == "file-served"        # file over env
     assert config.comfy_base_url == "http://file-comfy:18188"
-    assert (host, port) == ("10.0.0.5", 7000)
+    assert (host, port) == ("198.51.100.7", 7000)
 
     # explicit keyword arguments win over the file.
     config2, host2, port2 = resolve_settings(
         env=env, config_file=str(cfg_path),
-        llm_served_id="explicit", host="192.168.1.9", port=1234)
+        llm_served_id="explicit", host="192.0.2.10", port=1234)
     assert config2.llm_served_id == "explicit"
-    assert (host2, port2) == ("192.168.1.9", 1234)
+    assert (host2, port2) == ("192.0.2.10", 1234)
 
 
 def test_resolve_settings_facade_config_env_path(monkeypatch, tmp_path):
@@ -331,7 +331,7 @@ def test_wiring_smoke_chat_gen_evict_and_release_restore(restore_health):
                            lane="chat", modality="chat")
     chat_claim = orch.claim("chat-1", target, chat_req)
     assert chat_claim["ok"] is True
-    assert ["start", "vllm-server"] in runner.calls
+    assert ["start", "chat-engine"] in runner.calls
     assert stack["ledger"].is_resident(target, CHAT_MODEL_ID)
     assert "http://127.0.0.1:8000/health" in health.urls
 
@@ -341,10 +341,10 @@ def test_wiring_smoke_chat_gen_evict_and_release_restore(restore_health):
     gen_claim = orch.claim("img-1", target, gen_req)
     assert gen_claim["ok"] is True
     # the chat lane was evicted (docker stop) BEFORE ComfyUI started.
-    assert ["stop", "vllm-server"] in runner.calls
-    assert ["start", "weights-broker-comfyui-1"] in runner.calls
-    assert runner.calls.index(["stop", "vllm-server"]) < \
-        runner.calls.index(["start", "weights-broker-comfyui-1"])
+    assert ["stop", "chat-engine"] in runner.calls
+    assert ["start", "gen-engine"] in runner.calls
+    assert runner.calls.index(["stop", "chat-engine"]) < \
+        runner.calls.index(["start", "gen-engine"])
     assert not stack["ledger"].is_resident(target, CHAT_MODEL_ID)
     assert stack["ledger"].is_resident(target, "qwen-image-2.1")
     assert "http://127.0.0.1:18188/" in health.urls
@@ -352,11 +352,11 @@ def test_wiring_smoke_chat_gen_evict_and_release_restore(restore_health):
     # -- release: steps ComfyUI down and restores the chat lane -------------
     rel = orch.release("img-1")
     assert rel["ok"] is True
-    assert ["stop", "weights-broker-comfyui-1"] in runner.calls
+    assert ["stop", "gen-engine"] in runner.calls
     assert stack["ledger"].is_resident(target, CHAT_MODEL_ID)
     assert not stack["ledger"].is_resident(target, "qwen-image-2.1")
     # vLLM was started again to restore the lane (second chat boot).
-    assert runner.calls.count(["start", "vllm-server"]) == 2
+    assert runner.calls.count(["start", "chat-engine"]) == 2
 
 
 def test_wiring_smoke_video_claim_also_evicts_chat(restore_health):
@@ -374,8 +374,8 @@ def test_wiring_smoke_video_claim_also_evicts_chat(restore_health):
                                          lane="video", modality="video"))
     assert video_claim["ok"] is True
     # a video lane does not fit beside the TP2 chat model -> chat is evicted.
-    assert ["stop", "vllm-server"] in runner.calls
-    assert ["start", "weights-broker-comfyui-1"] in runner.calls
+    assert ["stop", "chat-engine"] in runner.calls
+    assert ["start", "gen-engine"] in runner.calls
 
 
 # --- wiring smoke: the FACADE chat path wakes the vLLM lane and leaves it up -
@@ -423,7 +423,7 @@ def test_wiring_smoke_facade_chat_wakes_vllm_and_gen_evicts_then_restores(
     status, _ = service.handle_chat(
         json.dumps({"model": CHAT_MODEL_ID}).encode())
     assert status == 200
-    assert ["start", "vllm-server"] in runner.calls
+    assert ["start", "chat-engine"] in runner.calls
     assert stack["ledger"].is_resident(target, CHAT_MODEL_ID)   # lane stays up
     # the chat scope was released (restore=False) — no open scope remains.
     assert stack["orchestrator"]._scopes == {}
@@ -432,20 +432,20 @@ def test_wiring_smoke_facade_chat_wakes_vllm_and_gen_evicts_then_restores(
     status, _body = service.handle_image_generations(
         json.dumps({"model": "gen/qwen-image-2.1"}).encode())
     assert status == 200
-    assert ["stop", "vllm-server"] in runner.calls              # chat evicted
-    assert ["start", "weights-broker-comfyui-1"] in runner.calls
-    assert runner.calls.index(["stop", "vllm-server"]) < \
-        runner.calls.index(["start", "weights-broker-comfyui-1"])
+    assert ["stop", "chat-engine"] in runner.calls              # chat evicted
+    assert ["start", "gen-engine"] in runner.calls
+    assert runner.calls.index(["stop", "chat-engine"]) < \
+        runner.calls.index(["start", "gen-engine"])
     # the job ran; its scope released (restore=True) restored the chat lane.
     assert comfy.run_calls and comfy.run_calls[0][0] == "qwen-image-2.1"
     assert stack["ledger"].is_resident(target, CHAT_MODEL_ID)
     assert not stack["ledger"].is_resident(target, "qwen-image-2.1")
-    assert runner.calls.count(["start", "vllm-server"]) == 2    # restored
+    assert runner.calls.count(["start", "chat-engine"]) == 2    # restored
 
 
 # --- COMFY_ARGS_FILE preflight (P5 follow-up: the silently-emptied --novram) -
 #
-# On .62 the h3 video models REQUIRE --novram on a 24 GB card; the args file
+# The h3 video models REQUIRE --novram on smaller cards; the args file
 # (/data/broker/comfy_args.conf, bind-mounted at /etc/comfyui_args.conf) was
 # silently emptied 2026-09-22 and every h3 run OOMd after. The startup
 # preflight must WARN (never hard-fail) when the named file lacks the flag,

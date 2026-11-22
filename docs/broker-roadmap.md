@@ -215,26 +215,22 @@ scope with honest progress states through the swap.
 (process restart where wake is unreliable, cache free between generative
 jobs); measured peaks replace published footprints in bookings.
 
-### P5 — broker consolidation (replace the .62 weights broker)
+### P5 — broker consolidation (replace the predecessor broker)
 
-The weights broker on the .62 inference host (`192.168.1.62:8080`, Gitea
-`charles/weights-broker`) predates this roadmap and still owns what v2 must
-become: the TP2 vLLM ↔ ComfyUI container dance, the ComfyUI gen workflow
-engine, and the stable OpenAI id/alias surface the fleet points at. P5 ports
-those three jobs into Model Forge and retires the broker. The broker stays
-LIVE and serving until the final phase; every replacement is verified before
-its consumers flip, and the alias map must keep working at every step.
+A predecessor self-hosted weight broker (a single-host deployment) predates
+this roadmap and owned three jobs Model Forge must become: the chat-server ↔
+generation-engine container dance, the ComfyUI generation workflow engine,
+and the stable OpenAI id/alias surface its consumers point at. P5 ports
+those three jobs into Model Forge and retires the predecessor. It stayed
+live and serving until the final phase; every replacement was verified
+before its consumers flipped, and the alias map kept working at every step.
 
-Current broker surface to preserve (verified 2026-11-19): 8 served ids at
-`:8080` — the resident chat lane `Qwen/Qwen3.8-27B-FP8` (vLLM TP2 across
-both 3090s, 262k ctx, served through the `current` symlink) plus 7 ComfyUI
-gen lanes (`gen/qwen-image-2.1`, `-edit`, `-cutout`, `gen/moss-image`,
-`gen/h3-t2v`, `gen/h3-i2v`, `gen/h3-r2v`) — with live consumers: Hermes
-custom_providers + auxiliary.vision, the image-gen plugin, the house-scan
-vision cron, and OpenViking on .63. De-registration order for the broker
-itself follows the packer skill: survivor analysis, alias backfill for every
-orphaned id, swap/verify before deleting, config deploy then weight deletes
-last.
+Surface to preserve: one resident chat lane plus seven ComfyUI generation
+lanes (`gen/qwen-image-2.1`, `-edit`, `-cutout`, `gen/moss-image`,
+`gen/h3-t2v`, `gen/h3-i2v`, `gen/h3-r2v`), consumed by the host's local
+tooling. De-registration order for the predecessor follows the standard
+retirement playbook: survivor analysis, alias backfill for every orphaned
+id, swap/verify before deleting, config deploy then weight deletes last.
 
 Three workstreams, each an acceptance gate:
 
@@ -246,12 +242,13 @@ Three workstreams, each an acceptance gate:
   boot_budget_s, gpu_count}` section. Budgets: vLLM 90–170 s warm / ~8 min
   cold; ComfyUI minutes (ai-dock cold boot). The §3 LLM-waiter rule is
   implemented in the orchestrator. **Acceptance:** orchestrator
-  claim(chat) → vllm-server up; claim(image) → lane evicted → comfyui up →
-  job → idle release → lane restored.
-- **(b) ComfyUI workflow runner.** Port the broker's workflow engine into
-  `engines/comfyui.py`: template registry (reuse the broker's
-  `workflows/*.json` verbatim), `param_map` injection (the broker's
-  `_inject`: explicit map first, class-based seed/steps/prompt fallback;
+  claim(chat) → the chat engine is up; claim(image) → a side lane is evicted
+  → the generation engine is up → job → idle release → the side lane is
+  restored.
+- **(b) ComfyUI workflow runner.** Port the predecessor's workflow engine
+  into `engines/comfyui.py`: template registry (reuse its `workflows/*.json`
+  verbatim), `param_map` injection (its `_inject`: explicit map first,
+  class-based seed/steps/prompt fallback;
   `size` → width/height), `/prompt` submit with 405 cold-boot retry,
   `/history` polling, output collection by `output_kind` (image/video/3d),
   data-URL → `/upload/image` normalization (nested `{"upload": {"path"}}`
@@ -261,24 +258,23 @@ Three workstreams, each an acceptance gate:
   the same output shapes as today (images via `POST /v1/images/generations`
   semantics, video via the job API); old gen id aliases resolve.
 - **(c) Facade + consumer migration.** A thin OpenAI facade in Model Forge:
-  chat passthrough + `/v1/models` catalog + aliases (port the broker's
+  chat passthrough + `/v1/models` catalog + aliases (port the predecessor's
   route layer only — the orchestrator owns policy). Extend
   `model_forge_activate` to write Hermes `custom_providers` +
   `auxiliary.vision`. Flip consumers one at a time (Hermes providers →
-  image plugin → vision cron → OpenViking .63), each verified before the
-  next. **Acceptance:** all consumers green on Model Forge; the broker
-  container stopped and its repo archived; freed resources reported.
+  image plugin → auxiliary vision → remaining local consumers), each
+  verified before the next. **Acceptance:** all consumers green on Model
+  Forge; the predecessor broker container stopped and its repository
+  archived; freed resources reported.
 
-**Status: COMPLETE (2026-11-20).** All three acceptance gates passed on the
-real lanes (record: `docs/tasks/p5-integration.md` — shadow acceptance a–f,
-real cutover acceptance A–E, consumer flips). The broker container is
-stopped and the Gitea repo `charles/weights-broker` is archived.
+**Status: COMPLETE (2026-11-20).** All three acceptance gates passed on real
+lanes (records held in the team's private ops repository: shadow acceptance
+a–f, real cutover acceptance A–E, consumer flips). The predecessor broker
+container is stopped and its repository is archived.
 
-Operational guardrails (from the broker skills): never `git reset --hard`
-in `~/work/weights-broker` (a stash holds an old vLLM-Omni experiment);
-infra ops through Gitea, product code through GitHub; commit with explicit
-paths only; test every replacement on throwaway ports/containers first
-(safe-adoption pattern: vLLM on :8001) and never disturb a live TP2 job.
+Testing convention for this work: every replacement is exercised on
+throwaway ports/containers first (for example a second server on an
+alternate port) before touching a live serving lane.
 
 ## 8. Honest difficulty profile
 

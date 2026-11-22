@@ -1279,8 +1279,8 @@ def _minimal_docker_env() -> dict:
 
 def _run_docker(args):
     """Default docker runner: ``subprocess ['docker', <args>]`` — the one real
-    docker seam. The facade runs on the .62 inference host, where the host
-    docker CLI is available; unit tests inject a fake and touch no docker.
+    docker seam. The facade runs on a host where the docker CLI is available;
+    unit tests inject a fake and touch no docker.
 
     stdout/stderr are captured (PIPE) so the ``docker inspect`` path can read
     the container's state from the child; start/stop emit a few bytes at most,
@@ -1333,10 +1333,11 @@ class DockerContainerLifecycle(EngineLifecycle):
     """A containerized engine: start the container, wait for its health
     endpoint, stop the container to evict.
 
-    Production parity (weights-broker ``ContainerControl``): a side model
-    (ComfyUI) runs as a container so the broker can stop it before a bigger
-    lane wakes — a resident side model OOMs the waking lane (vLLM TP2 books
-    ~22.8 GB/GPU at 0.95 utilization). ``docker stop`` frees the GPU
+    Production parity (the predecessor broker's ``ContainerControl``): a side
+    model (ComfyUI) runs as a container so the broker can stop it before a
+    bigger lane wakes — a resident side model OOMs the waking lane (a
+    tensor-parallel chat server books most of each accelerator at 0.95
+    utilization). ``docker stop`` frees the GPU
     instantly, which is the whole reason to containerize the engine.
 
     ``ensure_loaded`` starts the container only when it is not already
@@ -2259,10 +2260,10 @@ class Orchestrator:
     def llm_waiters(self) -> int:
         """How many chat requests currently wait on a lane wake.
 
-        This is the model-forge proxy for the production broker's
-        ``Lifecycle.llm_waiters`` counter (weights-broker ``broker/main.py``,
-        ``prepare_llm`` increments on entry and its ``finally`` decrements on
-        exit; ``prepare_gen`` refuses while it is non-zero). A waiter is a
+        This is the model-forge proxy for the predecessor broker's
+        ``Lifecycle.llm_waiters`` counter (its ``prepare_llm`` increments on
+        entry and its ``finally`` decrements on exit; ``prepare_gen`` refuses
+        while it is non-zero). A waiter is a
         chat request that has entered the lane-wake path and not yet left it.
         The count is read under the waiter lock, so a concurrent enter/exit
         never shows a torn or half-applied value."""
@@ -2388,7 +2389,7 @@ class Orchestrator:
                               f"release it first (fail-closed)",
                               target_id, request)
         restore = tuple(self._ledger.residents(target_id))
-        # Residency heal (weights-broker hard rule: gate on CONTAINER state,
+        # Residency heal (predecessor-broker hard rule: gate on CONTAINER state,
         # not the stale ledger/cache). If the ledger calls the REQUESTED model
         # resident but its runtime is actually down (e.g. a container stopped
         # outside this broker), the planner would emit NO load step, report

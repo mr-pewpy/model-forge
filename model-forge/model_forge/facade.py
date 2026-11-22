@@ -2,8 +2,8 @@
 
 WHY this is separate from ``broker.py``: the orchestrator owns *policy* (what
 weights are resident, when to swap, who waits). The facade owns *routes* — the
-HTTP surface that Hermes providers, the image plugin, the vision cron and
-OpenViking (.63) were written against. Keeping route plumbing apart from
+HTTP surface that Hermes providers, the image plugin and other local
+consumers were written against. Keeping route plumbing apart from
 orchestration policy is what lets the orchestrator change without rewriting the
 contract that live clients depend on.
 
@@ -288,14 +288,14 @@ class FacadeConfig:
     comfy_base_url: str = "http://127.0.0.1:18188"
     # -- topology / runtime overrides (shadow + stub deployments) -----------
     # The container names, health URLs and cold-boot budgets of the two lanes
-    # serve.py assembles. Production defaults are the real .62 containers; a
+    # serve.py assembles. Defaults are neutral placeholder names; a
     # shadow/stub deployment points them at throwaway containers so the
     # container-dance mechanics can be exercised without touching the live
     # stack. Defaults are byte-identical to serve.py's former hardcoded
     # TOPOLOGY_ENTRIES, so behaviour is unchanged when nothing overrides them.
-    chat_container: str = "vllm-server"
+    chat_container: str = "chat-engine"
     chat_health_url: str = "http://127.0.0.1:8000/health"
-    gen_container: str = "weights-broker-comfyui-1"
+    gen_container: str = "gen-engine"
     gen_health_url: str = "http://127.0.0.1:18188/"
     chat_boot_s: float = 480.0
     gen_boot_s: float = 600.0
@@ -304,11 +304,10 @@ class FacadeConfig:
     # points this at a stub-writable dir under assets_dir so /assets serves it.
     comfy_output_dir: str = "/output"
     # ComfyUI args file the serve preflight checks for ``--novram`` (empty =
-    # unchecked; env ``COMFY_ARGS_FILE``, FACADE_CONFIG settable). On .62 it is
-    # /data/broker/comfy_args.conf bind-mounted read-only at
-    # /etc/comfyui_args.conf — and it was silently emptied 2026-09-22, after
-    # which every h3 video run OOMd (the h3 models REQUIRE --novram on a 24 GB
-    # card). See :func:`comfy_args_state`.
+    # unchecked; env ``COMFY_ARGS_FILE``, FACADE_CONFIG settable). In one real
+    # deployment it was silently emptied after a bind-mount change, and every
+    # h3 video run OOMd afterwards (the h3 models REQUIRE ``--novram`` on
+    # smaller cards). See :func:`comfy_args_state`.
     comfy_args_file: str = ""
 
     @classmethod
@@ -326,9 +325,8 @@ def comfy_args_state(path: str) -> str:
     """``--novram`` verdict for the ComfyUI args file: ``"novram-ok"`` /
     ``"novram-missing"`` / ``"unchecked"``.
 
-    WHY: on .62 the h3 video models REQUIRE ``--novram`` on a 24 GB card and
-    the args file (``/data/broker/comfy_args.conf``, bind-mounted read-only at
-    ``/etc/comfyui_args.conf``) was silently emptied 2026-09-22 — every h3 run
+    WHY: the h3 video models REQUIRE ``--novram`` on smaller cards, and the
+    args file has been silently emptied in a real deployment — every h3 run
     OOMd afterwards and nothing surfaced the drift. serve.py logs this verdict
     at startup (an honest WARNING when the flag is confirmed absent) and
     ``GET /health`` reports it; neither hard-fails.
@@ -681,7 +679,7 @@ class FacadeService:
                         "gen job in progress and LLM wait budget exhausted "
                         f"(waited {float(self.config.max_gen_wait_s):g}s)",
                         "busy")
-                # 3. wake the chat lane: claim -> vllm-server ensure_loaded.
+                # 3. wake the chat lane: claim -> chat-engine ensure_loaded.
                 scope = f"chat-{token}" if token else f"chat-{uuid4().hex[:12]}"
                 request = _LoadRequest(model_id=model_id, engine=_CHAT_ENGINE,
                                        lane="chat", modality="chat")
@@ -932,8 +930,8 @@ class FacadeService:
         """Run one gen job: admit -> claim -> run -> release, then free.
 
         ORDER IS POLICY (roadmap §3, the LLM-waiter rule). ``admit_gen`` runs
-        BEFORE ``claim``. The broker checks ``llm_waiters`` at the TOP of
-        ``prepare_gen`` (weights-broker ``broker/main.py`` ~1103), before any
+        BEFORE ``claim``. The predecessor broker checks ``llm_waiters`` at the TOP of
+        ``prepare_gen`` (its own route), before any
         stop/evict or lane wake; ``claim`` is what executes the gen plan
         (evicting the waiting chat resident, waking and loading ComfyUI). So a
         gen job MUST be refused before ``claim`` — claiming first and admitting
