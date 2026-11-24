@@ -12,6 +12,10 @@ Covered, per the port contract:
     only; size -> width/height; unknown keys ignored; nested upload resolves);
   * 405 retry loop then success, and 405 exhaustion -> ok False;
   * upload normalisation writing the nested ``{"upload": {"path": ...}}`` shape;
+  * the SSRF gate on remote image refs (the runtime URL-safety policy first,
+    a conservative fallback floor when it is absent) and name containment:
+    ``/history`` output names that escape ``output_dir`` and stash filenames
+    built from request keys never become read/write paths;
   * history polling collecting image / video / 3d outputs — including the
     ai-dock drift where video outputs land in the ``images`` bucket with
     ``metadata.kind == "video"`` (p5-integration §11.5);
@@ -355,6 +359,24 @@ def test_remote_image_ref_is_fetched_and_uploaded(tmp_path, monkeypatch):
     assert fname.endswith(".jpg")                    # ext from the URL path
 
 
+def test_upload_stash_filename_is_sanitized(tmp_path):
+    # the stash name is filesystem-facing while the request key is not: a
+    # hostile key must not walk out of the uploads dir on write.
+    http = FakeHTTP()
+    r = make_runner(http)
+    b64 = base64.b64encode(b"PNGDATA").decode()
+    out = r._prepare_params({"../../../pwned": f"data:image/png;base64,{b64}"},
+                            str(tmp_path))
+    uploads = list((tmp_path / "uploads").iterdir())
+    assert uploads and all(os.sep not in p.name for p in uploads)
+    assert uploads[0].read_bytes() == b"PNGDATA"
+    # nothing landed outside the uploads dir
+    assert not (tmp_path.parent / "pwned.png").exists()
+    assert not (tmp_path / "pwned.png").exists()
+    # the nested contract shape is unchanged
+    assert out["../../../pwned"] == {"upload": {"path": "uploaded.png"}}
+
+
 # --- URL safety gate (SSRF) ------------------------------------------------
 
 def _install_fake_url_safety(monkeypatch, verdict):
@@ -444,6 +466,25 @@ def test_history_poll_collects_image_output():
     assert res["files"] == ["/output/sub/pic.png"]
     assert res["meta"]["outputs"][0]["node"] == "10"
     assert res["meta"]["prompt_id"] == "pid-default"
+
+
+def test_collect_outputs_skips_names_escaping_the_output_dir():
+    # /history names are endpoint-controlled: an absolute or ``..`` name must
+    # never become a read path (it would reach tools._media_asset_url's embed).
+    http = FakeHTTP()
+    http.history = {"status": {"status_str": "success", "messages": []},
+                    "outputs": {"9": {"images": [
+                        {"filename": "../../../etc/passwd", "subfolder": "",
+                         "type": "output"},
+                        {"filename": "/etc/shadow", "subfolder": "",
+                         "type": "output"},
+                        {"filename": "ok.png", "subfolder": "sub",
+                         "type": "output"}]}}}
+    r = make_runner(http)
+    res = r.run("moss-image", {"prompt": "x"}, assets_dir="/tmp/a", job_id="j")
+    assert res["ok"] is True
+    assert res["files"] == ["/output/sub/ok.png"]
+    assert [row["filename"] for row in res["meta"]["outputs"]] == ["ok.png"]
 
 
 def test_history_poll_collects_video_output():

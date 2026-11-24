@@ -29,6 +29,7 @@ import base64
 import ipaddress
 import json
 import os
+import re
 import socket
 import time
 import urllib.error
@@ -525,7 +526,13 @@ class ComfyWorkflowRunner:
                     or val.startswith("https://")):
                 continue
             data, ext = self._fetch_image_bytes(val)
-            name = f"{uuid4().hex[:8]}_{key}.{ext}"
+            # The stash name is filesystem-facing while the key and the ext
+            # are request/endpoint-controlled: keep both to a safe charset so
+            # a key like ``../../x`` cannot walk out of the uploads dir on
+            # write.
+            safe_key = re.sub(r"[^A-Za-z0-9._-]", "_", str(key))[:64] or "image"
+            safe_ext = re.sub(r"[^A-Za-z0-9]", "", str(ext))[:8] or "bin"
+            name = f"{uuid4().hex[:8]}_{safe_key}.{safe_ext}"
             up = Path(assets_dir) / "uploads"
             up.mkdir(parents=True, exist_ok=True)
             saved = up / name
@@ -624,9 +631,13 @@ class ComfyWorkflowRunner:
         with ``metadata.kind == "video"`` (p5-integration §11.5), so video
         collection picks those items up while image collection skips them —
         in a mixed bucket each item collects under its own kind. The
-        skip-empty-filename honesty and row shape are unchanged everywhere."""
+        skip-empty-filename honesty and row shape are unchanged everywhere.
+        Endpoint-supplied names that resolve outside ``output_dir`` (absolute
+        or ``..``) are dropped like empty names — untrusted ``/history`` data
+        must never reach the embed read downstream."""
         buckets = _OUTPUT_BUCKETS.get(output_kind, ())
         items: list[dict] = []
+        root = Path(self._output_dir).resolve()
 
         def add(bucket: str, item: dict) -> None:
             fn = item.get("filename", "") or ""
@@ -636,6 +647,14 @@ class ComfyWorkflowRunner:
                 return
             sub = item.get("subfolder", "") or ""
             path = os.path.join(self._output_dir, sub, fn)
+            resolved = Path(path).resolve()
+            if resolved == root or not resolved.is_relative_to(root):
+                # /history names are endpoint-controlled: an absolute or ``..``
+                # name resolves outside the output dir and must never reach
+                # the embed read downstream (tools._media_asset_url). Not a
+                # real output of this runner — skip it like the empty-name
+                # case above so it cannot count toward the done test.
+                return
             kind = item.get("type", "output")
             # ComfyUI's fetchable /view URL for this output — works for a
             # REMOTE/connected ComfyUI whose /output dir is not readable here
