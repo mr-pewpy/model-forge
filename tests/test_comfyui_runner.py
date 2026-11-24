@@ -251,8 +251,12 @@ def test_inject_size_maps_to_width_height(tmp_path):
     assert prepared["aspect_ratio"] == "16:9"
 
 
-def test_prepare_params_drops_control_keys_and_maps_image_url(tmp_path):
+def test_prepare_params_drops_control_keys_and_maps_image_url(tmp_path,
+                                                             monkeypatch):
     r = make_runner(FakeHTTP())
+    # the fetch mechanics are under test here, not the SSRF gate (pinned in
+    # the URL-safety section below) — clear the policy for this ref.
+    monkeypatch.setattr(comfyui, "_url_is_safe", lambda u: True)
     # image_url is a bare http ref -> uploaded; model/n/_timeout dropped.
     http = r._http
     http.raw_bytes = b"jpgbytes"
@@ -336,7 +340,8 @@ def test_upload_nested_shape_reaches_the_injected_graph(tmp_path):
     assert os.path.isdir(str(tmp_path / "uploads"))
 
 
-def test_remote_image_ref_is_fetched_and_uploaded(tmp_path):
+def test_remote_image_ref_is_fetched_and_uploaded(tmp_path, monkeypatch):
+    monkeypatch.setattr(comfyui, "_url_is_safe", lambda u: True)
     http = FakeHTTP()
     http.raw_bytes = b"JPEGBYTES"
     http.upload = {"name": "remote.jpeg", "subfolder": "", "type": "input"}
@@ -348,6 +353,83 @@ def test_remote_image_ref_is_fetched_and_uploaded(tmp_path):
     assert any(c["raw"] for c in http.calls)
     fname = http.calls_to("/upload/image")[0]["files"][0][1]
     assert fname.endswith(".jpg")                    # ext from the URL path
+
+
+# --- URL safety gate (SSRF) ------------------------------------------------
+
+def _install_fake_url_safety(monkeypatch, verdict):
+    """Fake the hermes runtime's ``tools.url_safety`` module (the real one is
+    not importable under the suite). ``verdict`` is a bool or a url->bool."""
+    import sys
+    import types
+    tools_mod = types.ModuleType("tools")
+    safety = types.ModuleType("tools.url_safety")
+    safety.is_safe_url = (verdict if callable(verdict) else (lambda u: verdict))
+    tools_mod.url_safety = safety
+    monkeypatch.setitem(sys.modules, "tools", tools_mod)
+    monkeypatch.setitem(sys.modules, "tools.url_safety", safety)
+
+
+def test_remote_image_ref_refused_by_policy_never_fetches(tmp_path,
+                                                          monkeypatch):
+    http = FakeHTTP()
+    r = make_runner(http)
+    monkeypatch.setattr(comfyui, "_url_is_safe", lambda u: False)
+    with pytest.raises(ValueError, match="refused"):
+        r._prepare_params({"image": "https://ex.test/a/photo.jpg"},
+                          str(tmp_path))
+    assert http.calls == []                # nothing rode the HTTP seam
+
+
+def test_run_reports_a_refused_image_url_as_honest_failure(monkeypatch):
+    http = FakeHTTP()
+    r = make_runner(http)
+    monkeypatch.setattr(comfyui, "_url_is_safe", lambda u: False)
+    res = r.run("qwen-image-2.1-edit",
+                {"prompt": "e", "image": "https://ex.test/a.png"},
+                assets_dir="/tmp/a", job_id="j")
+    assert res["ok"] is False and "refused" in res["reason"]
+    assert res["files"] == []
+    assert http.calls == []                # nothing rode the HTTP seam
+
+
+def test_url_safety_runtime_verdict_wins(monkeypatch):
+    # a refusal stands even where the fallback floor would allow (public IP)
+    _install_fake_url_safety(monkeypatch, lambda u: False)
+    assert comfyui._url_is_safe("https://93.184.216.34/a.png") is False
+    # and a policy allow (config opt-in) is honoured over the floor
+    _install_fake_url_safety(monkeypatch, lambda u: True)
+    assert comfyui._url_is_safe("http://10.0.0.5/a.png") is True
+
+
+def test_url_safety_fallback_floor_refuses_internal_targets(monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "tools", None)
+    monkeypatch.setitem(sys.modules, "tools.url_safety", None)
+    for url in ("http://169.254.169.254/latest/meta-data/",
+                "http://100.100.100.200/latest/meta-data/",
+                "http://127.0.0.1:8188/x.png",
+                "http://10.1.2.3/x.png",
+                "http://[::1]/x.png",
+                "http://[::ffff:169.254.169.254]/x.png",
+                "http://metadata.google.internal/computeMetadata/v1/",
+                "http://user:pass@93.184.216.34/x.png",
+                "file:///etc/passwd"):
+        assert comfyui._url_is_safe(url) is False, url
+    assert comfyui._url_is_safe("https://93.184.216.34/x.png") is True
+
+
+def test_url_safety_fallback_floor_refuses_dns_answers_to_private(monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "tools", None)
+    monkeypatch.setitem(sys.modules, "tools.url_safety", None)
+    monkeypatch.setattr(comfyui.socket, "getaddrinfo",
+                        lambda host, *a, **k: [(2, 1, 6, "", ("10.0.0.5", 0))])
+    assert comfyui._url_is_safe("https://rebind.example/x.png") is False
+    monkeypatch.setattr(comfyui.socket, "getaddrinfo",
+                        lambda host, *a, **k: [(2, 1, 6, "",
+                                                ("93.184.216.34", 0))])
+    assert comfyui._url_is_safe("https://rebind.example/x.png") is True
 
 
 # --- history polling / output collection -----------------------------------

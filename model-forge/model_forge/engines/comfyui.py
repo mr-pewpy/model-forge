@@ -26,8 +26,10 @@ never touch the network — the same seam style the broker lifecycle adapters in
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import os
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -90,6 +92,81 @@ def _item_is_video(item: dict) -> bool:
             if isinstance(kind, str) and kind.strip().lower() == "video":
                 return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# URL safety (SSRF gate for model-supplied image references)
+# ---------------------------------------------------------------------------
+#
+# Remote image refs arrive in tool args, so fetching one is a server-side
+# request the model directs — the classic SSRF shape. The gate is the hermes
+# runtime's public URL-safety policy (``tools.url_safety.is_safe_url``, the
+# same check core plugins such as firecrawl use). In a runtime-less
+# deployment (the standalone facade) that module is not importable, so a
+# conservative local floor applies instead. Fail-closed both ways: a URL that
+# cannot be cleared is never fetched.
+
+# Cloud metadata endpoints — the #1 SSRF target. The floor blocks them even
+# though several are also inside link-local/private ranges.
+_METADATA_HOSTS = frozenset({"metadata.google.internal", "metadata.goog"})
+_METADATA_IPS = frozenset({"169.254.169.254", "169.254.170.2",
+                           "169.254.169.253", "100.100.100.200"})
+
+
+def _ip_is_internal(ip) -> bool:
+    """True for addresses that must never be dialed by a model-supplied URL."""
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+            or str(ip) in _METADATA_IPS)
+
+
+def _fallback_url_is_safe(url: str) -> bool:
+    """Conservative SSRF floor for runtime-less deployments.
+
+    Refuses non-http(s) schemes, userinfo authorities (parsed ambiguously by
+    other clients) and hosts that resolve to private / loopback / link-local /
+    reserved / metadata addresses. DNS failures refuse (fail closed)."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme.lower() not in ("http", "https"):
+            return False
+        if ("@" in (parts.netloc or "") or parts.username
+                or parts.password or not parts.hostname):
+            return False
+        host = parts.hostname.lower()
+        if host in _METADATA_HOSTS:
+            return False
+        try:
+            return not _ip_is_internal(ipaddress.ip_address(host))
+        except ValueError:
+            pass
+        for info in socket.getaddrinfo(host, None):
+            try:
+                ip = ipaddress.ip_address(str(info[4][0]).split("%")[0])
+            except ValueError:
+                return False
+            if _ip_is_internal(ip):
+                return False
+        return True
+    except Exception:  # noqa: BLE001 — anything unexpected refuses the URL
+        return False
+
+
+def _url_is_safe(url: str) -> bool:
+    """True when a model-supplied ``http(s)`` image ref may be fetched.
+
+    The runtime policy's verdict wins (its config can allow private URLs on
+    purpose); when the runtime module is absent the local floor decides."""
+    try:
+        from tools.url_safety import is_safe_url
+    except Exception:  # noqa: BLE001 — runtime-less deployment: local floor
+        return _fallback_url_is_safe(url)
+    try:
+        return bool(is_safe_url(url))
+    except Exception:  # noqa: BLE001 — the policy raised: fail closed
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +477,10 @@ class ComfyWorkflowRunner:
     def _fetch_image_bytes(self, val: str) -> tuple[bytes, str]:
         """Resolve a ``data:`` or ``http(s)`` image reference to ``(bytes,
         ext)``. Remote fetches ride the injectable HTTP seam (``raw=True``) so
-        tests fake them without a network."""
+        tests fake them without a network — and are gated on the URL-safety
+        policy first (``_url_is_safe``): a model-supplied URL is untrusted
+        (SSRF), so a private/internal/unverifiable target is refused before
+        any request leaves the box."""
         if val.startswith("data:"):
             header, b64 = val.split(",", 1)
             data = base64.b64decode(b64)
@@ -409,6 +489,10 @@ class ComfyWorkflowRunner:
                    else "webp" if "image/webp" in header
                    else "bin")
             return data, ext
+        if not _url_is_safe(val):
+            raise ValueError(
+                "image URL refused by the URL-safety policy (private, "
+                f"internal or unverifiable target): {val!r}")
         data = self._http("GET", val, None, raw=True,
                           timeout=self._fetch_timeout_s)
         ext = Path(val.split("?")[0]).suffix.lstrip(".") or "bin"
