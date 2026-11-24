@@ -2301,3 +2301,114 @@ def test_restore_plan_is_none_for_an_http_only_restore():
     plan = orch.restore_plan("s2")
     assert plan is not None
     assert [s.engine for s in plan.load_steps] == ["ollama"]  # HTTP, no process
+
+
+# --- adopt_live: a live-but-unrecorded runtime becomes resident --------------
+
+class AdoptProbeLifecycle(RecordingLifecycle):
+    """RecordingLifecycle with a configurable probe (the adopt_live seam).
+
+    Distinct from the heal-tests ProbeLifecycle above (different constructor
+    shape); do not merge the two."""
+
+    def __init__(self, engine_id="recording", state="running", probe_ok=True,
+                 probe_raises=False, **kw):
+        super().__init__(engine_id, **kw)
+        self.state = state
+        self.probe_ok = probe_ok
+        self.probe_raises = probe_raises
+
+    def probe(self):
+        if self.probe_raises:
+            raise RuntimeError("probe exploded")
+        return {"ok": self.probe_ok, "state": self.state, "resident": []}
+
+
+def test_adopt_live_records_external_residency_when_the_runtime_is_up():
+    clock = FakeClock()
+    ledger = ResidencyLedger(bookings={"chat-a": 18.0}, clock=clock)
+    ledger.set_budget("local", 24.0)
+    adapter = AdoptProbeLifecycle("ollama", state="running")
+    orch = Orchestrator(ledger, EvictionPlanner(ledger, clock=clock),
+                        {"ollama": adapter}, clock=clock)
+
+    row = orch.adopt_live("local", "chat-a", "ollama", lane="chat")
+    assert row["ok"] is True and row["adopted"] is True
+    assert "external" in row["reason"]
+    (rec,) = ledger.residents("local")
+    assert rec.model_id == "chat-a" and rec.provenance == "external"
+
+    # Idempotent: a second adopt never restamps or downgrades the record.
+    again = orch.adopt_live("local", "chat-a", "ollama", lane="chat")
+    assert again["adopted"] is False and "untouched" in again["reason"]
+    (rec2,) = ledger.residents("local")
+    assert rec2.provenance == "external"
+
+
+def test_adopt_live_is_fail_soft_on_unknown_stopped_or_raising_runtimes():
+    ledger = ResidencyLedger(bookings={"chat-a": 18.0})
+    ledger.set_budget("local", 24.0)
+
+    bare = Orchestrator(ledger, EvictionPlanner(ledger), {})
+    row = bare.adopt_live("local", "chat-a", "ghost")
+    assert row["ok"] is True and row["adopted"] is False
+    assert "no engine adapter" in row["reason"]
+    assert ledger.residents("local") == ()
+
+    down = Orchestrator(ledger, EvictionPlanner(ledger),
+                        {"ollama": AdoptProbeLifecycle("ollama", state="stopped")})
+    assert down.adopt_live("local", "chat-a", "ollama")["adopted"] is False
+
+    blind = Orchestrator(ledger, EvictionPlanner(ledger),
+                         {"ollama": AdoptProbeLifecycle("ollama", probe_ok=False)})
+    assert blind.adopt_live("local", "chat-a", "ollama")["adopted"] is False
+
+    boom = Orchestrator(ledger, EvictionPlanner(ledger),
+                        {"ollama": AdoptProbeLifecycle("ollama",
+                                                  probe_raises=True)})
+    row = boom.adopt_live("local", "chat-a", "ollama")
+    assert row["adopted"] is False and "raised" in row["reason"]
+
+    assert ledger.residents("local") == ()       # nothing invented
+
+
+def _adopted_lane_dance(modality):
+    """The item-3 behavior: an adopted LLM lane is evicted by the gen claim
+    and restored by its release — auto-stop AND auto-restore."""
+    clock = FakeClock()
+    ledger = ResidencyLedger(bookings={"chat-a": 18.0, "gen-x": 18.0},
+                             clock=clock)
+    ledger.set_budget("local", 24.0)
+    chat = AdoptProbeLifecycle("vllm", state="running")
+    comfy = AdoptProbeLifecycle("comfyui", state="stopped")
+    orch = Orchestrator(ledger, EvictionPlanner(ledger, clock=clock),
+                        {"vllm": chat, "comfyui": comfy}, clock=clock)
+
+    # The LLM lane is up but was started OUTSIDE this process — the ledger
+    # knows nothing until prepare_gen adopts it.
+    assert orch.adopt_live("local", "chat-a", "vllm", lane="chat")["adopted"]
+
+    claimed = orch.claim("job-1", "local",
+                         LoadRequest("gen-x", "comfyui", lane=modality,
+                                     modality=modality))
+    assert claimed["ok"] is True
+    # auto-STOP: the claim's plan evicted the adopted LLM lane ...
+    assert ("release", "chat-a") in _call_names(chat)
+    assert ledger.is_resident("local", "gen-x")
+    assert not ledger.is_resident("local", "chat-a")
+
+    released = orch.release("job-1")
+    assert released["ok"] is True
+    # ... and auto-RESTORE: the release woke it again.
+    assert _call_names(chat) == [("release", "chat-a"),
+                                 ("ensure_loaded", "chat-a")]
+    assert ledger.is_resident("local", "chat-a")
+    assert not ledger.is_resident("local", "gen-x")
+
+
+def test_adopted_llm_lane_is_evicted_by_an_image_claim_and_restored():
+    _adopted_lane_dance("image")
+
+
+def test_adopted_llm_lane_is_evicted_by_a_video_claim_and_restored():
+    _adopted_lane_dance("video")

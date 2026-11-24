@@ -225,6 +225,10 @@ _DEFER_NOTE = ("image references are uploaded at run time (not at job "
 # spin. ``_CHAT_ENGINE`` is the engine id a chat claim targets (the vLLM lane).
 GEN_WAIT_POLL_S = 0.25
 _CHAT_ENGINE = "vllm"
+# The engine id a gen claim targets (the ComfyUI lane) — the sibling of
+# ``_CHAT_ENGINE``, used by ``prepare_gen`` to drive the lane's own lifecycle
+# seam and by the gen claim's LoadRequest.
+_GEN_ENGINE = "comfyui"
 
 
 def _enrich(entry: dict, meta: dict | None = None) -> dict:
@@ -344,6 +348,83 @@ def comfy_args_state(path: str) -> str:
     except OSError:
         return "unchecked"
     return "novram-ok" if "--novram" in text.split() else "novram-missing"
+
+
+# The per-workload ComfyUI args the gen path maintains in ``comfy_args_file``
+# (the predecessor broker's ``prepare_gen`` flipped this file per workload).
+# The h3 video models REQUIRE ``--novram`` on the 24 GB cards (every h3 run
+# OOMd after the flag was silently emptied on 2026-09-22), while image
+# workloads must run with the file EMPTY — ``--novram`` sends the
+# ``TextGenerate`` PE prompter to CPU where it fails silently (~12 s/it).
+# The value is the file's WHOLE content: the file feeds ComfyUI's extra CLI
+# args and has historically carried ``--novram`` and nothing else. The args
+# file is a read-only bind mount inside the ComfyUI container, so the flip is
+# a host-side write and only binds on the container's next start (see
+# ``FacadeService.prepare_gen``).
+GEN_ARGS_BY_WORKLOAD: dict[str, str] = {
+    "video": "--novram",
+    "image": "",
+}
+
+
+def comfy_args_for(kind: str) -> str:
+    """The ComfyUI args file content for one workload kind (``image``/``video``).
+
+    Policy lives in :data:`GEN_ARGS_BY_WORKLOAD`; an unknown or empty kind
+    maps to ``""`` (no extra args — ComfyUI's default memory management,
+    which streams the >24 GB models by itself). Pure: no I/O, so the flip
+    decision is trivially testable."""
+    return GEN_ARGS_BY_WORKLOAD.get(str(kind or "").strip().lower(), "")
+
+
+def flip_comfy_args(path: str, kind: str) -> dict:
+    """Make the ComfyUI args file carry the per-workload args for ``kind``.
+
+    WHY: the args file has been silently emptied in a real deployment
+    (2026-09-22 — every h3 run OOMd afterwards), and ``--novram`` left in
+    place makes the image lanes fail silently on CPU. The facade used to
+    only REPORT the drift (:func:`comfy_args_state`); this is the write
+    half — ``prepare_gen`` calls it before every gen job so the file always
+    matches the workload, and restarts the lane container so the new args
+    bind (the file is a RO bind mount inside the container — a host-side
+    write takes effect only on the container's next start).
+
+    Honest row ``{'ok', 'changed', 'path', 'args', 'reason'}``:
+    ``changed`` is True only when the file was actually rewritten — a
+    token-equal file is left untouched, so an unchanged workload never
+    forces a lane restart. A missing file is created; an unconfigured path
+    (``""``) is an honest no-op (``ok: True, changed: False`` — args are
+    not managed); a write failure is ``ok: False`` with the reason and
+    never raises — a failed flip must not sink the job, it degrades to the
+    pre-flip behavior and the ``/health`` ``comfy_args`` verdict keeps
+    reporting the drift."""
+    path = str(path or "")
+    if not path:
+        return {"ok": True, "changed": False, "path": "", "args": "",
+                "reason": "no ComfyUI args file configured (comfy_args_file "
+                          "unset) — args are not managed"}
+    desired = comfy_args_for(kind)
+    try:
+        current = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        current = None          # absent/unreadable -> treated as new content
+    if current is not None and current.split() == desired.split():
+        return {"ok": True, "changed": False, "path": path, "args": desired,
+                "reason": f"{path} already carries the {kind or 'unknown'} "
+                          f"workload args — file untouched, lane not "
+                          f"restarted"}
+    try:
+        Path(path).write_text(desired + "\n" if desired else "",
+                              encoding="utf-8")
+    except OSError as e:
+        return {"ok": False, "changed": False, "path": path, "args": desired,
+                "reason": f"writing {path} failed: {type(e).__name__}: {e} "
+                          f"— the file keeps its previous args (the lane is "
+                          f"not restarted)"}
+    return {"ok": True, "changed": True, "path": path, "args": desired,
+            "reason": f"{path} now carries the {kind or 'unknown'} workload "
+                      f"args ({desired or 'none'}) — the lane must restart "
+                      f"to bind them"}
 
 
 # An upstream call: (raw_body_bytes, headers) -> (status:int, body:bytes).
@@ -924,10 +1005,137 @@ class FacadeService:
             raise box["exc"]
         return box.get("result") or {}
 
+    def _prepare_gen_lanes(self, workflow_id: str, args_row: dict) -> dict:
+        """Stop the gen lane so the claim's load rebinds a changed args file,
+        and adopt a live LLM lane into the ledger — both fail-soft rows.
+
+        The gen lane restart runs ONLY when the args flip changed the file
+        (``args_row['changed']``) and the lane is up: a stop here plus the
+        claim's own ``ensure_loaded`` start is the restart (the adapter's
+        ``release`` is the docker-stop seam and waits for the container to
+        actually stop, so VRAM is freed before anything loads). A stopped
+        lane is left stopped — the claim starts it either way, on the new
+        args.
+
+        The adoption always runs and is the auto-stop/auto-restore fix: the
+        orchestrator's ledger is process-local, so a ``vllm-server`` started
+        OUTSIDE this process (compose, by hand) is invisible to the gen plan
+        — the claim then plans NO release step (the LLM lane is never
+        auto-stopped) and snapshots an empty restore set (never
+        auto-restored). Calling ``Orchestrator.adopt_live`` before the claim
+        records the observed runtime as resident (provenance ``"external"``),
+        so the claim stops the lane and the release restores it — the
+        choreography the planner already implements, fed with an honest
+        picture of reality.
+        """
+        rows = {"lane": {"ok": True, "changed": False,
+                         "reason": "args unchanged — gen lane left as it is"},
+                "adopt": {"ok": True, "adopted": False,
+                          "reason": "orchestrator exposes no adopt_live "
+                                    "seam — LLM lane not observed "
+                                    "(fail-soft)"}}
+        if args_row.get("changed"):
+            rows["lane"] = {"ok": True, "changed": False,
+                            "reason": f"no {_GEN_ENGINE!r} adapter reachable "
+                                      f"on the orchestrator — the gen lane "
+                                      f"is not restarted here (fail-soft); a "
+                                      f"running lane keeps its OLD args "
+                                      f"until it is restarted"}
+            getter = getattr(self._orchestrator, "adapter_for", None)
+            if callable(getter):
+                adapter = None
+                try:
+                    adapter = getter(_GEN_ENGINE)
+                except Exception as e:  # noqa: BLE001 — honest row, no raise
+                    rows["lane"] = {"ok": True, "changed": False,
+                                    "reason": f"gen lane adapter lookup "
+                                              f"raised {type(e).__name__}: {e}"
+                                              f" — lane not touched "
+                                              f"(fail-soft)"}
+                if adapter is not None:
+                    rows["lane"] = self._restart_gen_lane(adapter, workflow_id)
+        fn = getattr(self._orchestrator, "adopt_live", None)
+        if callable(fn):
+            try:
+                row = fn(self.config.gen_target_id, CHAT_MODEL_ID,
+                         _CHAT_ENGINE, lane="chat")
+            except Exception as e:  # noqa: BLE001 — honest row, never a raise
+                row = None
+                rows["adopt"] = {"ok": True, "adopted": False,
+                                 "reason": f"adopt_live raised "
+                                           f"{type(e).__name__}: {e} — LLM "
+                                           f"lane not observed (fail-soft)"}
+            if isinstance(row, dict):
+                rows["adopt"] = row
+        return rows
+
+    def _restart_gen_lane(self, adapter, workflow_id: str) -> dict:
+        """Stop the gen lane container when it is up (probe-gated, fail-soft)."""
+        try:
+            probe = adapter.probe()
+        except Exception as e:  # noqa: BLE001 — probes fail soft
+            return {"ok": True, "changed": False,
+                    "reason": f"gen lane probe raised {type(e).__name__}: {e}"
+                              f" — lane not touched (fail-soft)"}
+        state = str((probe or {}).get("state") or "").strip().lower() \
+            if isinstance(probe, dict) else ""
+        if state not in ("running", "booting", "ready", "observed"):
+            return {"ok": True, "changed": False,
+                    "reason": f"gen lane is {state or 'unreadable'} — no "
+                              f"restart needed (the claim's load starts it "
+                              f"on the new args)"}
+        try:
+            res = adapter.release(workflow_id) or {}
+        except Exception as e:  # noqa: BLE001 — honest row, never a raise
+            return {"ok": False, "changed": False,
+                    "reason": f"stopping the gen lane raised "
+                              f"{type(e).__name__}: {e} — the container may "
+                              f"still hold the OLD args"}
+        return {"ok": bool(res.get("ok")), "changed": bool(res.get("ok")),
+                "reason": ("gen lane stopped — the claim's load restarts it "
+                           "on the new args"
+                           if res.get("ok") else
+                           f"stopping the gen lane failed: "
+                           f"{res.get('reason', 'no reason given')}")}
+
+    def prepare_gen(self, workflow_id: str, kind: str) -> dict:
+        """prepare_gen (predecessor-broker parity): the pre-claim gen
+        choreography, in order.
+
+        1. **flip the ComfyUI args for this workload** (:func:`flip_comfy_args`)
+           — the args file must carry ``--novram`` for the h3 video lanes and
+           be EMPTY for the image lanes (see :data:`GEN_ARGS_BY_WORKLOAD`),
+           and the file is a RO bind mount inside the container, so the flip
+           is a host-side write.
+        2. **restart the gen lane container** when the args changed under a
+           running container — the write binds only at container start (see
+           ``_prepare_gen_lanes``).
+        3. **adopt a live LLM lane** so the claim below auto-stops it and the
+           release auto-restores it (see ``_prepare_gen_lanes``).
+
+        Runs AFTER ``admit_gen`` (a refusal touches nothing — the LLM-waiter
+        rule) and BEFORE ``claim``, so the claim's plan is computed against
+        the post-flip args and the adopted residency. Every step is
+        fail-soft with an honest row; the rows are returned under
+        ``args``/``lane``/``adopt`` and ``ok`` is False only when a step
+        reported a real failure (currently: an args write failure or a lane
+        stop failure). Never raises — a prepare miss degrades to the
+        pre-flip behavior instead of sinking the job. ``workflow_id`` is
+        carried for the lane rows' provenance; the flip policy keys on the
+        workload ``kind`` alone.
+        """
+        rows = {"args": flip_comfy_args(self.config.comfy_args_file, kind)}
+        rows.update(self._prepare_gen_lanes(workflow_id, rows["args"]))
+        ok = bool(rows["args"].get("ok")) and bool(rows["lane"].get("ok"))
+        return {"ok": ok, **rows,
+                "reason": " | ".join(f"{k}: {v.get('reason', '')}"
+                                     for k, v in rows.items())}
+
     def _run_gen_job(self, jid: str, workflow_id: str, params: dict,
                      kind: str,
                      timeout_s: float | None = None) -> tuple[bool, int, str]:
-        """Run one gen job: admit -> claim -> run -> release, then free.
+        """Run one gen job: admit -> prepare_gen -> claim -> run -> release,
+        then free.
 
         ORDER IS POLICY (roadmap §3, the LLM-waiter rule). ``admit_gen`` runs
         BEFORE ``claim``. The predecessor broker checks ``llm_waiters`` at the TOP of
@@ -938,7 +1146,10 @@ class FacadeService:
         second would let a gen job preempt the very chat request that owns the
         lane wake. A refusal is therefore an honest 503 with NO claim side
         effect (the original claim-then-admit order was wrong; the policy rule
-        is the authority).
+        is the authority). ``self.prepare_gen`` runs after admission (a
+        refusal must touch nothing) and before ``claim`` (the claim's plan is
+        computed against the flipped args and the adopted LLM-lane
+        residency).
 
         Every transition is recorded on the job row so ``/v1/videos/{jid}``,
         ``/jobs/{jid}`` and the sync image route all read one source of truth.
@@ -969,6 +1180,12 @@ class FacadeService:
                           or "admission refused: an LLM waiter owns the lane")
                 self._jobs.update(jid, status="failed", error=reason)
                 return False, 503, reason
+            # prepare_gen: per-workload args flip + lane restart + adopt a
+            # live LLM lane (the claim below then stops it and the release
+            # restores it). Fail-soft by contract: its rows are honest, but a
+            # prepare miss degrades to the pre-flip behavior and never sinks
+            # the job (see ``prepare_gen``).
+            self.prepare_gen(workflow_id, kind)
             request = _LoadRequest(model_id=workflow_id, engine="comfyui",
                                    lane=kind, modality=kind)
             claim = self._orchestrator.claim(

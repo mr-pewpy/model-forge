@@ -18,6 +18,8 @@ from model_forge.facade import (
     MODELS_ADVERTISED,
     FacadeConfig,
     FacadeService,
+    comfy_args_for,
+    flip_comfy_args,
     make_handler,
 )
 
@@ -1385,5 +1387,202 @@ def test_video_submit_without_timeout_keeps_runner_history_budget(tmp_path):
         json.dumps({"model": "gen/h3-t2v"}).encode())[1])["id"]
     assert runner.run_inputs[0]["timeout_s"] is None
     assert svc._jobs.get(jid)["status"] == "done"
+
+
+# --- prepare_gen: per-workload args flip, lane restart, LLM-lane adoption ----
+
+class FakeLane:
+    """Fake gen-lane adapter: records probe/release; state configurable."""
+
+    def __init__(self, state="running", log=None):
+        self.state = state
+        self.log = log
+        self.calls = []
+
+    def probe(self):
+        self.calls.append(("probe",))
+        return {"ok": True, "state": self.state}
+
+    def release(self, model_id):
+        self.calls.append(("release", model_id))
+        if self.log is not None:
+            self.log.append("lane_stop")
+        return {"ok": True, "reason": "stopped"}
+
+
+class PrepOrchestrator(FakeOrchestrator):
+    """FakeOrchestrator plus the prepare_gen seams (adapter_for/adopt_live)."""
+
+    def __init__(self, *, lane_state="running", adopt_ok=True, **kw):
+        super().__init__(**kw)
+        self.lane = FakeLane(state=lane_state, log=kw.get("log"))
+        self.adopt_ok = adopt_ok
+        self.adopts = []
+
+    def adapter_for(self, engine):
+        return self.lane if engine == "comfyui" else None
+
+    def adopt_live(self, target_id, model_id, engine, lane="chat"):
+        self.adopts.append((target_id, model_id, engine, lane))
+        self._rec("adopt_live")
+        return {"ok": True, "adopted": self.adopt_ok,
+                "reason": "fake adoption row"}
+
+
+def test_comfy_args_policy_is_video_novram_image_empty():
+    assert comfy_args_for("video") == "--novram"
+    assert comfy_args_for("image") == ""
+    assert comfy_args_for("") == "" and comfy_args_for(None) == ""
+
+
+def test_flip_comfy_args_writes_video_novram_and_clears_for_image(tmp_path):
+    f = tmp_path / "comfy_args.conf"
+    f.write_text("")                              # leftover image-mode state
+    row = flip_comfy_args(str(f), "video")
+    assert row["ok"] is True and row["changed"] is True
+    assert f.read_text().split() == ["--novram"]
+    row = flip_comfy_args(str(f), "image")
+    assert row["ok"] is True and row["changed"] is True
+    assert f.read_text().strip() == ""
+
+
+def test_flip_comfy_args_untouched_when_tokens_already_match(tmp_path):
+    f = tmp_path / "comfy_args.conf"
+    f.write_text("--novram\n")
+    row = flip_comfy_args(str(f), "video")
+    assert row["ok"] is True and row["changed"] is False
+    assert "untouched" in row["reason"]
+
+
+def test_flip_comfy_args_unconfigured_is_honest_noop():
+    row = flip_comfy_args("", "video")
+    assert row["ok"] is True and row["changed"] is False
+    assert "not managed" in row["reason"]
+
+
+def test_flip_comfy_args_write_failure_is_honest_not_a_raise(tmp_path):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    row = flip_comfy_args(str(blocker / "args.conf"), "video")
+    assert row["ok"] is False and row["changed"] is False
+    assert "failed" in row["reason"]
+
+
+def test_prepare_gen_flips_args_restarts_lane_and_adopts_llm_lane(tmp_path):
+    args = tmp_path / "comfy_args.conf"
+    args.write_text("")                           # leftover image-mode state
+    orch = PrepOrchestrator()
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=FakeRunner(),
+                       comfy_args_file=str(args))
+
+    row = svc.prepare_gen("h3-t2v", "video")
+
+    assert row["ok"] is True
+    assert args.read_text().split() == ["--novram"]
+    # the lane was stopped so the claim's load rebinds the new args ...
+    assert ("release", "h3-t2v") in orch.lane.calls
+    # ... and the live LLM lane was adopted for stop/restore by claim/release
+    assert orch.adopts == [("comfy", CHAT_MODEL_ID, "vllm", "chat")]
+
+
+def test_prepare_gen_leaves_lane_alone_when_args_unchanged(tmp_path):
+    args = tmp_path / "comfy_args.conf"
+    args.write_text("--novram\n")                 # already video-mode
+    orch = PrepOrchestrator()
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=FakeRunner(),
+                       comfy_args_file=str(args))
+
+    row = svc.prepare_gen("h3-t2v", "video")
+
+    assert row["ok"] is True
+    assert row["args"]["changed"] is False
+    assert not any(c[0] == "release" for c in orch.lane.calls)
+    # adoption still runs — it keys on the LLM lane, not on the args
+    assert orch.adopts == [("comfy", CHAT_MODEL_ID, "vllm", "chat")]
+
+
+def test_prepare_gen_skips_lane_restart_when_lane_not_running(tmp_path):
+    args = tmp_path / "comfy_args.conf"
+    args.write_text("")
+    orch = PrepOrchestrator(lane_state="stopped")
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=FakeRunner(),
+                       comfy_args_file=str(args))
+
+    row = svc.prepare_gen("h3-t2v", "video")
+
+    assert row["ok"] is True
+    assert args.read_text().split() == ["--novram"]
+    assert not any(c[0] == "release" for c in orch.lane.calls)
+    assert "no restart needed" in row["lane"]["reason"]
+
+
+def test_prepare_gen_without_orchestrator_seams_still_flips(tmp_path):
+    args = tmp_path / "comfy_args.conf"
+    args.write_text("")
+    orch = FakeOrchestrator()       # no adapter_for / adopt_live seams
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=FakeRunner(),
+                       comfy_args_file=str(args))
+
+    row = svc.prepare_gen("h3-t2v", "video")
+
+    assert row["ok"] is True
+    assert args.read_text().split() == ["--novram"]
+    assert "fail-soft" in row["lane"]["reason"]
+    assert "fail-soft" in row["adopt"]["reason"]
+
+
+def test_gen_job_orders_admit_then_prepare_then_claim(tmp_path):
+    log = []
+    args = tmp_path / "comfy_args.conf"
+    args.write_text("--novram")    # video leftover; the image job must clear
+    orch = PrepOrchestrator(log=log)
+    runner = FakeRunner(files=[_write(tmp_path / "shot.png")], log=log)
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner,
+                       dispatch=_inline, comfy_args_file=str(args))
+
+    raw = json.dumps({"model": "gen/qwen-image-2.1", "prompt": "x"}).encode()
+    status, _ = svc.handle_image_generations(raw)
+
+    assert status == 200
+    # admit_gen first (roadmap §3), then prepare_gen's lane stop + adoption,
+    # then claim -> run -> release.
+    assert log.index("admit_gen") < log.index("lane_stop")
+    assert log.index("lane_stop") < log.index("adopt_live")
+    assert (log.index("adopt_live") < log.index("claim") < log.index("run")
+            < log.index("release"))
+    assert args.read_text().strip() == ""
+
+
+def test_video_submit_flips_args_to_novram(tmp_path):
+    args = tmp_path / "comfy_args.conf"
+    args.write_text("")                           # leftover image-mode state
+    orch = PrepOrchestrator()
+    runner = FakeRunner(files=[_write(tmp_path / "v.mp4")])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner,
+                       dispatch=_inline, comfy_args_file=str(args))
+
+    status, _ = svc.handle_video_submit(
+        json.dumps({"model": "gen/h3-t2v", "prompt": "x"}).encode())
+
+    assert status == 200
+    assert args.read_text().split() == ["--novram"]
+    assert ("release", "h3-t2v") in orch.lane.calls
+
+
+def test_gen_job_survives_an_args_write_failure(tmp_path):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    orch = PrepOrchestrator()
+    runner = FakeRunner(files=[_write(tmp_path / "g.png")])
+    svc = _gen_service(tmp_path, orchestrator=orch, runner=runner,
+                       dispatch=_inline,
+                       comfy_args_file=str(blocker / "args.conf"))
+
+    raw = json.dumps({"model": "gen/qwen-image-2.1", "prompt": "x"}).encode()
+    status, _ = svc.handle_image_generations(raw)
+
+    # a failed flip degrades to the pre-flip behavior, never sinks the job
+    assert status == 200
+    assert orch.claims and orch.releases
 
 

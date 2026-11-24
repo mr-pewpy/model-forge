@@ -2349,6 +2349,76 @@ class Orchestrator:
                       f"lane claim (admission alone never claims)",
         }
 
+    def adopt_live(self, target_id, model_id, engine, lane="chat") -> dict:
+        """Record a live-but-unrecorded runtime as resident (provenance
+        ``"external"``) so later plans evict and restore it.
+
+        WHY: the ledger is process-local. A lane started OUTSIDE this
+        process (compose, a human at the shell) is invisible to it, so a
+        gen claim plans NO release step for that lane — it is never stopped
+        — and snapshots an empty restore set, so nothing brings it back
+        afterwards. That is the observed failure mode this seam closes: the
+        LLM lane had to be stopped and restored BY HAND around every gen
+        run. Adopting records the observed runtime as resident BEFORE the
+        claim computes its plan, so the claim's eviction stops the lane and
+        the release's restore phase starts it again — the choreography the
+        planner already implements, fed with an honest picture of reality.
+
+        Honest provenance: the resident is recorded ``"external"`` — this
+        process did not start it (``ResidentRecord.provenance``). Idempotent:
+        an already-recorded residency is left exactly as it is (an existing
+        record is never restamped or downgraded). Fail-soft: a missing model
+        id/engine, an unknown engine, a raising probe, a probe that cannot
+        confirm the runtime is up, or a probe naming a down state adopts
+        nothing (``adopted: False``) — the ledger keeps its honest ignorance
+        rather than inventing a resident. Never raises.
+
+        Returns ``{'ok': True, 'adopted': bool, 'reason': str}``. Adoption
+        is a heal, not a claim: it never starts, stops, or loads anything."""
+        model_id = str(model_id or "").strip()
+        engine = str(engine or "").strip()
+        if not model_id or not engine:
+            return {"ok": True, "adopted": False,
+                    "reason": "nothing to adopt — a model id and an engine "
+                              "name are both required (fail-soft)"}
+        if self._ledger.is_resident(target_id, model_id):
+            return {"ok": True, "adopted": False,
+                    "reason": f"{model_id} is already recorded resident on "
+                              f"{target_id!r} — residency left untouched"}
+        adapter = self._adapters.get(engine)
+        if adapter is None:
+            return {"ok": True, "adopted": False,
+                    "reason": f"no engine adapter registered for {engine!r} "
+                              f"— runtime state cannot be observed "
+                              f"(fail-soft)"}
+        try:
+            probe = adapter.probe()
+        except Exception as e:  # noqa: BLE001 — probes fail soft
+            return {"ok": True, "adopted": False,
+                    "reason": f"probe for {engine!r} raised "
+                              f"{type(e).__name__}: {e} — residency unknown, "
+                              f"not adopted (fail-soft)"}
+        if not isinstance(probe, dict) or not probe.get("ok"):
+            return {"ok": True, "adopted": False,
+                    "reason": f"probe for {engine!r} could not confirm the "
+                              f"runtime state — not adopted (fail-soft)"}
+        state = str(probe.get("state") or "").strip().lower()
+        # Up = the READY_STATES a swap confirms on, plus ``booting`` (a
+        # container that started but never answered healthy still holds
+        # VRAM — exactly what a gen plan must evict).
+        if state not in ("observed", "running", "ready", "booting"):
+            return {"ok": True, "adopted": False,
+                    "reason": f"runtime state is {state or 'unreadable'} — "
+                              f"not up, nothing to adopt"}
+        self._ledger.record_resident(target_id, model_id, engine=engine,
+                                     lane=lane, provenance="external")
+        return {"ok": True, "adopted": True,
+                "reason": f"adopted the live runtime for {model_id} ({engine}"
+                          f", lane {lane!r}) as resident on {target_id!r} "
+                          f"with provenance 'external' — a later claim's "
+                          f"plan will stop it and its release will restore "
+                          f"it"}
+
     # -- gen-busy read (the facade's wait for in-flight gen jobs) --
 
     @property
@@ -2631,6 +2701,16 @@ class Orchestrator:
     def touch(self, target_id, model_id) -> bool:
         """Record a use — keeps the model inside the recency window."""
         return self._ledger.touch(target_id, model_id)
+
+    def adapter_for(self, engine):
+        """The registered engine-lifecycle adapter for ``engine``, or ``None``.
+
+        A read-only accessor so choreography outside the planner (the
+        facade's ``prepare_gen``) can drive one lane's own lifecycle seam
+        (``probe`` / ``release``) without reaching into the orchestrator's
+        private adapter table. An unknown engine is ``None``, never a
+        raise."""
+        return self._adapters.get(str(engine or ""))
 
     def progress(self, key) -> dict | None:
         """The latest progress row for a scope id or pre-warm key."""
