@@ -174,6 +174,80 @@ def start_download(url: str, dest: str, sha256: str = "") -> dict:
             f"job_id={job_id}"}
 
 
+def _run_ollama_pull(job_id: str, model: str, base_url: str,
+                     target_id: str, pull_fn) -> None:
+    state = {
+        "job_id": job_id, "kind": "ollama_pull", "model": model,
+        "endpoint": f"{base_url.rstrip('/')}/api/pull",
+        "target": target_id, "state": "running",
+        "status_text": "starting pull", "done_bytes": 0, "total_bytes": 0,
+    }
+    _write_job(job_id, state)
+
+    def _on_progress(patch: dict) -> None:
+        state.update(patch)
+        _write_job(job_id, state)
+
+    try:
+        res = pull_fn(model, base_url, on_progress=_on_progress)
+        if isinstance(res, dict) and res.get("ok"):
+            state.update(
+                state="done",
+                status_text=str(res.get("status_text") or "success"),
+                done_bytes=int(res.get("done_bytes") or state["done_bytes"]),
+                total_bytes=int(res.get("total_bytes") or state["total_bytes"]),
+            )
+            if target_id and target_id != "local":
+                try:
+                    record_pull_entry(
+                        target_id, model,
+                        path=f"ollama:{model}",
+                        size_bytes=state["total_bytes"] or None,
+                        source=RECORD_OBSERVED,
+                    )
+                except Exception:  # noqa: BLE001 — recording is best-effort
+                    pass
+        else:
+            err = (res.get("error") if isinstance(res, dict)
+                   else "ollama pull failed")
+            state.update(state="error", error=str(err or "ollama pull failed"))
+    except Exception as exc:  # noqa: BLE001 — job file records the failure
+        state.update(state="error", error=f"{type(exc).__name__}: {exc}")
+    _write_job(job_id, state)
+
+
+def start_ollama_pull(model: str, base_url: str, *, target_id: str = "local",
+                      pull_fn=None) -> dict:
+    """Kick an Ollama /api/pull streaming job in a background thread; pollable
+    via ``job_status(job_id)`` like file downloads."""
+    name = str(model or "").strip()
+    root = str(base_url or "").strip().rstrip("/")
+    if not name:
+        return {"ok": False, "error": "model name is required"}
+    if not (root.startswith("http://") or root.startswith("https://")):
+        return {"ok": False, "error": "base_url must be http(s)"}
+    if pull_fn is None:
+        from .engines.llamacpp import ollama_pull_stream
+        pull_fn = ollama_pull_stream
+    job_id = uuid.uuid4().hex[:12]
+    _write_job(job_id, {
+        "job_id": job_id, "kind": "ollama_pull", "model": name,
+        "endpoint": f"{root}/api/pull", "target": target_id,
+        "state": "starting", "status_text": "queued",
+        "done_bytes": 0, "total_bytes": 0,
+    })
+    threading.Thread(
+        target=_run_ollama_pull,
+        args=(job_id, name, root, target_id, pull_fn),
+        daemon=True,
+    ).start()
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "poll": f"model_forge_install with job_id={job_id}",
+    }
+
+
 # --- pull records (B10): what weights are known present where ---------------
 #
 # The local target's weights are read from the storage scan every time. A

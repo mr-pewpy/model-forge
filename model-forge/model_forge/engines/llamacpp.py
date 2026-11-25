@@ -56,6 +56,79 @@ def _probe_root(root: str) -> EngineStatus | None:
     return None
 
 
+OLLAMA_DEFAULT_ROOT = "http://127.0.0.1:11434"
+
+
+def ollama_endpoint(base_url: str = "") -> str:
+    """Resolve an Ollama root URL: explicit base_url, else a live local
+    Ollama instance on PROBE_PORTS, else the default port 11434."""
+    if base_url:
+        return root_url(base_url)
+    for port in (11434, 8080, 8081, 8000, 8001):
+        root = f"http://127.0.0.1:{port}"
+        tags = _get_json(f"{root}/api/tags")
+        if isinstance(tags, dict) and "models" in tags:
+            return root
+    return OLLAMA_DEFAULT_ROOT
+
+
+def ollama_pull_stream(model: str, base_url: str = "", *, on_progress=None,
+                       timeout: float = 300.0) -> dict:
+    """POST /api/pull on an Ollama endpoint and consume NDJSON progress lines.
+
+    Reports honest status/byte progress via ``on_progress(dict)`` as Ollama
+    streams layers. Returns ``{"ok": True, ...}`` on completion or
+    ``{"ok": False, "error": ...}`` on failure — never raises."""
+    name = str(model or "").strip()
+    if not name:
+        return {"ok": False, "error": "model name is required"}
+    root = root_url(base_url) or OLLAMA_DEFAULT_ROOT
+    body = json.dumps({"name": name, "stream": True}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{root}/api/pull", data=body, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    last_status = ""
+    done_bytes = 0
+    total_bytes = 0
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                try:
+                    frame = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(frame, dict):
+                    continue
+                if frame.get("error"):
+                    return {"ok": False, "model": name, "endpoint": root,
+                            "done_bytes": done_bytes,
+                            "total_bytes": total_bytes,
+                            "error": str(frame["error"])}
+                if frame.get("status"):
+                    last_status = str(frame["status"])
+                if isinstance(frame.get("completed"), (int, float)):
+                    done_bytes = int(frame["completed"])
+                if isinstance(frame.get("total"), (int, float)):
+                    total_bytes = int(frame["total"])
+                if callable(on_progress):
+                    on_progress({
+                        "status_text": last_status,
+                        "done_bytes": done_bytes,
+                        "total_bytes": total_bytes,
+                    })
+        return {"ok": True, "model": name, "endpoint": root,
+                "status_text": last_status or "success",
+                "done_bytes": done_bytes, "total_bytes": total_bytes}
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return {"ok": False, "model": name, "endpoint": root,
+                "done_bytes": done_bytes, "total_bytes": total_bytes,
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
 def detect(base_url: str = "") -> EngineStatus:
     if base_url:
         root = root_url(base_url)

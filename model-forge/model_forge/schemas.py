@@ -61,6 +61,13 @@ BROWSE = {
                     "See model_forge_status for the list."
                 ),
             },
+            "query": {
+                "type": "string",
+                "description": (
+                    "Optional keyword search across curated entries and the "
+                    "live HuggingFace catalog (e.g. 'qwen', 'flux', 'ltx')."
+                ),
+            },
             "fresh": {
                 "type": "boolean",
                 "description": (
@@ -160,9 +167,12 @@ TARGET_ADD = {
 INSTALL = {
     "name": "model_forge_install",
     "description": (
-        "Pull/download a model on a compute target. Maya targets download "
-        "over HTTP with progress; Strata targets get the exact `strata "
-        "launch` command to run there; GGUF chat models defer to Hermes' "
+        "Pull/download a model on a compute target. Ollama targets pull "
+        "directly over HTTP (/api/pull with byte progress — supports Ollama "
+        "tags and hf.co/<owner>/<repo>); Maya targets pull over HTTP; ComfyUI/"
+        "vLLM/SGLang pull Hugging Face weights with resume and progress; "
+        "Strata targets get the exact `strata launch` command; Exo targets "
+        "use engine-native placement; GGUF chat models defer to Hermes' "
         "built-in Local Models. Or provision an inference engine with "
         "action='engine_install': the plan shows the vendor's exact "
         "official install command (Ollama, Strata, Project Maya) and it "
@@ -171,8 +181,8 @@ INSTALL = {
         "core's managed runtime. action='mark_installed' records weights "
         "present on a remote target (engine-observed or user-confirmed) so "
         "the swap pre-flight trusts them there. Use when the user wants a "
-        "model from model_forge_browse downloaded, an engine installed, or "
-        "a remote install acknowledged."
+        "model from model_forge_browse or Hugging Face downloaded, an engine "
+        "installed, or a remote install acknowledged."
     ),
     "parameters": {
         "type": "object",
@@ -343,11 +353,26 @@ ACTIVATE = {
         "properties": {
             "model_id": {
                 "type": "string",
-                "description": "Registry model id from model_forge_browse.",
+                "description": (
+                    "Registry model id from model_forge_browse, or any live-"
+                    "served model id currently advertised by a running engine "
+                    "on target."
+                ),
             },
             "target": {
                 "type": "string",
                 "description": "Compute target id (default 'local').",
+            },
+            "surface": {
+                "type": "string",
+                "enum": ["auto", "chat", "vision", "image", "video"],
+                "description": (
+                    "Which Hermes surface to wire: 'auto' (default, inferred "
+                    "from model modality), 'chat' (model.* + custom_providers), "
+                    "'vision' (auxiliary.vision + chat/custom_providers), "
+                    "'image' (image_gen.provider + model-forge-image settings), "
+                    "or 'video' (video_gen.provider + model-forge-video settings)."
+                ),
             },
             "engine_model": {
                 "type": "string",

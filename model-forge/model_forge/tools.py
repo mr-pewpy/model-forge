@@ -222,6 +222,190 @@ def write_auxiliary_vision(model: str, base_url: str) -> dict:
     return dict(vision)
 
 
+_MEDIA_SURFACE_MAP = {
+    "image": ("image_gen", "model-forge-image"),
+    "video": ("video_gen", "model-forge-video"),
+}
+
+
+def write_media_provider_config(surface: str, *, base_url: str,
+                                default_model: str = "") -> dict:
+    """Wire Hermes' ``image_gen`` or ``video_gen`` provider to the companion
+    Model Forge media backend plugin and record its endpoint/default model in
+    ``plugins.entries.<plugin>.settings`` in one in-process config save.
+
+    Raises on invalid surface or config failure — callers report the failure
+    honestly instead of hiding it."""
+    spec = _MEDIA_SURFACE_MAP.get(surface)
+    if spec is None:
+        raise ValueError(f"unsupported media surface: {surface!r}")
+    section_key, plugin_key = spec
+    from hermes_cli.config import load_config, save_config
+    cfg = load_config()
+    section = cfg.get(section_key)
+    if not isinstance(section, dict):
+        section = {}
+    section["provider"] = _MEDIA_PROVIDER_NAME
+    cfg[section_key] = section
+
+    plugins = cfg.get("plugins")
+    if not isinstance(plugins, dict):
+        plugins = {}
+    entries = plugins.get("entries")
+    if not isinstance(entries, dict):
+        entries = {}
+    entry = entries.get(plugin_key)
+    if not isinstance(entry, dict):
+        entry = {}
+    settings = entry.get("settings")
+    if not isinstance(settings, dict):
+        settings = {}
+    settings["base_url"] = base_url
+    if default_model:
+        settings["default_model"] = default_model
+    entry["settings"] = settings
+    entries[plugin_key] = entry
+    plugins["entries"] = entries
+    cfg["plugins"] = plugins
+    save_config(cfg)
+    return {
+        "surface": surface,
+        "provider_key": f"{section_key}.provider",
+        "provider": _MEDIA_PROVIDER_NAME,
+        "plugin": plugin_key,
+        "base_url": base_url,
+        "default_model": settings.get("default_model", ""),
+    }
+
+
+def _read_active_wiring() -> dict:
+    """Read-only, secret-free summary of what Hermes is currently wired to:
+    default chat model/provider, auxiliary vision, image_gen/video_gen backends,
+    and custom_providers names. Never raises and never returns credentials."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+    except Exception:  # noqa: BLE001 — fail soft outside Hermes
+        return {"ok": False}
+    model_sec = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    aux = cfg.get("auxiliary") if isinstance(cfg.get("auxiliary"), dict) else {}
+    vis = aux.get("vision") if isinstance(aux.get("vision"), dict) else {}
+    img = cfg.get("image_gen") if isinstance(cfg.get("image_gen"), dict) else {}
+    vid = cfg.get("video_gen") if isinstance(cfg.get("video_gen"), dict) else {}
+    entries = ((cfg.get("plugins") or {}).get("entries") or {})
+    if not isinstance(entries, dict):
+        entries = {}
+    img_settings = ((entries.get("model-forge-image") or {}).get("settings")
+                    or {})
+    vid_settings = ((entries.get("model-forge-video") or {}).get("settings")
+                    or {})
+    cps = cfg.get("custom_providers")
+    cp_rows = []
+    if isinstance(cps, list):
+        for r in cps:
+            if isinstance(r, dict) and r.get("name"):
+                models = r.get("models")
+                model_names = (list(models.keys()) if isinstance(models, dict)
+                               else list(models) if isinstance(models, list)
+                               else [])
+                cp_rows.append({
+                    "name": str(r.get("name", "")),
+                    "base_url": str(r.get("base_url", "")),
+                    "models": model_names[:12],
+                })
+    return {
+        "ok": True,
+        "chat": {
+            "model": str(model_sec.get("default") or ""),
+            "provider": str(model_sec.get("provider") or ""),
+            "base_url": str(model_sec.get("base_url") or ""),
+        },
+        "vision": {
+            "model": str(vis.get("model") or ""),
+            "base_url": str(vis.get("base_url") or ""),
+        },
+        "image": {
+            "provider": str(img.get("provider") or ""),
+            "base_url": str(img_settings.get("base_url") or ""),
+            "default_model": str(img_settings.get("default_model") or ""),
+        },
+        "video": {
+            "provider": str(vid.get("provider") or ""),
+            "base_url": str(vid_settings.get("base_url") or ""),
+            "default_model": str(vid_settings.get("default_model") or ""),
+        },
+        "custom_providers": cp_rows,
+    }
+
+
+ENGINE_CATALOG: tuple[dict, ...] = (
+    {
+        "id": "llamacpp",
+        "name": "llama.cpp (Hermes Local)",
+        "modalities": ["chat", "vision"],
+        "default_port": 8080,
+        "install_mode": "core_managed",
+        "summary": "Built into Hermes Local Models for GGUF chat and vision.",
+    },
+    {
+        "id": "ollama",
+        "name": "Ollama",
+        "modalities": ["chat", "vision", "ocr"],
+        "default_port": 11434,
+        "install_mode": "approved_installer",
+        "summary": "Easiest local model runner with one-step pulls (tags and hf.co GGUFs).",
+    },
+    {
+        "id": "vllm",
+        "name": "vLLM / vLLM-Omni",
+        "modalities": ["chat", "vision", "ocr", "image", "image_edit"],
+        "default_port": 8000,
+        "install_mode": "connect_or_manual",
+        "summary": "High-throughput GPU server for chat, vision, OCR, and Omni image generation.",
+    },
+    {
+        "id": "sglang",
+        "name": "SGLang / Diffusion",
+        "modalities": ["chat", "vision", "image", "image_edit"],
+        "default_port": 30000,
+        "install_mode": "connect_or_manual",
+        "summary": "Fast GPU serving for chat, vision, and SGLang Diffusion image editing.",
+    },
+    {
+        "id": "comfyui",
+        "name": "ComfyUI",
+        "modalities": ["image", "image_edit", "video", "3d"],
+        "default_port": 8188,
+        "install_mode": "connect_or_manual",
+        "summary": "Visual workflow engine for local image, image-edit, video, and 3D generation.",
+    },
+    {
+        "id": "strata",
+        "name": "Strata",
+        "modalities": ["chat", "vision"],
+        "default_port": 8080,
+        "install_mode": "approved_installer",
+        "summary": "Streams large MoE models from RAM to consumer GPUs and Apple Silicon.",
+    },
+    {
+        "id": "maya",
+        "name": "Project Maya",
+        "modalities": ["chat", "vision", "ocr"],
+        "default_port": 8080,
+        "install_mode": "approved_installer",
+        "summary": "Multi-GPU MoE server with auto-swapping models and HTTP pulls.",
+    },
+    {
+        "id": "exo",
+        "name": "Exo",
+        "modalities": ["chat", "vision", "ocr"],
+        "default_port": 52415,
+        "install_mode": "connect_or_manual",
+        "summary": "Distributed local inference cluster across machines on your network.",
+    },
+)
+
+
 # Engine provisioning: the vendor-official installers Model Forge's
 # engine_install action may plan and run. The command is never model-supplied
 # — only these fixed, PINNED specs can execute, and only after the
@@ -538,9 +722,45 @@ def policy_hook(tool_name: str, args: dict | None = None, task_id: str = "",
     if tool_name == "model_forge_activate" and args.get("apply") is True:
         slug = custom_provider_slug_for(str(args.get("target") or "local"))
         shown_engine_model = args.get("engine_model") or "(registry default)"
-        return {
-            "action": "approve",
-            "message": (
+        surface = str(args.get("surface") or "auto").strip().lower() or "auto"
+        requested_mid = str(args.get("model_id") or "").strip()
+        if surface == "auto" and requested_mid:
+            curated = next((m for m in models_for() if m.id == requested_mid),
+                           None)
+            if curated is not None:
+                if curated.modality in ("image", "image_edit"):
+                    surface = "image"
+                elif curated.modality == "video":
+                    surface = "video"
+                elif curated.modality == "vision":
+                    surface = "vision"
+        if surface in _MEDIA_SURFACE_MAP:
+            sec_key, plug_key = _MEDIA_SURFACE_MAP[surface]
+            msg = (
+                f"Model Forge wants to wire Hermes' {sec_key} backend to "
+                f"this endpoint ({sec_key}.provider = {_MEDIA_PROVIDER_NAME} "
+                f"and plugins.entries.{plug_key}.settings base_url / "
+                "default_model):\n"
+                f"  surface: {surface}\n"
+                f"  model_id: {args.get('model_id')}\n"
+                f"  target: {args.get('target') or 'local'}\n"
+                f"  engine_model: {shown_engine_model}"
+            )
+        elif surface == "vision":
+            msg = (
+                "Model Forge wants to rewrite your default model config "
+                "(model.default, model.provider, base_url), register the "
+                "custom_providers entry " + slug + " (declaring the served "
+                "model), and point auxiliary.vision (model + base_url) at "
+                "this endpoint:\n"
+                f"  model_id: {args.get('model_id')}\n"
+                f"  target: {args.get('target') or 'local'}\n"
+                f"  engine_model: {shown_engine_model}\n"
+                f"  custom_providers: {slug} (declares the served model id)\n"
+                f"  auxiliary.vision: model + base_url"
+            )
+        else:
+            msg = (
                 "Model Forge wants to rewrite your default model config "
                 "(model.default, model.provider, base_url) and register the "
                 "custom_providers entry " + slug + " (declaring the served "
@@ -550,7 +770,11 @@ def policy_hook(tool_name: str, args: dict | None = None, task_id: str = "",
                 f"  target: {args.get('target') or 'local'}\n"
                 f"  engine_model: {shown_engine_model}\n"
                 f"  custom_providers: {slug} (declares the served model "
-                f"id)"),
+                f"id)"
+            )
+        return {
+            "action": "approve",
+            "message": msg,
             "rule_key": "model-forge:activate",
         }
     if tool_name == "model_forge_install" \
@@ -893,6 +1117,50 @@ def install_plan(entry: ModelEntry, target: ComputeTarget,
                             "Hermes' built-in Local Models pane (Settings -> "
                             "Providers -> Local Models, or `hermes model`); "
                             "Model Forge does not duplicate it")
+    if chosen == "ollama":
+        pull_name = engine_model.strip()
+        if not pull_name:
+            src = str(entry.source or "").strip()
+            if src.startswith("hf.co/"):
+                pull_name = src
+            elif "/" in src:
+                pull_name = "hf.co/" + src
+            else:
+                pull_name = src or entry.id
+        if available_engines is None or "ollama" in available_engines:
+            ep = (llamacpp_adapter.OLLAMA_DEFAULT_ROOT
+                  if target.kind == "local"
+                  else root_url(target.base_url))
+            return _plan(
+                ok=True, action="ollama_pull",
+                model=pull_name,
+                endpoint=ep + "/api/pull",
+                command=["ollama", "pull", pull_name],
+                detail="POST /api/pull (streaming NDJSON progress job); "
+                       "supports Ollama tags and hf.co/<owner>/<repo>",
+            )
+        return _plan(
+            ok=True, action="run_cli_on_target",
+            model=pull_name,
+            command=["ollama", "pull", pull_name],
+            detail=(f"Ollama was not detected on {target.label} — start "
+                    "Ollama (or install it with model_forge_install "
+                    "action='engine_install', engine='ollama') and run this "
+                    "pull"),
+        )
+    if chosen == "exo":
+        exo_model = (engine_model or entry.source or entry.id).strip()
+        ep = ("http://127.0.0.1:52415" if target.kind == "local"
+              else root_url(target.base_url))
+        return _plan(
+            ok=True, action="exo_place",
+            model=exo_model,
+            endpoint=ep + "/place_instance",
+            detail=("Exo downloads and places models engine-natively; run "
+                    "model_forge_broker action='claim' model_id="
+                    f"{entry.id!r} (or POST {ep}/place_instance) to pull and "
+                    "load it on the Exo cluster"),
+        )
     if chosen == "maya":
         if not engine_model:
             return _plan(ok=False, action="needs_engine_model",
@@ -952,7 +1220,8 @@ def install_plan(entry: ModelEntry, target: ComputeTarget,
 
 
 def activation_plan(entry: ModelEntry, target: ComputeTarget,
-                    available_engines: list[str], engine_model: str = "") -> dict:
+                    available_engines: list[str], engine_model: str = "",
+                    surface: str = "auto") -> dict:
     """What model_forge_activate would do — no side effects (unit-tested)."""
     if entry.id in _CATALOG_MARKER_IDS:
         return {"ok": False, "action": "placeholder_not_activatable",
@@ -967,11 +1236,51 @@ def activation_plan(entry: ModelEntry, target: ComputeTarget,
                 "detail": f"'{entry.id}' is a placeholder entry — no engine "
                           "serves this modality yet, so it cannot become the "
                           "default model. Activate a concrete served model"}
-    if entry.modality not in _CHAT_MODALITIES:
-        return {"ok": False, "action": "not_a_chat_model",
-                "detail": f"{entry.modality} models activate through their "
-                          "own provider surface (image_gen/video_gen), not "
-                          "as the chat model"}
+    surf = str(surface or "auto").strip().lower() or "auto"
+    if surf == "auto":
+        if entry.modality in ("image", "image_edit"):
+            surf = "image"
+        elif entry.modality == "video":
+            surf = "video"
+        elif entry.modality == "vision":
+            surf = "vision"
+        elif entry.modality in _CHAT_MODALITIES:
+            surf = "chat"
+        else:
+            return {"ok": False, "action": "not_a_chat_model",
+                    "detail": f"{entry.modality} models activate through "
+                              "their own provider surface (image_gen/"
+                              "video_gen/model_forge_generate_media), not "
+                              "as the chat model"}
+    if surf in _MEDIA_SURFACE_MAP:
+        sec_key, plug_key = _MEDIA_SURFACE_MAP[surf]
+        engine = next((e for e in entry.engines if e in available_engines), "")
+        if not engine and "openai-compatible" in available_engines:
+            engine = "openai-compatible"
+        if not engine:
+            return {"ok": False, "action": "engine_not_running",
+                    "detail": f"none of {list(entry.engines)} answered at "
+                              f"{target.base_url} — install/serve first"}
+        served = engine_model or native_id_for(entry.id, engine)
+        base_v1 = root_url(target.base_url) + "/v1"
+        return {
+            "ok": True,
+            "action": "persist_media_provider",
+            "surface": surf,
+            "provider": _MEDIA_PROVIDER_NAME,
+            "plugin": plug_key,
+            "config_key": f"{sec_key}.provider",
+            "model": served,
+            "base_url": base_v1,
+            "engine": engine,
+            "detail": (f"sets {sec_key}.provider = {_MEDIA_PROVIDER_NAME} "
+                       f"and points {plug_key} at {base_v1} "
+                       f"(default_model={served}); " + _NEXT_SESSION_NOTE),
+        }
+    if surf not in ("chat", "vision"):
+        return {"ok": False, "action": "invalid_surface",
+                "detail": f"unknown surface {surf!r}; valid surfaces: "
+                          "['auto', 'chat', 'vision', 'image', 'video']"}
     engine = next((e for e in entry.engines if e in available_engines), "")
     if not engine and "openai-compatible" in available_engines:
         # A generic endpoint can serve any of this entry's engines (remote
@@ -987,9 +1296,10 @@ def activation_plan(entry: ModelEntry, target: ComputeTarget,
     slug = custom_provider_slug_for(target.id)
     cp_entry = custom_provider_entry(model_id, name=custom_provider_name(target.id),
                                      base_url=base_v1)
-    return {
+    plan = {
         "ok": True,
         "action": "persist_model_selection",
+        "surface": surf,
         "provider": provider,
         "model": model_id,
         "base_url": base_v1,
@@ -1007,6 +1317,15 @@ def activation_plan(entry: ModelEntry, target: ComputeTarget,
                   "(declaring '" + model_id + "') so /model can switch to "
                   "it; " + _NEXT_SESSION_NOTE),
     }
+    if surf == "vision":
+        plan["auxiliary_vision"] = {
+            "model": model_id,
+            "base_url": base_v1,
+            "applied": False,
+            "write": ("points auxiliary.vision (model + base_url) at "
+                      + base_v1 + " for native image understanding"),
+        }
+    return plan
 
 
 # --- facade activation: the two Hermes consumer surfaces (P5c C2) -----------
@@ -1508,6 +1827,16 @@ def model_forge_browse(args: dict | None = None, **kwargs) -> str:
         available = [e.id for e in _detect(base) if e.available]
         entries = models_for(modality=modality,
                              engine=args.get("engine") or None)
+        query = str(args.get("query") or "").strip()
+        if query:
+            ql = query.lower()
+            entries = [
+                m for m in entries
+                if ql in m.id.lower() or ql in m.name.lower()
+                or ql in (m.source or "").lower()
+                or ql in (m.note or "").lower()
+                or ql in (m.modality or "").lower()
+            ]
         out = {
             "target": target.id,
             "hardware_budget_gb": hw.budget_gb,
@@ -1518,6 +1847,8 @@ def model_forge_browse(args: dict | None = None, **kwargs) -> str:
                     "chat models: use Hermes' built-in Local Models pane "
                     "(hardware-priced catalog).",
         }
+        if query:
+            out["query"] = query
         invitation = pointing_invitation(
             load_targets(),
             _hw_for_target(next((t for t in load_targets()
@@ -1553,7 +1884,9 @@ def _fresh_section(args: dict, entries: list[ModelEntry]) -> dict:
                           "curated catalog only.",
         }
     from . import discovery
-    res = discovery.fresh_models(args.get("modality") or None)
+    query = str(args.get("query") or "").strip()
+    res = (discovery.fresh_models(args.get("modality") or None, query=query)
+           if query else discovery.fresh_models(args.get("modality") or None))
     if res.get("live_discovery") != "ok":
         return {
             "live_discovery": res.get("live_discovery", "unavailable"),
@@ -1959,8 +2292,21 @@ def model_forge_install(args: dict | None = None, **kwargs) -> str:
         if not model_id:
             return _dump({"error": "model_id required (or job_id to poll a "
                                    "download)"})
+        engine_arg = str(args.get("engine", "")).strip()
         entry = next((m for m in models_for() if m.id == model_id), None)
         vet = None
+        if entry is None and engine_arg in ("ollama", "exo"):
+            # Engine-native pull/placement for any Ollama tag / hf.co repo
+            # or Exo model id — validate no control chars, fail closed.
+            if any(ord(c) < 32 for c in model_id) or len(model_id) > 200:
+                return _dump({"ok": False, "action": "install_refused",
+                              "model_id": model_id,
+                              "error": "invalid model_id for engine pull"})
+            entry = ModelEntry(
+                id=model_id, name=model_id, modality="chat",
+                engines=(engine_arg,), source=model_id, status="known",
+                note=f"direct {engine_arg} model pull",
+            )
         if entry is None:
             # A1: not a curated id — vet the LIVE row (file resolution + honest
             # size-based fit + engine candidates) before it may be installed.
@@ -1977,13 +2323,13 @@ def model_forge_install(args: dict | None = None, **kwargs) -> str:
         if target is None:
             return _dump({"error": f"unknown target: {args.get('target')}"})
         base = "" if target.kind == "local" else target.base_url
-        available = [e.id for e in _detect(base) if e.available]
+        statuses = _detect(base)
+        available = [e.id for e in statuses if e.available]
         engine_model = str(args.get("engine_model") or "")
         if vet is not None and not engine_model:
             # The vet already resolved the primary weights file — use it rather
             # than re-fetching the repo file list in the auto-resolve below.
             engine_model = vet["resolution"].get("file", "")
-        engine_arg = str(args.get("engine", ""))
         plan = install_plan(entry, target, engine_model=engine_model,
                             engine=engine_arg, available_engines=available)
         if (plan.get("action") == "needs_engine_model"
@@ -2006,7 +2352,21 @@ def model_forge_install(args: dict | None = None, **kwargs) -> str:
             else:
                 plan.update({k: v for k, v in resolved.items()
                              if k not in ("engine", "engine_note")})
-        if plan.get("action") == "maya_pull":
+        if plan.get("action") == "ollama_pull":
+            ollama_row = next(
+                (e for e in statuses if e.id == "ollama" and e.available),
+                None,
+            )
+            ep = (ollama_row.endpoint
+                  if ollama_row is not None and ollama_row.endpoint
+                  else (llamacpp_adapter.OLLAMA_DEFAULT_ROOT
+                        if target.kind == "local"
+                        else root_url(target.base_url)))
+            plan["endpoint"] = root_url(ep) + "/api/pull"
+            started = pull.start_ollama_pull(
+                plan["model"], root_url(ep), target_id=target.id)
+            plan.update(started)
+        elif plan.get("action") == "maya_pull":
             result = maya_adapter.pull(plan["model"], detach=True,
                                        base_url=target.base_url)
             if result is None:
@@ -2058,34 +2418,56 @@ def model_forge_install(args: dict | None = None, **kwargs) -> str:
         return _err(exc)
 
 
-def model_forge_activate(args: dict | None = None, **kwargs) -> str:
-    """Connect a running chat/vision model as THIS Hermes' default model.
+def _live_served_entry(requested: str, statuses: list,
+                       surface: str = "auto") -> ModelEntry | None:
+    """When ``requested`` is not in the curated registry, accept it if a live
+    detected engine on the target ACTUALLY advertises that exact model id in
+    ``models_loaded`` — fail closed (None) for anything unserved."""
+    wanted = requested.strip()
+    if not wanted:
+        return None
+    for st in statuses:
+        if not st.available:
+            continue
+        loaded = [str(m).strip() for m in (st.models_loaded or ()) if m]
+        if wanted in loaded:
+            mod = surface if surface in ("chat", "vision", "image", "video") else "chat"
+            return ModelEntry(
+                id=wanted, name=wanted, modality=mod,
+                engines=(st.id,), source=wanted, status="known",
+                note=f"live-served by {st.display_name}",
+            )
+    return None
 
-    Safe by default: pass apply=true to actually write model.* config
-    (takes effect next session; revert with `hermes model`).
+
+def model_forge_activate(args: dict | None = None, **kwargs) -> str:
+    """Connect a running chat/vision/image/video model into Hermes.
+
+    Safe by default: pass apply=true to actually write config (behind the
+    human-approval gate; takes effect next session; revert with `hermes model`).
+
+    Supports curated registry models AND any live-served model currently
+    advertised by a running engine on the target (fail-closed if unserved).
+    For chat/vision models, writes model.* + custom_providers (+ auxiliary.vision
+    for vision). For image/video models (or surface='image'|'video'), wires
+    image_gen/video_gen.provider='model-forge' and the companion backend plugin
+    endpoint/default_model in-process via hermes_cli.config.
 
     Pass facade=true when the target is an OpenAI-compatible model-forge
     facade: the plan and apply then cover BOTH config surfaces the live
     consumers read — the index-addressed ``custom_providers`` entry (model
     list refreshed from the target's ``/v1/models`` when reachable, fail-soft
     otherwise) AND ``auxiliary.vision`` (model + base_url for the vision lane).
-    A legacy alias in the requested/served model id is written as its CANONICAL
-    id (the facade resolves aliases anyway; config names what /v1/models
-    advertises). Engine-native activations are unchanged. For facade=true a
-    registry-less id is also accepted when the TARGET's own /v1/models catalog
-    advertises it (or aliases.resolve maps it to a cataloged id) — fail-closed,
-    an honest refusal otherwise.
-
-    Tests exercise the REAL write path against real ``hermes_cli.config``
-    load/save semantics (an isolated config in a temp home); the two facade
-    surfaces are written IN-PROCESS, never through dotted ``hermes config set``
-    CLI calls. The human-approval gate (policy_hook, apply=true) is
-    unchanged."""
+    """
     args = args or {}
     try:
         requested = str(args.get("model_id") or "").strip()
         if not requested:
             return _dump({"error": "model_id required"})
+        surface = str(args.get("surface") or "auto").strip().lower() or "auto"
+        target = get_target(args.get("target"))
+        if target is None:
+            return _dump({"error": f"unknown target: {args.get('target')}"})
         # A legacy alias resolves to its canonical id first (identity for a
         # canonical id): the registry is keyed on canonical ids and the config
         # should name the canonical id the facade advertises.
@@ -2095,29 +2477,46 @@ def model_forge_activate(args: dict | None = None, **kwargs) -> str:
             entry = next((m for m in models_for() if m.id == requested), None)
         if entry is None and args.get("facade") is True:
             # P5 §8: a facade activation may name a CATALOG id the curated
-            # registry has no entry for (the facade chat id
-            # Qwen/Qwen3.8-27B-FP8). Accept exactly what the target's own
+            # registry has no entry for. Accept exactly what the target's own
             # /v1/models advertises (or what an alias resolves to there) —
             # fail-closed, with an honest refusal for anything else.
-            catalog_target = get_target(args.get("target"))
-            if catalog_target is None:
-                return _dump({"error": f"unknown target: {args.get('target')}"})
-            entry, refusal = _facade_catalog_entry(requested, catalog_target)
+            entry, refusal = _facade_catalog_entry(requested, target)
             if entry is None:
                 return _dump({"error": refusal})
-        if entry is None:
-            return _dump({"error": f"unknown model_id: {requested}"})
-        target = get_target(args.get("target"))
-        if target is None:
-            return _dump({"error": f"unknown target: {args.get('target')}"})
         base = "" if target.kind == "local" else target.base_url
         statuses = _detect(base)
+        if entry is None:
+            entry = _live_served_entry(requested, statuses, surface=surface)
+            if entry is None and model_id != requested:
+                entry = _live_served_entry(model_id, statuses, surface=surface)
+        if entry is None:
+            return _dump({"error": f"unknown model_id: {requested}"})
         available = [e.id for e in statuses if e.available]
-        plan = activation_plan(entry, target, available,
-                               engine_model=str(args.get("engine_model", "")))
-        if plan.get("ok"):
+        # On the local target, prefer the matched engine's real probed endpoint
+        # (e.g. Ollama :11434, vLLM :8000, SGLang :30000, Exo :52415) over the
+        # generic :8080 placeholder so activation wires to the actual server.
+        effective_target = target
+        if target.kind == "local":
+            matched_st = next(
+                (st for st in statuses
+                 if st.available and st.endpoint
+                 and (st.id in entry.engines or st.id == "openai-compatible")),
+                None,
+            )
+            if matched_st is not None and matched_st.endpoint:
+                effective_target = ComputeTarget(
+                    id=target.id, label=target.label,
+                    base_url=matched_st.endpoint, kind=target.kind,
+                    vram_gb=target.vram_gb, ram_gb=target.ram_gb,
+                    note=target.note, vram_source=target.vram_source,
+                    ram_source=target.ram_source,
+                )
+        plan = activation_plan(entry, effective_target, available,
+                               engine_model=str(args.get("engine_model", "")),
+                               surface=surface)
+        if plan.get("ok") and plan.get("action") == "persist_model_selection":
             mods = {m for e in statuses if e.available for m in e.modalities}
-            root = root_url(target.base_url)
+            root = root_url(effective_target.base_url)
             base_v1 = root + "/v1"
             media = {}
             withheld = []
@@ -2150,75 +2549,97 @@ def model_forge_activate(args: dict | None = None, **kwargs) -> str:
                     "endpoint serves that route): " + "; ".join(withheld))
         # A facade target covers BOTH consumer surfaces: the index-addressed
         # custom_providers entry and auxiliary.vision (see _facade_plan_surfaces).
-        if plan.get("ok") and args.get("facade") is True:
+        if plan.get("ok") and args.get("facade") is True \
+                and plan.get("action") == "persist_model_selection":
             _facade_plan_surfaces(plan,
                                   providers=_current_custom_providers())
         if plan.get("ok"):
             if args.get("apply") is True:
-                try:
-                    from hermes_cli.model_setup import persist_model_selection
-                    saved = persist_model_selection(
-                        plan["model"], plan["provider"],
-                        base_url=plan["base_url"],
-                        api_mode=_CUSTOM_PROVIDER_API_MODE)
-                    plan["applied"] = True
-                    plan["saved_model_section"] = saved
-                except Exception as exc:
-                    plan["applied"] = False
-                    plan["error"] = f"{type(exc).__name__}: {exc}"
-                # The custom_providers registration is its own honest write:
-                # a failure here is reported beside the model-section state,
-                # never folded into it.
-                if plan.get("facade"):
-                    # Both consumer surfaces are written IN-PROCESS through the
-                    # SAME hermes_cli.config load/save API the non-facade path
-                    # uses. Index-addressed `hermes config set` writes cannot be
-                    # used: the CLI splits a key on '.' (a canonical model id
-                    # like Qwen/Qwen3.8-27B-FP8 shatters into nested keys) and
-                    # cannot grow a list (a fresh config becomes an unread
-                    # MAPPING {'0': {...}}, appending at len(rows) raises
-                    # IndexError). Each surface keeps its own honest
-                    # applied/error state.
+                if plan.get("action") == "persist_media_provider":
                     try:
-                        plan["custom_provider"]["saved"] = \
-                            write_custom_provider_entry(
-                                plan["custom_provider"]["entry"])
-                        plan["custom_provider"]["applied"] = True
+                        saved = write_media_provider_config(
+                            plan["surface"],
+                            base_url=plan["base_url"],
+                            default_model=plan.get("model", ""),
+                        )
+                        plan["applied"] = True
+                        plan["saved_media_config"] = saved
+                        plan["config_writes"] = [
+                            {"key": saved["provider_key"],
+                             "value": saved["provider"], "ok": True},
+                            {"key": f"plugins.entries.{saved['plugin']}.settings.base_url",
+                             "value": saved["base_url"], "ok": True},
+                        ]
                     except Exception as exc:  # noqa: BLE001 — honest state
-                        plan["custom_provider"]["applied"] = False
-                        plan["custom_provider"]["error"] = \
-                            f"{type(exc).__name__}: {exc}"
-                    try:
-                        plan["auxiliary_vision"]["saved"] = \
-                            write_auxiliary_vision(
-                                plan["auxiliary_vision"]["model"],
-                                plan["auxiliary_vision"]["base_url"])
-                        plan["auxiliary_vision"]["applied"] = True
-                    except Exception as exc:  # noqa: BLE001 — honest state
-                        plan["auxiliary_vision"]["applied"] = False
-                        plan["auxiliary_vision"]["error"] = \
-                            f"{type(exc).__name__}: {exc}"
-                    plan["config_writes"] = [
-                        {"key": "custom_providers",
-                         "value": plan["custom_provider"]["slug"],
-                         "ok": plan["custom_provider"]["applied"]},
-                        {"key": "auxiliary.vision.model",
-                         "value": plan["auxiliary_vision"]["model"],
-                         "ok": plan["auxiliary_vision"]["applied"]},
-                        {"key": "auxiliary.vision.base_url",
-                         "value": plan["auxiliary_vision"]["base_url"],
-                         "ok": plan["auxiliary_vision"]["applied"]},
-                    ]
+                        plan["applied"] = False
+                        plan["error"] = f"{type(exc).__name__}: {exc}"
                 else:
                     try:
-                        plan["custom_provider"]["saved"] = \
-                            write_custom_provider_entry(
-                                plan["custom_provider"]["entry"])
-                        plan["custom_provider"]["applied"] = True
+                        from hermes_cli.model_setup import persist_model_selection
+                        saved = persist_model_selection(
+                            plan["model"], plan["provider"],
+                            base_url=plan["base_url"],
+                            api_mode=_CUSTOM_PROVIDER_API_MODE)
+                        plan["applied"] = True
+                        plan["saved_model_section"] = saved
                     except Exception as exc:
-                        plan["custom_provider"]["applied"] = False
-                        plan["custom_provider"]["error"] = \
-                            f"{type(exc).__name__}: {exc}"
+                        plan["applied"] = False
+                        plan["error"] = f"{type(exc).__name__}: {exc}"
+                    # The custom_providers registration is its own honest write:
+                    # a failure here is reported beside the model-section state,
+                    # never folded into it.
+                    if plan.get("facade"):
+                        try:
+                            plan["custom_provider"]["saved"] = \
+                                write_custom_provider_entry(
+                                    plan["custom_provider"]["entry"])
+                            plan["custom_provider"]["applied"] = True
+                        except Exception as exc:  # noqa: BLE001 — honest state
+                            plan["custom_provider"]["applied"] = False
+                            plan["custom_provider"]["error"] = \
+                                f"{type(exc).__name__}: {exc}"
+                        try:
+                            plan["auxiliary_vision"]["saved"] = \
+                                write_auxiliary_vision(
+                                    plan["auxiliary_vision"]["model"],
+                                    plan["auxiliary_vision"]["base_url"])
+                            plan["auxiliary_vision"]["applied"] = True
+                        except Exception as exc:  # noqa: BLE001 — honest state
+                            plan["auxiliary_vision"]["applied"] = False
+                            plan["auxiliary_vision"]["error"] = \
+                                f"{type(exc).__name__}: {exc}"
+                        plan["config_writes"] = [
+                            {"key": "custom_providers",
+                             "value": plan["custom_provider"]["slug"],
+                             "ok": plan["custom_provider"]["applied"]},
+                            {"key": "auxiliary.vision.model",
+                             "value": plan["auxiliary_vision"]["model"],
+                             "ok": plan["auxiliary_vision"]["applied"]},
+                            {"key": "auxiliary.vision.base_url",
+                             "value": plan["auxiliary_vision"]["base_url"],
+                             "ok": plan["auxiliary_vision"]["applied"]},
+                        ]
+                    else:
+                        try:
+                            plan["custom_provider"]["saved"] = \
+                                write_custom_provider_entry(
+                                    plan["custom_provider"]["entry"])
+                            plan["custom_provider"]["applied"] = True
+                        except Exception as exc:
+                            plan["custom_provider"]["applied"] = False
+                            plan["custom_provider"]["error"] = \
+                                f"{type(exc).__name__}: {exc}"
+                        if isinstance(plan.get("auxiliary_vision"), dict):
+                            try:
+                                plan["auxiliary_vision"]["saved"] = \
+                                    write_auxiliary_vision(
+                                        plan["auxiliary_vision"]["model"],
+                                        plan["auxiliary_vision"]["base_url"])
+                                plan["auxiliary_vision"]["applied"] = True
+                            except Exception as exc:  # noqa: BLE001
+                                plan["auxiliary_vision"]["applied"] = False
+                                plan["auxiliary_vision"]["error"] = \
+                                    f"{type(exc).__name__}: {exc}"
             else:
                 plan["applied"] = False
                 plan["hint"] = "re-run with apply=true to write the config"
@@ -4725,20 +5146,29 @@ _COCKPIT_USAGE = (
     "model_forge_storage action=delete).")
 
 
-def cockpit_models(modality: str | None = None) -> dict:
-    """Curated model rows with the browse fit data, priced against the local
-    target — the model section the Desktop pane reuses. Curated catalog only
-    (no live HuggingFace layer): a pane read must stay offline-safe."""
+def cockpit_models(modality: str | None = None,
+                   target_id: str | None = None) -> dict:
+    """Curated model rows with the browse fit data, priced against the
+    selected compute target (default 'local') — the model section the Desktop
+    pane and full view reuse. Curated catalog only (no live HuggingFace
+    layer): a pane read must stay offline-safe."""
     if modality is not None and modality not in MODALITIES:
         return {"error": f"unknown modality: {modality!r}; valid "
                          f"modalities: {list(MODALITIES)}"}
     targets = load_targets()
-    local = next((t for t in targets if t.id == "local"), targets[0])
-    hw = _hw_for_target(local)
-    available = [e.id for e in _detect("") if e.available]
+    chosen = None
+    if target_id:
+        chosen = next((t for t in targets if t.id == target_id), None)
+        if chosen is None:
+            return {"error": f"unknown target: {target_id!r}"}
+    if chosen is None:
+        chosen = next((t for t in targets if t.id == "local"), targets[0])
+    hw = _hw_for_target(chosen)
+    base = "" if chosen.kind == "local" else chosen.base_url
+    available = [e.id for e in _detect(base) if e.available]
     entries = models_for(modality=modality or None)
     return {
-        "target": local.id,
+        "target": chosen.id,
         "hardware_budget_gb": hw.budget_gb,
         "models": _browse_model_rows(entries, hw, available),
         "note": "Fit verdicts are advisory (the browse fit data, curated "
@@ -4749,9 +5179,10 @@ def cockpit_models(modality: str | None = None) -> dict:
 
 def cockpit_data() -> dict:
     """The read-only cockpit snapshot behind the /model-forge command and
-    the Desktop pane: compute targets with hardware, declared + detected
-    engines, model rows reusing the browse fit data, and installed model
-    storage in the model_forge_storage list shape. Never raises."""
+    the Desktop UI: compute targets with hardware, declared + detected
+    engines, model rows reusing the browse fit data, installed model
+    storage in the model_forge_storage list shape, pull-credential presence
+    booleans, current Hermes wiring summary, and engine metadata. Never raises."""
     declared = _settings_engines()
     targets = load_targets()
     out = {
@@ -4761,6 +5192,9 @@ def cockpit_data() -> dict:
         "models": cockpit_models().get("models", []),
         "storage": _storage_listing(),
         "residency": cockpit_residency(),
+        "pull_credentials": credentials_status(),
+        "active_wiring": _read_active_wiring(),
+        "engine_catalog": [dict(row) for row in ENGINE_CATALOG],
         "delete_note": DELETE_VERB_NOTE,
     }
     local = next((t for t in targets if t.id == "local"), targets[0])

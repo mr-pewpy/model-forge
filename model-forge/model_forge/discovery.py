@@ -49,11 +49,21 @@ MODALITY_TAGS: dict[str, tuple[str, ...]] = {
 }
 
 
-def search_url(pipeline_tag: str = "", limit: int = DEFAULT_LIMIT) -> str:
-    """The freshness query: newest-first by last-modified, per pipeline lane."""
-    params = {"sort": "lastModified", "direction": "-1", "limit": str(limit)}
+def search_url(pipeline_tag: str = "", limit: int = DEFAULT_LIMIT,
+               query: str = "") -> str:
+    """The freshness/search query: newest-first by last-modified when no
+    keyword query is given, or most-downloaded first when searching by keyword
+    so official releases surface before obscure fine-tunes."""
+    q = str(query or "").strip()
+    params = {
+        "sort": "downloads" if q else "lastModified",
+        "direction": "-1",
+        "limit": str(limit),
+    }
     if pipeline_tag:
         params["pipeline_tag"] = pipeline_tag
+    if q:
+        params["search"] = q
     return HF_API + "?" + urllib.parse.urlencode(params)
 
 
@@ -127,34 +137,40 @@ def _cache_write(cache_dir: Path | None, key: str, rows: list[dict],
 
 
 def fresh_models(modality: str | None = None, *, limit: int = DEFAULT_LIMIT,
-                 cache_dir: Path | None = None, ttl: float = TTL_S,
-                 now: float | None = None, fetch=None) -> dict:
-    """Newest live HF models for a modality, last-modified desc.
+                 query: str = "", cache_dir: Path | None = None,
+                 ttl: float = TTL_S, now: float | None = None,
+                 fetch=None) -> dict:
+    """Newest live HF models for a modality (or keyword search when ``query``
+    is provided).
 
     Returns {"live_discovery": "ok"|"unavailable", "models": [row, ...],
     "error": str} where each row is {id, last_modified, downloads,
     pipeline_tag, url, status:"fresh"} — unvetted live results, deliberately
-    distinct from curated registry entries. Cached per modality for ``ttl``
-    seconds under ``cache_dir`` (default: the plugin data dir); every failure
-    degrades to ``unavailable`` so the curated catalog stays authoritative.
+    distinct from curated registry entries. Cached per modality/query for
+    ``ttl`` seconds under ``cache_dir`` (default: the plugin data dir); every
+    failure degrades to ``unavailable`` so the curated catalog stays
+    authoritative.
     """
     fetch = fetch or fetch_json
     now = time.time() if now is None else now
-    key = modality or "all"
+    q = str(query or "").strip()
+    key = (modality or "all") + (f"_q_{q}" if q else "")
     try:
         cdir = Path(cache_dir) if cache_dir is not None else _cache_dir()
     except Exception:
         cdir = None
     cached = _cache_read(cdir, key, ttl, now)
     if cached is not None:
-        return {"live_discovery": "ok", "models": _sort_rows(cached),
-                "error": ""}
+        rows_out = (sorted(cached, key=lambda r: (int(r.get("downloads") or 0),
+                                                  r.get("id", "")),
+                           reverse=True) if q else _sort_rows(cached))
+        return {"live_discovery": "ok", "models": rows_out, "error": ""}
     try:
         tags = MODALITY_TAGS.get(modality, ()) if modality else ()
         rows: list[dict] = []
         seen: set[str] = set()
         for tag in (tags or ("",)):
-            data = fetch(search_url(tag, limit))
+            data = fetch(search_url(tag, limit, query=q))
             if not isinstance(data, list):
                 raise ValueError(
                     f"unexpected HF response shape: {type(data).__name__}")
@@ -165,7 +181,10 @@ def fresh_models(modality: str | None = None, *, limit: int = DEFAULT_LIMIT,
                 if row["id"] and row["id"] not in seen:
                     seen.add(row["id"])
                     rows.append(row)
-        rows = _sort_rows(rows)[:limit]
+        rows = (sorted(rows, key=lambda r: (int(r.get("downloads") or 0),
+                                            r.get("id", "")),
+                       reverse=True)[:limit]
+                if q else _sort_rows(rows)[:limit])
         _cache_write(cdir, key, rows, now)
         return {"live_discovery": "ok", "models": rows, "error": ""}
     except Exception as exc:  # noqa: BLE001 — fail-soft is the contract
