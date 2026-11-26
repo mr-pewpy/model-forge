@@ -124,7 +124,8 @@ class ModelForgeVideoGenProvider(OpenAICompatibleVideoGenProvider):
         }
 
     def generate(self, prompt: str, **kwargs: Any) -> Dict[str, Any]:
-        if not _base_url():
+        base = _base_url()
+        if not base:
             from agent.video_gen_provider import error_response
             return error_response(
                 error=("no video endpoint configured — set the base URL in "
@@ -132,6 +133,35 @@ class ModelForgeVideoGenProvider(OpenAICompatibleVideoGenProvider):
                        f"export {_ENV_BASE_URL}"),
                 error_type="missing_credentials", provider=self.name,
                 prompt=(prompt or "").strip())
+        try:
+            from model_forge import media_providers as mp
+            if mp.detect_media_protocol(base, kind="video") == "comfyui":
+                from agent.video_gen_provider import (
+                    DEFAULT_ASPECT_RATIO, error_response, save_bytes_video,
+                    success_response,
+                )
+                aspect = str(kwargs.get("aspect_ratio") or DEFAULT_ASPECT_RATIO)
+                image_url = str(kwargs.get("image_url") or "")
+                res = mp.run_comfyui_media(
+                    base, (prompt or "").strip(), kind="video",
+                    model=str(kwargs.get("model") or _default_model() or ""),
+                    aspect_ratio=aspect,
+                    image_url=image_url,
+                )
+                if not res.get("ok"):
+                    return error_response(
+                        error=str(res.get("error") or "ComfyUI video job failed"),
+                        error_type="api_error", provider=self.name,
+                        prompt=(prompt or "").strip(), aspect_ratio=aspect)
+                saved = str(save_bytes_video(
+                    res["bytes"], extension=res.get("ext") or "mp4"))
+                return success_response(
+                    video=saved, model=str(res.get("model") or ""),
+                    prompt=(prompt or "").strip(),
+                    modality="image" if image_url else "text",
+                    aspect_ratio=aspect, duration=0, provider=self.name)
+        except ImportError:
+            pass
         if not kwargs.get("model"):
             default = _default_model()
             models = _live_models()

@@ -113,6 +113,31 @@ def job_status(job_id: str) -> dict:
         return {"state": "unknown", "error": f"no such job: {job_id}"}
 
 
+def list_jobs(limit: int = 20) -> list[dict]:
+    """Read-only listing of recent pull/download/installer job records, newest
+    first, capped at ``limit``. Never raises."""
+    try:
+        jdir = _jobs_dir()
+        if not jdir.is_dir():
+            return []
+        files = sorted(
+            (p for p in jdir.glob("*.json") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:max(1, min(int(limit), 50))]
+        rows: list[dict] = []
+        for p in files:
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    rows.append(data)
+            except (OSError, ValueError):
+                continue
+        return rows
+    except Exception:  # noqa: BLE001 — fail soft
+        return []
+
+
 def _run(job_id: str, url: str, dest: str, sha256: str) -> None:
     part = Path(str(dest) + ".part")
     final = Path(dest)

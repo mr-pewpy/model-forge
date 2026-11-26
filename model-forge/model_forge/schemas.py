@@ -189,19 +189,20 @@ INSTALL = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["model_install", "engine_install",
-                         "mark_installed"],
+                "enum": ["model_install", "engine_install", "engine_start",
+                         "engine_stop", "mark_installed"],
                 "description": (
                     "'model_install' (default) pulls a model. "
                     "'engine_install' provisions an inference engine: plan "
                     "first (the vendor's exact install command), then "
                     "execute=true runs it after the human-approval gate "
                     "approves — denial or timeout runs nothing. "
+                    "'engine_start' plans (execute=false) or launches "
+                    "(execute=true, approval-gated, loopback 127.0.0.1 only) "
+                    "an installed local engine (ollama, exo, vllm). "
+                    "'engine_stop' stops a local engine started by Model Forge. "
                     "'mark_installed' records that model_id's weights are "
-                    "present on target (after you ran the on-target command "
-                    "or watched the pull finish) — recorded as your "
-                    "confirmation unless the engine reports the pull "
-                    "complete."
+                    "present on target."
                 ),
             },
             "model_id": {

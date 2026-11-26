@@ -720,3 +720,186 @@ def register(ctx):
     # of them to Hermes' human-approval gate (fail closed on denial or
     # timeout).
     ctx.register_hook("pre_tool_call", tools.policy_hook)
+    _register_builtin_media_providers(ctx)
+
+
+def _register_builtin_media_providers(ctx) -> None:
+    """Register unified image_gen and video_gen providers inside the core
+    model-forge package so a single Plugin Store install natively supports
+    image_generate and video_generate (both OpenAI /v1 and raw ComfyUI /prompt)
+    without requiring extra companion packages. Safe no-op outside Hermes."""
+    if not (hasattr(ctx, "register_image_gen_provider")
+            and hasattr(ctx, "register_video_gen_provider")):
+        return
+    try:
+        from agent.image_gen_provider import (
+            DEFAULT_ASPECT_RATIO as IMG_DEFAULT_ASPECT,
+            ImageGenProvider,
+            error_response as img_error,
+            resolve_aspect_ratio,
+            save_b64_image,
+            success_response as img_success,
+        )
+        from agent.video_gen_provider import (
+            DEFAULT_ASPECT_RATIO as VID_DEFAULT_ASPECT,
+            VideoGenProvider,
+            error_response as vid_error,
+            save_bytes_video,
+            success_response as vid_success,
+        )
+    except Exception:  # noqa: BLE001 — bare probe / test harness without agent
+        return
+    from .model_forge import media_providers as mp
+
+    def _read_media_setting(plugin_key: str, field: str, env_key: str) -> str:
+        val = ""
+        try:
+            from hermes_cli.config import load_config_readonly
+            cfg = load_config_readonly() or {}
+            entries = (cfg.get("plugins") or {}).get("entries") or {}
+            val = str(((entries.get(plugin_key) or {}).get("settings") or {})
+                      .get(field) or "")
+            if not val:
+                mf = ((entries.get("model-forge") or {}).get("settings") or {})
+                alt = ("image_" if plugin_key.endswith("image") else "video_") + field
+                val = str(mf.get(alt) or "")
+        except Exception:
+            val = ""
+        if not val:
+            try:
+                from agent.secret_scope import get_secret_str
+                val = get_secret_str(env_key, "")
+            except Exception:
+                val = ""
+        return val.rstrip("/")
+
+    class _UnifiedImageProvider(ImageGenProvider):
+        @property
+        def name(self) -> str:
+            return "model-forge"
+
+        @property
+        def display_name(self) -> str:
+            return "Model Forge (local)"
+
+        def is_available(self) -> bool:
+            return True
+
+        def generate(self, prompt: str, aspect_ratio: str = IMG_DEFAULT_ASPECT,
+                     *, image_url=None, reference_image_urls=None, **kwargs):
+            text = (prompt or "").strip()
+            aspect = resolve_aspect_ratio(aspect_ratio)
+            if not text:
+                return img_error(error="Prompt is required",
+                                 error_type="invalid_argument",
+                                 provider=self.name, aspect_ratio=aspect)
+            base = _read_media_setting("model-forge-image", "base_url",
+                                       "MODEL_FORGE_IMAGE_BASE_URL")
+            if not base:
+                return img_error(
+                    error=("no images endpoint configured — open Model Forge "
+                           "and set an image engine or ComfyUI URL"),
+                    error_type="missing_credentials", provider=self.name,
+                    prompt=text, aspect_ratio=aspect)
+            model_id = str(kwargs.get("model") or _read_media_setting(
+                "model-forge-image", "default_model", "") or "")
+            if mp.detect_media_protocol(base, kind="image") == "comfyui":
+                res = mp.run_comfyui_media(
+                    base, text, kind="image", model=model_id,
+                    aspect_ratio=aspect, image_url=str(image_url or ""),
+                    reference_image_urls=reference_image_urls,
+                )
+                if not res.get("ok"):
+                    return img_error(error=str(res.get("error")),
+                                     error_type="api_error",
+                                     provider=self.name, prompt=text,
+                                     aspect_ratio=aspect)
+                saved = str(save_b64_image(mp.encode_b64(res["bytes"]),
+                                           extension=res.get("ext") or "png"))
+                return img_success(image=saved, model=str(res.get("model") or ""),
+                                   prompt=text, aspect_ratio=aspect,
+                                   modality="image" if image_url else "text",
+                                   provider=self.name)
+            try:
+                out = mp.openai_generate_image_stdlib(
+                    base, text, model=model_id,
+                    extra_body=({"image_url": str(image_url)} if image_url else None),
+                )
+                image = out.get("url") or ""
+                if not image and out.get("b64_json"):
+                    image = str(save_b64_image(str(out["b64_json"])))
+                if not image:
+                    return img_error(error="engine returned no image data",
+                                     error_type="api_error", provider=self.name,
+                                     prompt=text, aspect_ratio=aspect)
+                return img_success(image=image, model=str(out.get("model") or model_id),
+                                   prompt=text, aspect_ratio=aspect,
+                                   modality="image" if image_url else "text",
+                                   provider=self.name)
+            except Exception as exc:  # noqa: BLE001
+                return img_error(error=f"model-forge image generation failed: {exc}",
+                                 error_type="api_error", provider=self.name,
+                                 prompt=text, aspect_ratio=aspect)
+
+    class _UnifiedVideoProvider(VideoGenProvider):
+        @property
+        def name(self) -> str:
+            return "model-forge"
+
+        @property
+        def display_name(self) -> str:
+            return "Model Forge (local)"
+
+        def is_available(self) -> bool:
+            return True
+
+        def generate(self, prompt: str, **kwargs):
+            text = (prompt or "").strip()
+            aspect = str(kwargs.get("aspect_ratio") or VID_DEFAULT_ASPECT)
+            base = _read_media_setting("model-forge-video", "base_url",
+                                       "MODEL_FORGE_VIDEO_BASE_URL")
+            if not base:
+                return vid_error(
+                    error=("no video endpoint configured — open Model Forge "
+                           "and set a video engine or ComfyUI URL"),
+                    error_type="missing_credentials", provider=self.name,
+                    prompt=text, aspect_ratio=aspect)
+            model_id = str(kwargs.get("model") or _read_media_setting(
+                "model-forge-video", "default_model", "") or "")
+            image_url = str(kwargs.get("image_url") or "")
+            if mp.detect_media_protocol(base, kind="video") == "comfyui":
+                res = mp.run_comfyui_media(
+                    base, text, kind="video", model=model_id,
+                    aspect_ratio=aspect, image_url=image_url,
+                )
+                if not res.get("ok"):
+                    return vid_error(error=str(res.get("error")),
+                                     error_type="api_error",
+                                     provider=self.name, prompt=text,
+                                     aspect_ratio=aspect)
+                saved = str(save_bytes_video(res["bytes"],
+                                             extension=res.get("ext") or "mp4"))
+                return vid_success(video=saved, model=str(res.get("model") or ""),
+                                   prompt=text,
+                                   modality="image" if image_url else "text",
+                                   aspect_ratio=aspect, duration=0,
+                                   provider=self.name)
+            try:
+                out = mp.openai_generate_video_stdlib(
+                    base, text, model=model_id, image_url=image_url,
+                    aspect_ratio=aspect, duration=kwargs.get("duration"),
+                )
+                saved = str(save_bytes_video(out["bytes"],
+                                             extension=out.get("ext") or "mp4"))
+                return vid_success(video=saved, model=str(out.get("model") or model_id),
+                                   prompt=text,
+                                   modality="image" if image_url else "text",
+                                   aspect_ratio=aspect, duration=0,
+                                   provider=self.name)
+            except Exception as exc:  # noqa: BLE001
+                return vid_error(error=f"model-forge video generation failed: {exc}",
+                                 error_type="api_error", provider=self.name,
+                                 prompt=text, aspect_ratio=aspect)
+
+    ctx.register_image_gen_provider(_UnifiedImageProvider())
+    ctx.register_video_gen_provider(_UnifiedVideoProvider())

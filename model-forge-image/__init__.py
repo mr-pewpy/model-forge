@@ -249,6 +249,45 @@ class ModelForgeImageGenProvider(ImageGenProvider):
                        f"export {_ENV_BASE_URL}"),
                 error_type="missing_credentials", provider=self.name,
                 prompt=prompt, aspect_ratio=aspect)
+        try:
+            extra = _extra_body(image_url, reference_image_urls)
+        except ValueError as exc:
+            return error_response(
+                error=str(exc), error_type="invalid_argument",
+                provider=self.name, prompt=prompt, aspect_ratio=aspect)
+
+        # Direct ComfyUI workflow path: when the user points at a raw ComfyUI
+        # server (e.g. http://127.0.0.1:8188), run the bundled workflow
+        # directly instead of requiring a separate OpenAI media facade.
+        try:
+            from model_forge import media_providers as mp
+            if mp.detect_media_protocol(base, kind="image") == "comfyui":
+                res = mp.run_comfyui_media(
+                    base, prompt, kind="image",
+                    model=str(kwargs.get("model") or _default_model() or ""),
+                    aspect_ratio=aspect,
+                    image_url=extra.get("image_url", ""),
+                    reference_image_urls=extra.get("reference_image_urls"),
+                )
+                if not res.get("ok"):
+                    return error_response(
+                        error=str(res.get("error") or "ComfyUI image job failed"),
+                        error_type="api_error", provider=self.name,
+                        model=str(kwargs.get("model") or ""),
+                        prompt=prompt, aspect_ratio=aspect)
+                from agent.image_gen_provider import save_b64_image
+                saved = str(save_b64_image(
+                    mp.encode_b64(res["bytes"]),
+                    extension=res.get("ext") or "png",
+                ))
+                return success_response(
+                    image=saved, model=str(res.get("model") or ""),
+                    prompt=prompt, aspect_ratio=aspect,
+                    modality="image" if image_url else "text",
+                    provider=self.name)
+        except ImportError:
+            pass
+
         model_id = _resolve_model(kwargs.get("model"))
         if not model_id:
             return error_response(
@@ -256,12 +295,6 @@ class ModelForgeImageGenProvider(ImageGenProvider):
                 error_type="no_model", provider=self.name, prompt=prompt,
                 aspect_ratio=aspect)
 
-        try:
-            extra = _extra_body(image_url, reference_image_urls)
-        except ValueError as exc:
-            return error_response(
-                error=str(exc), error_type="invalid_argument",
-                provider=self.name, prompt=prompt, aspect_ratio=aspect)
         try:
             import openai
             client = openai.OpenAI(api_key="local-endpoint", base_url=base,

@@ -265,6 +265,20 @@ def write_media_provider_config(surface: str, *, base_url: str,
         settings["default_model"] = default_model
     entry["settings"] = settings
     entries[plugin_key] = entry
+    # Also mirror onto the unified model-forge entry so single-package installs
+    # pick up the configured media endpoint without requiring the separate
+    # companion backend package.
+    mf_entry = entries.get("model-forge")
+    if not isinstance(mf_entry, dict):
+        mf_entry = {}
+    mf_settings = mf_entry.get("settings")
+    if not isinstance(mf_settings, dict):
+        mf_settings = {}
+    mf_settings[f"{surface}_base_url"] = base_url
+    if default_model:
+        mf_settings[f"{surface}_default_model"] = default_model
+    mf_entry["settings"] = mf_settings
+    entries["model-forge"] = mf_entry
     plugins["entries"] = entries
     cfg["plugins"] = plugins
     save_config(cfg)
@@ -812,6 +826,28 @@ def policy_hook(tool_name: str, args: dict | None = None, task_id: str = "",
                 "rule_key": "model-forge:engine_install",
             }
         return None   # no approved installer -> nothing can execute
+    if tool_name == "model_forge_install" \
+            and args.get("action") == "engine_start" \
+            and args.get("execute") is True:
+        plan = engine_start_plan(
+            str(args.get("engine") or ""),
+            model_id=str(args.get("model_id") or ""),
+        )
+        if plan.get("ok") and plan.get("argv"):
+            cmd_str = " ".join(shlex.quote(a) for a in plan["argv"])
+            return {
+                "action": "approve",
+                "message": (
+                    "Model Forge wants to launch the local "
+                    f"{plan.get('engine')} inference engine bound to loopback "
+                    "127.0.0.1 only (minimal env, no credentials forwarded):\n"
+                    f"  command: {cmd_str}\n"
+                    f"  endpoint: {plan.get('endpoint')}\n"
+                    "Approve to start this local server — denying runs nothing."
+                ),
+                "rule_key": "model-forge:engine_start",
+            }
+        return None
     if tool_name == "model_forge_broker" \
             and args.get("action") in ("claim", "swap"):
         # A claim/swap can start an engine SERVER process (vLLM/llama.cpp),
@@ -1263,16 +1299,24 @@ def activation_plan(entry: ModelEntry, target: ComputeTarget,
         if not engine and "openai-compatible" in available_engines:
             engine = "openai-compatible"
         if not engine and "comfyui" in available_engines:
+            served = engine_model or native_id_for(entry.id, "comfyui")
+            root = root_url(target.base_url)
             return {
-                "ok": False,
-                "action": "needs_openai_media_route",
+                "ok": True,
+                "action": "persist_media_provider",
                 "surface": surf,
+                "protocol": "comfyui",
+                "provider": _MEDIA_PROVIDER_NAME,
+                "plugin": plug_key,
+                "config_key": f"{sec_key}.provider",
+                "model": served,
+                "base_url": root,
+                "engine": "comfyui",
                 "detail": (
-                    f"ComfyUI at {target.base_url} serves its native /prompt "
-                    f"workflow API, not the OpenAI /v1 {surf} route that "
-                    f"{plug_key} calls — use model_forge_generate_media "
-                    "directly, or connect an OpenAI-compatible media facade, "
-                    "vLLM-Omni, or SGLang Diffusion endpoint"
+                    f"sets {sec_key}.provider = {_MEDIA_PROVIDER_NAME} and "
+                    f"points {plug_key} directly at ComfyUI {root} "
+                    f"(native /prompt workflows, default_model={served}; no "
+                    "separate facade needed); " + _NEXT_SESSION_NOTE
                 ),
             }
         if not engine:
@@ -1286,6 +1330,7 @@ def activation_plan(entry: ModelEntry, target: ComputeTarget,
             "ok": True,
             "action": "persist_media_provider",
             "surface": surf,
+            "protocol": "openai",
             "provider": _MEDIA_PROVIDER_NAME,
             "plugin": plug_key,
             "config_key": f"{sec_key}.provider",
@@ -1611,6 +1656,262 @@ def _confirm_engine(engine_id: str) -> dict:
             "detail": "the engine did not answer detection after the "
                       "installer finished; engines are started by you — run "
                       "it and Model Forge will detect it"}
+
+
+def _managed_engines_dir():
+    from pathlib import Path
+    from plugins.plugin_storage import plugin_data_dir
+    d = Path(plugin_data_dir("model-forge")) / "engines"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _pid_alive(pid: int) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _read_managed_engine(engine_id: str) -> dict | None:
+    try:
+        p = _managed_engines_dir() / f"{engine_id}.json"
+        if not p.is_file():
+            return None
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and _pid_alive(int(data.get("pid") or 0)):
+            return data
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def local_engine_clis() -> dict:
+    """Read-only check of which local engine CLIs exist on PATH and whether
+    Model Forge currently owns a managed local process for each."""
+    bins = {
+        "ollama": "ollama",
+        "vllm": "vllm",
+        "llamacpp": "llama-server",
+        "strata": "strata",
+        "exo": "exo",
+        "docker": "docker",
+        "uvx": "uvx",
+    }
+    out = {}
+    for eid, binary in bins.items():
+        path = shutil.which(binary) or ""
+        managed = _read_managed_engine(eid) if eid in ("ollama", "exo", "vllm") else None
+        out[eid] = {
+            "binary": binary,
+            "installed": bool(path),
+            "path": path,
+            "managed_running": bool(managed),
+            "managed_pid": int(managed["pid"]) if managed else None,
+        }
+    return out
+
+
+def engine_start_plan(engine_id: str, model_id: str = "", *,
+                      which_fn=None) -> dict:
+    """Plan launching an installed local engine bound strictly to 127.0.0.1.
+
+    Pure plan — never spawns a process. Fixed hardcoded argv only."""
+    key = str(engine_id or "").strip().lower()
+    which = which_fn or shutil.which
+    if key in ("llamacpp", "llama.cpp", "llama-server"):
+        return {
+            "ok": False,
+            "action": "use_core_local_models",
+            "engine": "llamacpp",
+            "detail": ("llama.cpp is managed by Hermes core's built-in "
+                       "Local Models runtime (Settings -> Providers -> "
+                       "Local Models)."),
+        }
+    if key == "ollama":
+        if not which("ollama"):
+            return {
+                "ok": False,
+                "action": "engine_not_installed",
+                "engine": "ollama",
+                "detail": ("ollama CLI not found on PATH — run "
+                           "model_forge_install action='engine_install', "
+                           "engine='ollama' first."),
+            }
+        return {
+            "ok": True,
+            "action": "engine_start_plan",
+            "engine": "ollama",
+            "argv": ["ollama", "serve"],
+            "env_extra": {"OLLAMA_HOST": "127.0.0.1:11434"},
+            "endpoint": "http://127.0.0.1:11434",
+            "port": 11434,
+            "detail": ("Launches Ollama locally bound strictly to "
+                       "127.0.0.1:11434 with a minimal environment."),
+        }
+    if key == "exo":
+        if not which("exo"):
+            return {
+                "ok": False,
+                "action": "engine_not_installed",
+                "engine": "exo",
+                "detail": "exo CLI not found on PATH — install Exo first.",
+            }
+        return {
+            "ok": True,
+            "action": "engine_start_plan",
+            "engine": "exo",
+            "argv": ["exo"],
+            "env_extra": {},
+            "endpoint": "http://127.0.0.1:52415",
+            "port": 52415,
+            "detail": ("Launches the local Exo node on port 52415 with a "
+                       "minimal environment."),
+        }
+    if key == "vllm":
+        if not which("vllm"):
+            return {
+                "ok": False,
+                "action": "engine_not_installed",
+                "engine": "vllm",
+                "detail": "vllm CLI not found on PATH — install vLLM first.",
+            }
+        mid = str(model_id or "").strip()
+        if (not mid or mid.startswith("-") or len(mid) > 200
+                or any(ord(c) < 32 for c in mid)):
+            return {
+                "ok": False,
+                "action": "model_id_required",
+                "engine": "vllm",
+                "detail": ("vLLM requires a safe model_id (e.g. "
+                           "'Qwen/Qwen2.5-7B-Instruct') to start serving."),
+            }
+        return {
+            "ok": True,
+            "action": "engine_start_plan",
+            "engine": "vllm",
+            "argv": ["vllm", "serve", mid, "--host", "127.0.0.1",
+                     "--port", "8000"],
+            "env_extra": {},
+            "endpoint": "http://127.0.0.1:8000",
+            "port": 8000,
+            "detail": (f"Launches vLLM serving {mid} bound strictly to "
+                       "127.0.0.1:8000 with a minimal environment."),
+        }
+    return {
+        "ok": False,
+        "action": "manual_launch_required",
+        "engine": key,
+        "detail": (f"Model Forge does not auto-launch {key!r} — start it "
+                   "from its own directory or connect an already-running URL."),
+    }
+
+
+def start_local_engine(engine_id: str, model_id: str = "", *,
+                       which_fn=None, popen_fn=None) -> dict:
+    """Spawn an approved local engine (shell=False, minimal env, 127.0.0.1)."""
+    plan = engine_start_plan(engine_id, model_id=model_id, which_fn=which_fn)
+    if not plan.get("ok"):
+        return plan
+    key = plan["engine"]
+    existing = _read_managed_engine(key)
+    if existing is not None:
+        return {
+            "ok": True,
+            "action": "engine_already_running",
+            "engine": key,
+            "pid": existing["pid"],
+            "endpoint": plan["endpoint"],
+            "provenance": "model-forge",
+            "detail": f"{key} is already running (managed PID {existing['pid']}).",
+        }
+    env = _minimal_env()
+    env.update(plan.get("env_extra") or {})
+    spawn = popen_fn or subprocess.Popen
+    proc = spawn(
+        plan["argv"],
+        shell=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=env,
+    )
+    record = {
+        "engine": key,
+        "pid": int(proc.pid),
+        "argv": list(plan["argv"]),
+        "endpoint": plan["endpoint"],
+        "provenance": "model-forge",
+        "started_at": time.time(),
+    }
+    try:
+        (_managed_engines_dir() / f"{key}.json").write_text(
+            json.dumps(record), encoding="utf-8")
+    except Exception:  # noqa: BLE001 — record best effort
+        pass
+    return {
+        "ok": True,
+        "action": "engine_started",
+        "engine": key,
+        "pid": int(proc.pid),
+        "endpoint": plan["endpoint"],
+        "provenance": "model-forge",
+        "detail": (f"Started {key} (PID {proc.pid}) on {plan['endpoint']}. "
+                   "Run model_forge_status in a few seconds to confirm readiness."),
+    }
+
+
+def stop_local_engine(engine_id: str, *, kill_fn=None) -> dict:
+    """Stop a local engine ONLY when Model Forge itself started it."""
+    key = str(engine_id or "").strip().lower()
+    if not key:
+        return {"ok": False, "error": "engine required"}
+    rec = _read_managed_engine(key)
+    if rec is None:
+        return {
+            "ok": False,
+            "action": "not_managed_by_model_forge",
+            "engine": key,
+            "detail": (f"No active {key} process started by Model Forge was "
+                       "found; externally started servers are never stopped "
+                       "without provenance."),
+        }
+    pid = int(rec["pid"])
+    killer = kill_fn or os.kill
+    try:
+        killer(pid, signal.SIGTERM)
+    except OSError as exc:
+        return {"ok": False, "engine": key, "pid": pid,
+                "error": f"failed to stop PID {pid}: {exc}"}
+    try:
+        (_managed_engines_dir() / f"{key}.json").unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+    return {
+        "ok": True,
+        "action": "engine_stopped",
+        "engine": key,
+        "pid": pid,
+        "detail": f"Sent SIGTERM to Model Forge-managed {key} (PID {pid}).",
+    }
+
+
+def _engine_start_action(args: dict) -> dict:
+    engine_id = str(args.get("engine") or "").strip()
+    model_id = str(args.get("model_id") or "").strip()
+    if args.get("execute") is True:
+        return start_local_engine(engine_id, model_id=model_id)
+    plan = engine_start_plan(engine_id, model_id=model_id)
+    if plan.get("ok"):
+        plan["hint"] = (
+            "plan only — re-run with action='engine_start', "
+            f"engine={plan['engine']!r}, execute=true to launch after "
+            "human approval"
+        )
+    return plan
 
 
 def _minimal_env() -> dict:
@@ -2301,12 +2602,17 @@ def model_forge_install(args: dict | None = None, **kwargs) -> str:
         action = str(args.get("action") or "model_install").strip()
         if action == "engine_install":
             return _dump(_engine_install_action(args))
+        if action == "engine_start":
+            return _dump(_engine_start_action(args))
+        if action == "engine_stop":
+            return _dump(stop_local_engine(str(args.get("engine") or "")))
         if action == "mark_installed":
             return _dump(_install_mark_installed(args))
         if action != "model_install":
             return _dump({"error": f"unknown action: {action!r}; valid "
                                    f"actions: ['model_install', "
-                                   f"'engine_install', 'mark_installed']"})
+                                   f"'engine_install', 'engine_start', "
+                                   f"'engine_stop', 'mark_installed']"})
         model_id = str(args.get("model_id") or "").strip()
         if not model_id:
             return _dump({"error": "model_id required (or job_id to poll a "
