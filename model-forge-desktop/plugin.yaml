@@ -1,6 +1,6 @@
 name: model-forge-desktop
 kind: desktop
-version: 1.3.0
+version: 1.3.1
 requires_hermes: ">=0.23.0"
 description: "Model Forge native Desktop experience — full workspace page, sidebar entry, Settings -> Plugins pages, and dockable cockpit pane. Detect your GPU or connect network/cloud GPUs without JSON, add your Hugging Face token via Hermes' credential store, browse/pull models across every modality and engine (llama.cpp, Ollama, vLLM, SGLang, ComfyUI, Strata, Project Maya, Exo), and pipe them into Hermes. Disclosure: reads local host facts (machine.facts), plugin settings/suite state (plugins.manage), and tool-registered targets (read-only shell read); saves user-submitted target/engine/media settings via plugins.manage settings and Hugging Face tokens via Hermes' model.save_key credential route; probes configured endpoints read-only over HTTP; routes destructive/install/activation actions to Hermes chat behind the human-approval gate. No telemetry."
 author: anai (Pewpy)

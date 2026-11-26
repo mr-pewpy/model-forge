@@ -1,5 +1,5 @@
 name: model-forge
-version: 1.3.0
+version: 1.3.1
 requires_hermes: ">=0.23.0"
 description: >-
   Local models for every modality. Find your GPU, pick a model — chat, vision,
