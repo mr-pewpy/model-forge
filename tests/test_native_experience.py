@@ -224,6 +224,10 @@ def test_activate_image_video_vision_and_live_served_models(tmp_path, monkeypatc
             EngineStatus(id="comfyui", display_name="ComfyUI", available=True,
                          endpoint="http://gpu-box.example.com:8080",
                          modalities=("image", "video")),
+            EngineStatus(id="openai-compatible",
+                         display_name="OpenAI-compatible", available=True,
+                         endpoint="http://gpu-box.example.com:8080",
+                         modalities=("chat", "vision", "image", "video")),
         ],
     )
 
@@ -277,6 +281,16 @@ def test_activate_image_video_vision_and_live_served_models(tmp_path, monkeypatc
     refused = json.loads(tools.model_forge_activate(
         {"model_id": "not-really-served:99b", "target": "local"}))
     assert "error" in refused
+
+    # 6. Raw ComfyUI alone does not wire as an OpenAI /v1 media endpoint
+    comfy_only = tools.activation_plan(
+        ModelEntry(id="ltx-2.5", name="LTX-2.5", modality="video",
+                   engines=("comfyui",), source="Lightricks/LTX-2"),
+        remote,
+        available_engines=["comfyui"],
+    )
+    assert comfy_only["ok"] is False
+    assert comfy_only["action"] == "needs_openai_media_route"
 
 
 def test_cockpit_data_includes_wiring_credentials_and_engines(tmp_path, monkeypatch):

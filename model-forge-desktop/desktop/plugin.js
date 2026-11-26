@@ -1470,6 +1470,7 @@ function HfCredentialsDialog(props) {
 
 function AddComputeDialog(props) {
   const { open, onOpenChange, initialTarget, existingTargets, existingEngines, defaultMode, onSaved } = props;
+  const isEditingExisting = Boolean(initialTarget && initialTarget.id);
   const [mode, setMode] = useState(defaultMode || (initialTarget ? initialTarget.kind : "lan"));
   const [label, setLabel] = useState((initialTarget && initialTarget.label) || "");
   const [baseUrl, setBaseUrl] = useState((initialTarget && initialTarget.base_url) || "");
@@ -1576,7 +1577,13 @@ function AddComputeDialog(props) {
       children: [
         jsxs(DialogHeader, {
           children: [
-            jsx(DialogTitle, { children: initialTarget ? "Edit GPU Target" : "Point Model Forge at a GPU or Engine" }),
+            jsx(DialogTitle, {
+              children: isEditingExisting
+                ? "Edit GPU Target"
+                : mode === "engine"
+                  ? "Connect Engine URL"
+                  : "Point Model Forge at a GPU or Engine",
+            }),
             jsx(DialogDescription, {
               children: "Connect another computer on your home/office network, a rented cloud GPU, or any running inference server. No JSON editing needed.",
             }),
@@ -1585,7 +1592,7 @@ function AddComputeDialog(props) {
         jsxs("div", {
           className: "grid gap-3 py-2",
           children: [
-            !initialTarget ? jsx(SegmentedControl, {
+            !isEditingExisting ? jsx(SegmentedControl, {
               value: mode,
               onChange: setMode,
               options: [
@@ -2431,9 +2438,13 @@ function ModelForgePage(props) {
   };
 
   const renderWiringTab = () => {
+    // Only suggest OpenAI-compatible /v1 media endpoints here — raw ComfyUI
+    // speaks its native /prompt workflow API, not /v1/images or /v1/videos.
     const mediaCandidates = runningEngines.filter((e) =>
+      (e.id === "vllm" || e.id === "sglang" || e.id === "openai-compatible") &&
       (e.modalities || []).some((m) => m === "image" || m === "video") && e.root,
     );
+    const hasRawComfy = runningEngines.some((e) => e.id === "comfyui");
     return jsxs("div", {
       className: "grid gap-4",
       children: [
@@ -2551,7 +2562,7 @@ function ModelForgePage(props) {
                     jsx(Badge, { variant: imgUrlDraft ? "success" : "muted", size: "xs", children: imgUrlDraft ? "Configured" : "Not wired" }),
                   ],
                 }),
-                jsx("div", { className: "text-[11px] text-(--ui-text-tertiary)", children: "Routes Hermes' native image_generate tool to your local or LAN endpoint." }),
+                jsx("div", { className: "text-[11px] text-(--ui-text-tertiary)", children: "Routes Hermes' native image_generate tool to your local or LAN OpenAI-compatible images endpoint (vLLM-Omni, SGLang Diffusion, or Model Forge media facade)." + (hasRawComfy ? " Raw ComfyUI uses native /prompt workflows via model_forge_generate_media or the Model Forge facade." : "") }),
                 jsx(Input, { value: imgUrlDraft, onChange: (e) => setImgUrlDraft(e.target.value), placeholder: "http://gpu-box.example.com:8080/v1" }),
                 jsx(Input, { value: imgModelDraft, onChange: (e) => setImgModelDraft(e.target.value), placeholder: "Default model id (blank = auto from /v1/models)" }),
                 mediaCandidates.length > 0 ? jsxs("div", {

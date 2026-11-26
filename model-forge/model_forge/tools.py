@@ -1254,12 +1254,31 @@ def activation_plan(entry: ModelEntry, target: ComputeTarget,
                               "as the chat model"}
     if surf in _MEDIA_SURFACE_MAP:
         sec_key, plug_key = _MEDIA_SURFACE_MAP[surf]
-        engine = next((e for e in entry.engines if e in available_engines), "")
+        openai_media_engines = ("vllm", "sglang", "openai-compatible")
+        engine = next(
+            (e for e in entry.engines
+             if e in available_engines and e in openai_media_engines),
+            "",
+        )
         if not engine and "openai-compatible" in available_engines:
             engine = "openai-compatible"
+        if not engine and "comfyui" in available_engines:
+            return {
+                "ok": False,
+                "action": "needs_openai_media_route",
+                "surface": surf,
+                "detail": (
+                    f"ComfyUI at {target.base_url} serves its native /prompt "
+                    f"workflow API, not the OpenAI /v1 {surf} route that "
+                    f"{plug_key} calls — use model_forge_generate_media "
+                    "directly, or connect an OpenAI-compatible media facade, "
+                    "vLLM-Omni, or SGLang Diffusion endpoint"
+                ),
+            }
         if not engine:
             return {"ok": False, "action": "engine_not_running",
-                    "detail": f"none of {list(entry.engines)} answered at "
+                    "detail": f"none of {list(entry.engines)} (or an OpenAI-"
+                              f"compatible {surf} gateway) answered at "
                               f"{target.base_url} — install/serve first"}
         served = engine_model or native_id_for(entry.id, engine)
         base_v1 = root_url(target.base_url) + "/v1"

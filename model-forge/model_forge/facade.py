@@ -122,9 +122,8 @@ MODELS_ADVERTISED: dict[str, dict] = {
     "Qwen/Qwen3.8-27B-FP8": {
         "label": "Qwen3.8-27B-FP8",
         "description": (
-            "Resident LLM lane — OBLITERATUS abliterated FP8 build (only chat "
-            "model kept, 2026-11-19). vLLM TP2 across both 3090s, 262K context, "
-            "native vision, tool calling, thinking control."
+            "Resident LLM lane — abliterated FP8 build, tensor-parallel vLLM "
+            "serving, 262K context, native vision, tool calling, thinking control."
         ),
         "engine": "vllm",
         "context_length": 262144,

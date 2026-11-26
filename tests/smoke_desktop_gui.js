@@ -281,6 +281,13 @@ async function main() {
   assert(mod.HfCredentialsDialog({ open: true, onOpenChange: () => {}, connected: false }), "HfCredentialsDialog failed");
   resetHooks([]);
   assert(mod.AddComputeDialog({ open: true, onOpenChange: () => {}, existingTargets: [], existingEngines: [], defaultMode: "cloud" }), "AddComputeDialog failed");
+  resetHooks([]);
+  const engDlg = mod.AddComputeDialog({
+    open: true, onOpenChange: () => {},
+    initialTarget: { label: "Ollama", base_url: "http://127.0.0.1:11434", kind: "engine" },
+    existingTargets: [], existingEngines: [], defaultMode: "engine",
+  });
+  assert(JSON.stringify(engDlg).includes("Connect Engine URL"), "engine prefill dialog should show Connect Engine URL");
   resetHooks([populated]);
   assert(mod.SettingsOverviewPage(), "SettingsOverviewPage failed");
   resetHooks([populated]);

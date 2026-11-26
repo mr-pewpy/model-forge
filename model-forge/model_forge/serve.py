@@ -73,8 +73,8 @@ __all__ = [
 # the reference topology
 # ---------------------------------------------------------------------------
 
-# One RTX 3090 = 24 GB. The machine has two of them; the chat lane (TP2) owns
-# both, the gen lane is pinned to one.
+# Reference 24 GB dual-GPU topology: the chat lane (TP2) spans both GPUs,
+# while a gen lane stays pinned to one 24 GB card.
 CARD_VRAM_GB = 24.0
 MACHINE_VRAM_GB = CARD_VRAM_GB * 2.0          # nominal pool: both cards
 
