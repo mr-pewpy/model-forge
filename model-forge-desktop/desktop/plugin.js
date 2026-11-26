@@ -2438,13 +2438,10 @@ function ModelForgePage(props) {
   };
 
   const renderWiringTab = () => {
-    // Only suggest OpenAI-compatible /v1 media endpoints here — raw ComfyUI
-    // speaks its native /prompt workflow API, not /v1/images or /v1/videos.
     const mediaCandidates = runningEngines.filter((e) =>
-      (e.id === "vllm" || e.id === "sglang" || e.id === "openai-compatible") &&
+      (e.id === "comfyui" || e.id === "vllm" || e.id === "sglang" || e.id === "openai-compatible") &&
       (e.modalities || []).some((m) => m === "image" || m === "video") && e.root,
     );
-    const hasRawComfy = runningEngines.some((e) => e.id === "comfyui");
     return jsxs("div", {
       className: "grid gap-4",
       children: [
@@ -2562,17 +2559,17 @@ function ModelForgePage(props) {
                     jsx(Badge, { variant: imgUrlDraft ? "success" : "muted", size: "xs", children: imgUrlDraft ? "Configured" : "Not wired" }),
                   ],
                 }),
-                jsx("div", { className: "text-[11px] text-(--ui-text-tertiary)", children: "Routes Hermes' native image_generate tool to your local or LAN OpenAI-compatible images endpoint (vLLM-Omni, SGLang Diffusion, or Model Forge media facade)." + (hasRawComfy ? " Raw ComfyUI uses native /prompt workflows via model_forge_generate_media or the Model Forge facade." : "") }),
-                jsx(Input, { value: imgUrlDraft, onChange: (e) => setImgUrlDraft(e.target.value), placeholder: "http://gpu-box.example.com:8080/v1" }),
-                jsx(Input, { value: imgModelDraft, onChange: (e) => setImgModelDraft(e.target.value), placeholder: "Default model id (blank = auto from /v1/models)" }),
+                jsx("div", { className: "text-[11px] text-(--ui-text-tertiary)", children: "Routes Hermes' native image_generate tool to either a raw ComfyUI URL (e.g. http://127.0.0.1:8188 — direct workflows) or an OpenAI-compatible /v1 images API." }),
+                jsx(Input, { value: imgUrlDraft, onChange: (e) => setImgUrlDraft(e.target.value), placeholder: "http://127.0.0.1:8188 or http://gpu-box.example.com:8080/v1" }),
+                jsx(Input, { value: imgModelDraft, onChange: (e) => setImgModelDraft(e.target.value), placeholder: "Default model or workflow id (blank = auto)" }),
                 mediaCandidates.length > 0 ? jsxs("div", {
                   className: "flex flex-wrap gap-1",
-                  children: mediaCandidates.slice(0, 3).map((e, i) => jsx(Button, {
+                  children: mediaCandidates.slice(0, 4).map((e, i) => jsx(Button, {
                     key: "mc-" + i,
                     size: "xs",
                     variant: "chip",
-                    onClick: () => setImgUrlDraft(rootUrl(e.root) + "/v1"),
-                    children: "Use " + e.name,
+                    onClick: () => setImgUrlDraft(e.id === "comfyui" ? rootUrl(e.root) : rootUrl(e.root) + "/v1"),
+                    children: e.id === "comfyui" ? "Use ComfyUI (direct)" : "Use " + e.name,
                   })),
                 }) : null,
                 jsxs("div", {
@@ -2604,17 +2601,17 @@ function ModelForgePage(props) {
                     jsx(Badge, { variant: vidUrlDraft ? "success" : "muted", size: "xs", children: vidUrlDraft ? "Configured" : "Not wired" }),
                   ],
                 }),
-                jsx("div", { className: "text-[11px] text-(--ui-text-tertiary)", children: "Routes Hermes' native video_generate tool to your local or LAN video API." }),
-                jsx(Input, { value: vidUrlDraft, onChange: (e) => setVidUrlDraft(e.target.value), placeholder: "http://gpu-box.example.com:8080/v1" }),
-                jsx(Input, { value: vidModelDraft, onChange: (e) => setVidModelDraft(e.target.value), placeholder: "Default model id (blank = auto from /v1/models)" }),
+                jsx("div", { className: "text-[11px] text-(--ui-text-tertiary)", children: "Routes Hermes' native video_generate tool to either a raw ComfyUI URL (e.g. http://127.0.0.1:8188 — direct workflows) or an OpenAI-compatible /v1 video API." }),
+                jsx(Input, { value: vidUrlDraft, onChange: (e) => setVidUrlDraft(e.target.value), placeholder: "http://127.0.0.1:8188 or http://gpu-box.example.com:8080/v1" }),
+                jsx(Input, { value: vidModelDraft, onChange: (e) => setVidModelDraft(e.target.value), placeholder: "Default model or workflow id (blank = auto)" }),
                 mediaCandidates.length > 0 ? jsxs("div", {
                   className: "flex flex-wrap gap-1",
-                  children: mediaCandidates.slice(0, 3).map((e, i) => jsx(Button, {
+                  children: mediaCandidates.slice(0, 4).map((e, i) => jsx(Button, {
                     key: "vc-" + i,
                     size: "xs",
                     variant: "chip",
-                    onClick: () => setVidUrlDraft(rootUrl(e.root) + "/v1"),
-                    children: "Use " + e.name,
+                    onClick: () => setVidUrlDraft(e.id === "comfyui" ? rootUrl(e.root) : rootUrl(e.root) + "/v1"),
+                    children: e.id === "comfyui" ? "Use ComfyUI (direct)" : "Use " + e.name,
                   })),
                 }) : null,
                 jsxs("div", {
