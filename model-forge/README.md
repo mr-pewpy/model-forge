@@ -83,7 +83,7 @@ One Model Forge experience on every Hermes surface:
 
 | Surface | What you get |
 |---|---|
-| **Desktop app** | The cockpit pane (GPU & compute targets with the pointing invitation, declared + detected engines, model fit rows, installed model storage) plus the same tools in chat. |
+| **Desktop app** | Full `/model-forge` workspace page, sidebar nav entry, `Settings -> Plugins -> Model Forge` pages, and dockable cockpit pane — guided GPU/cloud/engine connection wizards (no raw JSON), in-GUI Hugging Face token setup (`model.save_key`), 5-package suite status, live engine models with one-click Hermes wiring, modality catalog with fit verdicts, installed storage + quiet collapsed Resource view, and broker residency. |
 | **Telegram** (and other gateway chats) | The `/model-forge` command — `cockpit`, `models [modality]`, `storage` (JSON rows) and `status`, `browse [modality]`, `broker`, `claim`, `release`, `swap`, `help` (plain-text rows built for chat) — plus every tool through the agent. |
 | **CLI / TUI** | The same `/model-forge` command and tools; model switching is core (`/model`, `hermes model`). |
 | **Web dashboard** | The Model Forge tab (`model-forge/dashboard/`): the same cockpit data — targets, engines, models, storage — as a read-only snapshot. |
@@ -328,9 +328,13 @@ Honest scoping — current limits, and what does not work yet:
   unbooked and the planner refuses to gate them until a measured peak lands
   — run `model_forge_broker` `action=bench` after the model's first load
   (`status` marks those rows `unbooked — run bench after first load`).
-- **`model_forge_generate_media` speaks the media gateway job API only**
-  (`/v1/videos/generations`, `/v1/audio/music`, `/v1/audio/sfx`). The
-  ComfyUI-native job flow (`/prompt` + `/history`) is not implemented.
+- **`model_forge_generate_media` runs image/video through the ComfyUI-native
+  job flow** (`/prompt` + `/history`) on a local or connected ComfyUI endpoint,
+  inside the same claim/release scope as the gateway lanes, with honest
+  progress states. Outputs are `data:` URLs when the file is readable here
+  (local ComfyUI) or the fetchable ComfyUI `/view` URLs when it is not (a
+  connected/remote ComfyUI). 3d/music/sfx ride the media gateway job API
+  (`/v1/videos/generations`, `/v1/audio/music`, `/v1/audio/sfx`).
 - **Engine lifecycle management is limited to weight residency.** Model
   Forge never installs or launches full engine stacks — it detects engines,
   pulls model files, and emits run commands. Claim and release do drive
@@ -343,22 +347,31 @@ Honest scoping — current limits, and what does not work yet:
   only after you approve it at the human-approval gate. llama.cpp is never
   installed — Hermes core's managed runtime covers it.
 
+The complete **known limits and deferred work** register — the reason, today's
+alternative, and what would unblock each item — is in
+[docs/deferred-work.md](../docs/deferred-work.md).
+
 ## Disclosure (what this plugin does on your machine)
 
 - **Network:** probes engine endpoints you configured — compute targets and
   the user-declared engine endpoints from settings (`engines_json`) —
   with engine-specific reads: llama-server `/props`,
-  Ollama `/api/tags`, Maya `/api/catalog`, ComfyUI `/system_stats`, vLLM
-  `/version`, SGLang `/get_model_info`, and OpenAI-compatible
-  `/v1/models` + image-route existence. Model discovery queries the public HuggingFace API
-  (`huggingface.co/api/models`, newest-first per modality; disabled with
-  `fresh=false`) and caches answers for one hour. Model downloads stream
-  from the URL the engine or registry names (HuggingFace / ModelScope
-  resolve links); install plans may also query the HuggingFace API for a
-  repository's file list when no file is named. Media jobs (`model_forge_generate_media`) POST prompts and
-  image bytes to user-configured compute targets, and Maya pulls POST to the
-  target's `/api/pull`; 3D media jobs poll the gateway's `/jobs/<id>` route
-  until the job settles. Weight residency claims and releases
+  Ollama `/api/tags`, Maya `/api/catalog`, Ollama/Maya `/api/ps` (the bench
+  action's remote memory report), ComfyUI `/system_stats`, vLLM
+  `/version`, SGLang `/get_model_info`, Exo `/node_id` and `/state`, and
+  OpenAI-compatible `/v1/models` + image-route existence. Model discovery
+  queries the public HuggingFace API (`huggingface.co/api/models`, newest-first
+  per modality or keyword search via `query`; disabled with `fresh=false`) and
+  caches answers for one hour. Model downloads stream from the URL the engine
+  or registry names (HuggingFace / ModelScope resolve links); install plans may
+  also query the HuggingFace API for a repository's file list when no file is
+  named. Media jobs (`model_forge_generate_media`) POST prompts and image bytes
+  to user-configured compute targets, and Ollama / Maya pulls POST to the
+  target's `/api/pull` (Ollama pulls stream NDJSON progress in a background
+  job); image and video jobs may also run through a
+  configured ComfyUI endpoint's workflow queue (`POST /prompt`,
+  `GET /history/<id>`), with output files read via `/view`; 3D media jobs
+  poll the gateway's `/jobs/<id>` route until the job settles. Weight residency claims and releases
   (`model_forge_broker`, and the automatic scope around
   `model_forge_generate_media` jobs) drive engine load and unload calls on
   your user-configured compute-target endpoints — for example an Ollama
@@ -400,8 +413,11 @@ Honest scoping — current limits, and what does not work yet:
   server processes on this machine; every such START (including a release
   whose restore re-loads a non-resident process-engine model, and a media
   job's lane claim/release) rides the human-approval gate
-  (`model-forge:broker_server_start`) and binds `127.0.0.1` only. Outside
-  those gated starts, no engine launcher is run by the plugin.
+  (`model-forge:broker_server_start`) and binds `127.0.0.1` only; stopping a
+  server the plugin did not start is gated the same way (server provenance
+  is tracked honestly, and otherwise the plugin stops only what it started).
+  Outside those gated starts and stops, no engine launcher is run by the
+  plugin.
 - **Background:** long model downloads and approved engine installs run on
   a daemon background thread (job records are pollable with
   `model_forge_install` `job_id`); installer jobs carry a hard timeout (900
@@ -424,18 +440,26 @@ Honest scoping — current limits, and what does not work yet:
   directory and in your engine-managed model directories (the Ollama models
   dir and the HuggingFace hub cache under your home directory);
   `model_forge_storage` with `action=delete` removes the user-approved files
-  and folders from those roots. The `/model-forge` cockpit command, the
-  Desktop cockpit pane, and the dashboard tab are read-only: they return the
-  same inventory data (never delete or write) and issue the same read-only
-  engine probes. Your Hermes config is the one exception to "never write":
-  an approved activation writes the `model:` section plus a
-  `custom_providers` entry (see Approvals), and the `model-forge-providers`
-  package's `hermes model` setup step writes those same two sections after
-  you pick a model interactively.
+  and folders from those roots. The `/model-forge` cockpit command and the
+  dashboard tab are read-only: they return the same inventory data (never
+  delete or write) and issue the same read-only engine probes. The Desktop
+  plugin (`model-forge-desktop`) reads local host facts (`machine.facts`),
+  plugin settings/suite status (`plugins.manage`), and tool-registered targets
+  (read-only shell read), saves user-submitted target/engine/media settings via
+  `plugins.manage settings`, saves or removes `HF_TOKEN` via Hermes' official
+  `model.save_key` / `model.disconnect` credential routes, and routes
+  destructive deletes, engine installers, and model activations to Hermes chat
+  behind the human-approval gate. Your Hermes config is written only after
+  explicit approval: an approved activation writes the `model:` section plus a
+  `custom_providers` entry, and when activating vision, image, or video models
+  also writes `auxiliary.vision`, `image_gen` + `model-forge-image`, or
+  `video_gen` + `model-forge-video` (see Approvals); the `model-forge-providers`
+  package's `hermes model` setup step writes the chat sections after you pick
+  a model interactively.
 - **Approvals:** actions escalate to Hermes' human-approval gate and
   fail closed on denial or timeout — registering a compute target, writing
-  the default model config plus a `custom_providers` entry (so the
-  activated model is switchable with `/model`) via
+  Hermes model/provider config (`model.*`, `custom_providers`, `auxiliary.vision`,
+  `image_gen` + `model-forge-image`, or `video_gen` + `model-forge-video`) via
   `model_forge_activate` with `apply=true`,
   deleting a model-storage entry (`model_forge_storage` with `action=delete`;
   the prompt names the exact path and size), running a vendor engine
@@ -455,8 +479,9 @@ Honest scoping — current limits, and what does not work yet:
   action mapped to its rule key or its documented reason for needing
   none — is in [docs/surface-parity.md](../docs/surface-parity.md).
 - **Credentials:** none required. HF/ModelScope tokens are optional, stored
-  through Hermes' credential route (`Settings → Plugins`), read only via the
-  secret scope.
+  through Hermes' credential route (`Settings → Plugins` or the in-GUI Hugging
+  Face dialog via `model.save_key`), read only via the secret scope, and sent
+  only to their own hosts (`huggingface.co` / `modelscope.cn`).
 - **Telemetry:** none.
 
 ## Requirements
@@ -487,7 +512,6 @@ The repo holds five installable packages: `model-forge/` (tools + hooks),
 ```bash
 python3 tests/run.py                # stdlib runner, no deps; without pytest it
                                     # skips fixture-based tests
-cd /path/to/model-forge             # repo root
 pytest -q                           # same suite under pytest (root config: pytest.ini)
 cd model-forge          # the tools plugin
 hermes plugins doctor . --ci        # load-test in isolation
