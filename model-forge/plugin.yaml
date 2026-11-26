@@ -1,5 +1,5 @@
 name: model-forge
-version: 2.0.0
+version: 2.0.1
 requires_hermes: ">=0.23.0"
 description: >-
   Unified local-AI platform for Hermes — one install ships all 8 tools, the

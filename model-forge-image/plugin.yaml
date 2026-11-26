@@ -1,6 +1,6 @@
 name: model-forge-image
 kind: backend
-version: 2.0.0
+version: 2.0.1
 requires_hermes: ">=0.23.0"
 description: "Model Forge local image generation backend — routes image_generate to either a raw ComfyUI endpoint (native /prompt workflows, no separate facade required) or any OpenAI-compatible images API (media gateway, vLLM-Omni, SGLang Diffusion). Disclosure: sends prompts and image bytes to the single endpoint you configure and reads its /models or /system_stats listing; local image inputs pass the Hermes read-block check, image magic bytes, and a 25 MB cap. No other network, no telemetry."
 author: anai (Pewpy)

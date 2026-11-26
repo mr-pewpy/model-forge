@@ -145,6 +145,91 @@ const ENGINE_GUIDE = [
 
 const refreshHooks = new Set();
 let openAddGpuHook = null;
+let lastUnifiedState = null;
+
+function plural(n, singular, many) {
+  return n + " " + (n === 1 ? singular : many);
+}
+
+function capitalizeFirst(text) {
+  const s = String(text || "").trim();
+  if (!s) return "";
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function engineDisplayName(e) {
+  if (!e) return "Inference Server";
+  if (e.id === "openai-compatible") return "OpenAI-Compatible Server";
+  return e.name || e.id || "Inference Server";
+}
+
+function engineShortStatus(e) {
+  if (!e) return "";
+  const count = Array.isArray(e.models_loaded) ? e.models_loaded.length : 0;
+  if (count > 0) return plural(count, "model", "models") + " live";
+  const detail = String(e.detail || "").replace(/\s*—\s*engine identity unknown.*$/i, "").trim();
+  if (!detail) return "Online";
+  return detail.length > 56 ? detail.slice(0, 55) + "…" : detail;
+}
+
+function inferLiveModelRole(modelId, engine) {
+  const m = String(modelId || "").toLowerCase();
+  if (/(?:t2v|i2v|r2v|video|ltx|wan|mochi|cogvideo|hunyuan-?video|h3-)/.test(m)) {
+    return { badge: "Video", surface: "video", actionLabel: "Use for Video" };
+  }
+  if (/(?:edit|cutout|inpaint|kontext|klein)/.test(m)) {
+    return { badge: "Image Edit", surface: "image", actionLabel: "Use for Images" };
+  }
+  if (/(?:^gen\/|image|flux|sdxl|moss-image|krea|z-image|diffusion)/.test(m)) {
+    return { badge: "Image", surface: "image", actionLabel: "Use for Images" };
+  }
+  if (/(?:vl\b|-vl-|vision|ocr|pixtral|llava)/.test(m)) {
+    return { badge: "Vision", surface: "vision", actionLabel: "Use for Vision" };
+  }
+  const mods = (engine && Array.isArray(engine.modalities)) ? engine.modalities : [];
+  if (mods.includes("video") && !mods.includes("chat")) {
+    return { badge: "Video", surface: "video", actionLabel: "Use for Video" };
+  }
+  if (mods.includes("image") && !mods.includes("chat")) {
+    return { badge: "Image", surface: "image", actionLabel: "Use for Images" };
+  }
+  return { badge: "Chat", surface: "chat", actionLabel: "Use for Chat" };
+}
+
+function isModelActiveInWiring(modelId, surface, activeWiring, mediaSettings) {
+  const id = String(modelId || "").trim().toLowerCase();
+  if (!id) return false;
+  if (activeWiring && activeWiring.ok) {
+    if (surface === "chat" && String((activeWiring.chat && activeWiring.chat.model) || "").toLowerCase() === id) return true;
+    if (surface === "vision" && String((activeWiring.vision && activeWiring.vision.model) || "").toLowerCase() === id) return true;
+    if (surface === "chat" && String((activeWiring.vision && activeWiring.vision.model) || "").toLowerCase() === id) return true;
+  }
+  if (mediaSettings) {
+    if (surface === "image" && String(mediaSettings.imageDefaultModel || "").toLowerCase() === id) return true;
+    if (surface === "video" && String(mediaSettings.videoDefaultModel || "").toLowerCase() === id) return true;
+  }
+  return false;
+}
+
+function pickDefaultTargetId(targets) {
+  if (!Array.isArray(targets) || !targets.length) return "local";
+  const local = targets.find((t) => t.id === "local");
+  const localHasGpu = Boolean(local && local.hardware && local.hardware.total_vram_gb > 0);
+  const localHasLive = Boolean(local && (local.engines || []).some((e) => e.available));
+  if (localHasLive || localHasGpu) return "local";
+  const remoteLive = targets.find((t) => t.id !== "local" && (t.engines || []).some((e) => e.available));
+  if (remoteLive) return remoteLive.id;
+  const remoteGpu = targets.find((t) => t.id !== "local" && t.hardware && t.hardware.total_vram_gb > 0);
+  if (remoteGpu) return remoteGpu.id;
+  return "local";
+}
+
+function SafeDot(props) {
+  return jsx("span", {
+    className: "inline-flex shrink-0 items-center",
+    children: jsx(StatusDot, { tone: props.tone }),
+  });
+}
 
 function notifyRefreshHooks() {
   refreshHooks.forEach((fn) => {
@@ -316,13 +401,15 @@ async function loadUnifiedState(ctx) {
   const errors = [];
   if (settings.error) errors.push(settings.error);
   if (cockpit && cockpit.ok === false && cockpit.error) errors.push(cockpit.error);
-  return {
+  const result = {
     settings,
     cockpit: cockpit && cockpit.ok !== false ? cockpit : null,
     jobs: (jobsRes && Array.isArray(jobsRes.jobs)) ? jobsRes.jobs : [],
     clis: (clisRes && clisRes.clis) || {},
     errors,
   };
+  lastUnifiedState = result;
+  return result;
 }
 
 // --- Shared visual primitives ------------------------------------------------
@@ -330,7 +417,7 @@ async function loadUnifiedState(ctx) {
 function Card(props) {
   return jsx("div", {
     className: cn(
-      "rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary)/40 p-3.5",
+      "min-w-0 overflow-hidden rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary)/40 p-3.5",
       props.className,
     ),
     children: props.children,
@@ -716,16 +803,16 @@ function AddComputeDialog(props) {
                 jsx("div", {
                   className: "mb-1 font-medium text-(--ui-text-primary)",
                   children: probeResult.engines.length
-                    ? "Connected! Detected " + probeResult.engines.length + " engine(s):"
+                    ? "Connected! Detected " + plural(probeResult.engines.length, "engine", "engines") + ":"
                     : "No engine answered at " + probeResult.url + " (you can still save it and start the engine later).",
                 }),
                 ...probeResult.engines.map((e, i) => jsxs("div", {
                   key: "pe-" + i,
                   className: "flex items-center gap-2 py-0.5 text-(--ui-text-secondary)",
                   children: [
-                    jsx(StatusDot, { tone: "good" }),
-                    jsx("span", { className: "font-medium", children: e.name || e.id }),
-                    jsx("span", { className: "text-(--ui-text-quaternary)", children: e.detail }),
+                    jsx(SafeDot, { tone: "good" }),
+                    jsx("span", { className: "shrink-0 font-medium text-(--ui-text-primary)", children: engineDisplayName(e) }),
+                    jsx("span", { className: "truncate text-(--ui-text-tertiary)", children: engineShortStatus(e) }),
                   ],
                 })),
               ],
@@ -822,10 +909,14 @@ function ActionPromptDialog(props) {
 
 function ModelForgeWorkspace(props) {
   const ctx = props.ctx;
-  const [state, setState] = useState(null);
+  const [state, setState] = useState(() => lastUnifiedState);
   const [showFullCockpit, setShowFullCockpit] = useState(false);
   const [tab, setTab] = useState("models");
-  const [selectedTarget, setSelectedTarget] = useState("local");
+  const [selectedTarget, setSelectedTarget] = useState(() => {
+    const ts = (lastUnifiedState && lastUnifiedState.cockpit && lastUnifiedState.cockpit.targets) || [];
+    return pickDefaultTargetId(ts);
+  });
+  const [userPickedTarget, setUserPickedTarget] = useState(false);
   const [modality, setModality] = useState("all");
   const [search, setSearch] = useState("");
   const [liveBrowse, setLiveBrowse] = useState({ phase: "idle", models: null, fresh: [], query: "", error: "" });
@@ -838,10 +929,10 @@ function ModelForgeWorkspace(props) {
   const [removeConfirm, setRemoveConfirm] = useState(null);
   const [pendingAction, setPendingAction] = useState(null);
   const [engineCmdDialog, setEngineCmdDialog] = useState(null);
-  const [imgUrlDraft, setImgUrlDraft] = useState("");
-  const [imgModelDraft, setImgModelDraft] = useState("");
-  const [vidUrlDraft, setVidUrlDraft] = useState("");
-  const [vidModelDraft, setVidModelDraft] = useState("");
+  const [imgUrlDraft, setImgUrlDraft] = useState(() => (lastUnifiedState && lastUnifiedState.settings && lastUnifiedState.settings.mediaSettings.imageBaseUrl) || "");
+  const [imgModelDraft, setImgModelDraft] = useState(() => (lastUnifiedState && lastUnifiedState.settings && lastUnifiedState.settings.mediaSettings.imageDefaultModel) || "");
+  const [vidUrlDraft, setVidUrlDraft] = useState(() => (lastUnifiedState && lastUnifiedState.settings && lastUnifiedState.settings.mediaSettings.videoBaseUrl) || "");
+  const [vidModelDraft, setVidModelDraft] = useState(() => (lastUnifiedState && lastUnifiedState.settings && lastUnifiedState.settings.mediaSettings.videoDefaultModel) || "");
   const [savingMedia, setSavingMedia] = useState(false);
 
   const load = () => {
@@ -851,6 +942,14 @@ function ModelForgeWorkspace(props) {
       setImgModelDraft(next.settings.mediaSettings.imageDefaultModel || "");
       setVidUrlDraft(next.settings.mediaSettings.videoBaseUrl || "");
       setVidModelDraft(next.settings.mediaSettings.videoDefaultModel || "");
+      const ts = (next.cockpit && next.cockpit.targets) || [];
+      if (!userPickedTarget) {
+        const best = pickDefaultTargetId(ts);
+        if (best && best !== selectedTarget) {
+          setSelectedTarget(best);
+          runLiveBrowse({ target: best, fresh: false });
+        }
+      }
     });
   };
 
@@ -1155,10 +1254,23 @@ function ModelForgeWorkspace(props) {
         const key = eng.targetId + "::" + eng.id + "::" + mid;
         if (mid && !seenLive.has(key)) {
           seenLive.add(key);
-          liveModels.push({ modelId: mid, engineName: eng.name, targetId: eng.targetId, targetLabel: eng.targetLabel });
+          const role = inferLiveModelRole(mid, eng);
+          const isActive = isModelActiveInWiring(mid, role.surface, activeWiring, state.settings.mediaSettings);
+          liveModels.push({
+            modelId: mid,
+            engineName: engineDisplayName(eng),
+            targetId: eng.targetId,
+            targetLabel: eng.targetLabel,
+            role,
+            isActive,
+          });
         }
       });
     });
+
+    const activeTargetObj = cockpitTargets.find((t) => t.id === selectedTarget) || localTarget || cockpitTargets[0];
+    const activeTargetLabel = activeTargetObj ? (activeTargetObj.label || activeTargetObj.id) : selectedTarget;
+    const activeTargetVram = activeTargetObj && activeTargetObj.hardware && activeTargetObj.hardware.total_vram_gb;
 
     return jsxs("div", {
       className: "grid gap-4",
@@ -1167,35 +1279,50 @@ function ModelForgeWorkspace(props) {
 
         // Live models ready on active engines
         liveModels.length > 0 ? jsxs(Card, {
-          className: "grid gap-2",
+          className: "grid gap-2.5",
           children: [
             jsxs("div", {
-              className: "flex items-center justify-between",
+              className: "flex flex-wrap items-center justify-between gap-2",
               children: [
-                jsx("div", { className: "text-xs font-semibold text-(--ui-text-primary)", children: "Ready right now (" + liveModels.length + " loaded on your engines)" }),
-                jsx(Badge, { variant: "success", size: "xs", children: "Live" }),
+                jsxs("div", {
+                  className: "flex items-center gap-2",
+                  children: [
+                    jsx("div", { className: "text-xs font-semibold text-(--ui-text-primary)", children: "Ready Right Now" }),
+                    jsx(Badge, { variant: "success", size: "xs", children: plural(liveModels.length, "model", "models") + " live" }),
+                  ],
+                }),
+                jsx("div", { className: "text-[11px] text-(--ui-text-tertiary)", children: "Pick a model to route it into Hermes chat, vision, images, or video." }),
               ],
             }),
             jsx("div", {
-              className: "grid gap-1.5 sm:grid-cols-2",
-              children: liveModels.slice(0, 8).map((lm, i) => jsxs("div", {
+              className: "grid gap-2",
+              style: { gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))" },
+              children: liveModels.slice(0, 12).map((lm, i) => jsxs("div", {
                 key: "lm-" + i,
-                className: "flex items-center justify-between gap-2 rounded border border-(--ui-stroke-tertiary) px-2.5 py-1.5 text-xs",
+                className: "flex min-w-0 items-center justify-between gap-2.5 rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-bg-primary)/30 px-3 py-2 text-xs",
                 children: [
                   jsxs("div", {
-                    className: "min-w-0",
+                    className: "min-w-0 flex-1",
                     children: [
-                      jsx("div", { className: "truncate font-medium text-(--ui-text-primary)", children: lm.modelId }),
-                      jsx("div", { className: "truncate text-[11px] text-(--ui-text-tertiary)", children: lm.engineName + " · " + lm.targetLabel }),
+                      jsxs("div", {
+                        className: "flex items-center gap-1.5",
+                        children: [
+                          jsx("span", { className: "truncate font-medium text-(--ui-text-primary)", children: lm.modelId }),
+                          jsx(Badge, { variant: "outline", size: "xs", children: lm.role.badge }),
+                          lm.isActive ? jsx(Badge, { variant: "success", size: "xs", children: "Active" }) : null,
+                        ],
+                      }),
+                      jsx("div", { className: "mt-0.5 truncate text-[11px] text-(--ui-text-tertiary)", children: lm.targetLabel + " · " + lm.engineName }),
                     ],
                   }),
                   jsx(Button, {
                     size: "xs",
+                    variant: lm.isActive ? "outline" : "secondary",
                     onClick: () => triggerAgentAction(
                       "Use " + lm.modelId + " in Hermes",
-                      "Call model_forge_activate with model_id=" + JSON.stringify(lm.modelId) + ", target=" + JSON.stringify(lm.targetId) + ", and apply=true so I can approve wiring it natively into Hermes.",
+                      "Call model_forge_activate with model_id=" + JSON.stringify(lm.modelId) + ", surface=" + JSON.stringify(lm.role.surface) + ", target=" + JSON.stringify(lm.targetId) + ", and apply=true so I can approve wiring it natively into Hermes.",
                     ),
-                    children: "Use in Hermes",
+                    children: lm.isActive ? "Wired" : lm.role.actionLabel,
                   }),
                 ],
               })),
@@ -1208,21 +1335,9 @@ function ModelForgeWorkspace(props) {
           className: "grid gap-2.5",
           children: [
             jsxs("div", {
-              className: "flex flex-wrap items-center justify-between gap-2",
               children: [
-                jsxs("div", {
-                  children: [
-                    jsx("div", { className: "text-xs font-semibold text-(--ui-text-primary)", children: "Pull any model or search Hugging Face" }),
-                    jsx("div", { className: "text-[11px] text-(--ui-text-tertiary)", children: "Paste any Hugging Face repo (e.g. unsloth/Qwen3-8B-GGUF) or Ollama tag (e.g. qwen3:8b), or search Hugging Face live right here." }),
-                  ],
-                }),
-                jsx(Button, {
-                  size: "xs",
-                  variant: "outline",
-                  disabled: liveBrowse.phase === "loading",
-                  onClick: () => runLiveBrowse({ query: customModelId.trim() || search.trim(), fresh: true }),
-                  children: liveBrowse.phase === "loading" ? "Searching…" : "Search Hugging Face",
-                }),
+                jsx("div", { className: "text-xs font-semibold text-(--ui-text-primary)", children: "Find or Download Any Open-Weight Model" }),
+                jsx("div", { className: "text-[11px] text-(--ui-text-tertiary)", children: "Search Hugging Face live by keyword, or paste a repo (unsloth/Qwen3-8B-GGUF) or Ollama tag (qwen3:8b) to pull." }),
               ],
             }),
             jsxs("div", {
@@ -1232,6 +1347,11 @@ function ModelForgeWorkspace(props) {
                   className: "min-w-56 flex-1",
                   value: customModelId,
                   onChange: (e) => setCustomModelId(e.target.value),
+                  onKeyDown: (e) => {
+                    if (e.key === "Enter" && customModelId.trim()) {
+                      runLiveBrowse({ query: customModelId.trim(), fresh: true });
+                    }
+                  },
                   placeholder: "Search keyword, owner/repo, or Ollama tag (e.g. qwen3:8b)",
                 }),
                 jsx(SegmentedControl, {
@@ -1248,6 +1368,14 @@ function ModelForgeWorkspace(props) {
                 }),
                 jsx(Button, {
                   size: "sm",
+                  variant: "outline",
+                  disabled: liveBrowse.phase === "loading",
+                  onClick: () => runLiveBrowse({ query: customModelId.trim() || search.trim(), fresh: true }),
+                  children: liveBrowse.phase === "loading" ? "Searching…" : "Search HF",
+                }),
+                jsx(Button, {
+                  size: "sm",
+                  variant: customModelId.trim() ? "default" : "secondary",
                   disabled: !customModelId.trim(),
                   onClick: () => {
                     const mid = customModelId.trim();
@@ -1272,20 +1400,21 @@ function ModelForgeWorkspace(props) {
               className: "flex items-center justify-between",
               children: [
                 jsx("div", { className: "text-xs font-semibold text-(--ui-text-primary)", children: "Live Hugging Face Results" + (liveBrowse.query ? " for \"" + liveBrowse.query + "\"" : "") + " (" + liveBrowse.fresh.length + ")" }),
-                jsx(Badge, { variant: "outline", size: "xs", children: "Unvetted live HF" }),
+                jsx(Badge, { variant: "outline", size: "xs", children: "Live Hugging Face" }),
               ],
             }),
             jsx("div", {
-              className: "grid gap-1.5 sm:grid-cols-2",
+              className: "grid gap-1.5",
+              style: { gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))" },
               children: liveBrowse.fresh.slice(0, 8).map((row) => jsxs("div", {
                 key: row.id,
-                className: "flex items-center justify-between gap-2 rounded border border-(--ui-stroke-tertiary) px-2.5 py-1.5 text-xs",
+                className: "flex min-w-0 items-center justify-between gap-2 rounded border border-(--ui-stroke-tertiary) px-2.5 py-1.5 text-xs",
                 children: [
                   jsxs("div", {
                     className: "min-w-0",
                     children: [
                       jsx("div", { className: "truncate font-medium text-(--ui-text-primary)", children: row.id }),
-                      jsx("div", { className: "truncate text-[11px] text-(--ui-text-tertiary)", children: (row.pipeline_tag || "model") + (row.downloads ? " · " + Number(row.downloads).toLocaleString() + " pulls" : "") }),
+                      jsx("div", { className: "truncate text-[11px] text-(--ui-text-tertiary)", children: (row.pipeline_tag || "model") + (row.downloads ? " · " + Number(row.downloads).toLocaleString() + " downloads" : "") }),
                     ],
                   }),
                   jsx(Button, {
@@ -1306,29 +1435,51 @@ function ModelForgeWorkspace(props) {
           ],
         }) : null,
 
-        // Modality chips + filter
+        // Modality chips + filter + target scope context
         jsxs("div", {
-          className: "flex flex-wrap items-center justify-between gap-2",
+          className: "grid gap-2 pt-1",
           children: [
-            jsx("div", {
-              className: "flex flex-wrap gap-1",
-              children: MODALITY_OPTIONS.map((opt) => jsx(Button, {
-                key: opt.id,
-                size: "xs",
-                variant: modality === opt.id ? "default" : "chip",
-                onClick: () => setModality(opt.id),
-                children: opt.label,
-              })),
+            jsxs("div", {
+              className: "flex flex-wrap items-center justify-between gap-2",
+              children: [
+                jsx("div", { className: "text-xs font-semibold text-(--ui-text-primary)", children: "Curated Model Catalog" }),
+                jsx(Badge, {
+                  variant: "outline",
+                  size: "xs",
+                  children: "Fit checked for " + activeTargetLabel + (activeTargetVram ? " (" + activeTargetVram + " GB VRAM)" : ""),
+                }),
+              ],
             }),
-            jsx(SearchField, { variant: "box", containerClassName: "w-56", placeholder: "Filter curated catalog…", value: search, onChange: setSearch }),
+            jsxs("div", {
+              className: "flex flex-wrap items-center justify-between gap-2",
+              children: [
+                jsx("div", {
+                  className: "flex flex-wrap gap-1",
+                  children: MODALITY_OPTIONS.map((opt) => jsx(Button, {
+                    key: opt.id,
+                    size: "xs",
+                    variant: modality === opt.id ? "default" : "chip",
+                    onClick: () => setModality(opt.id),
+                    children: opt.label,
+                  })),
+                }),
+                jsx(Input, {
+                  className: "w-56",
+                  value: search,
+                  onChange: (e) => setSearch(e.target.value),
+                  placeholder: "Filter catalog…",
+                }),
+              ],
+            }),
           ],
         }),
 
         // Curated catalog grid
         modelRows.length === 0
-          ? jsx(EmptyState, { title: "No curated models match", description: "Click 'Search Hugging Face' above to search all open-weight models live." })
+          ? jsx(EmptyState, { title: "No curated models match", description: "Click 'Search HF' above to search all open-weight models live." })
           : jsx("div", {
-              className: "grid gap-2.5 md:grid-cols-2",
+              className: "grid gap-2.5",
+              style: { gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))" },
               children: modelRows.map((m) => {
                 const fit = m.fit || {};
                 const badge = fitBadgeMeta(fit.verdict || m.status);
@@ -1340,7 +1491,7 @@ function ModelForgeWorkspace(props) {
                   className: "flex flex-col justify-between gap-2.5",
                   children: [
                     jsxs("div", {
-                      className: "grid gap-1",
+                      className: "grid gap-1.5",
                       children: [
                         jsxs("div", {
                           className: "flex items-start justify-between gap-2",
@@ -1358,14 +1509,14 @@ function ModelForgeWorkspace(props) {
                             matchedRunning ? jsx(Badge, { variant: "success", size: "xs", children: matchedRunning + " ready" }) : null,
                           ],
                         }),
-                        (fit.advisory || m.note) ? jsx("div", { className: "text-xs leading-relaxed text-(--ui-text-secondary)", children: fit.advisory || m.note }) : null,
+                        (fit.advisory || m.note) ? jsx("div", { className: "text-xs leading-relaxed text-(--ui-text-secondary)", children: capitalizeFirst(fit.advisory || m.note) }) : null,
                       ],
                     }),
                     jsxs("div", {
                       className: "flex flex-wrap items-center gap-1.5 pt-1",
                       children: [
                         isCoreGguf
-                          ? jsx(Button, { size: "xs", onClick: () => host.navigate("/settings?tab=providers"), children: "Open Hermes Local Models" })
+                          ? jsx(Button, { size: "xs", variant: "secondary", onClick: () => host.navigate("/settings?tab=providers"), children: "Open Hermes Local Models" })
                           : jsx(Button, {
                               size: "xs",
                               variant: matchedRunning ? "default" : "secondary",
@@ -1445,48 +1596,57 @@ function ModelForgeWorkspace(props) {
                   jsxs("div", {
                     className: "flex flex-wrap items-start justify-between gap-2",
                     children: [
-                      jsxs("div", {
-                        children: [
-                          jsxs("div", {
-                            className: "flex items-center gap-2",
-                            children: [
-                              jsx(StatusDot, { tone: live.length ? "good" : "muted" }),
-                              jsx("span", { className: "text-sm font-semibold text-(--ui-text-primary)", children: t.label || t.id }),
-                              jsx(Badge, { variant: "outline", size: "xs", children: t.kind }),
-                              t.hardware && t.hardware.total_vram_gb ? jsx(Badge, { variant: "default", size: "xs", children: t.hardware.total_vram_gb + " GB VRAM" }) : null,
-                            ],
-                          }),
-                          jsx("div", { className: "mt-0.5 font-mono text-[11px] text-(--ui-text-quaternary)", children: t.base_url }),
-                        ],
-                      }),
-                      jsxs("div", {
-                        className: "flex items-center gap-1.5",
-                        children: [
-                          jsx(Button, {
+                        jsxs("div", {
+                          className: "min-w-0 flex-1",
+                          children: [
+                            jsxs("div", {
+                              className: "flex flex-wrap items-center gap-2",
+                              children: [
+                                jsx(SafeDot, { tone: live.length ? "good" : "muted" }),
+                                jsx("span", { className: "text-sm font-semibold text-(--ui-text-primary)", children: t.label || t.id }),
+                                jsx(Badge, { variant: "outline", size: "xs", children: t.kind }),
+                                t.hardware && t.hardware.total_vram_gb ? jsx(Badge, { variant: "default", size: "xs", children: t.hardware.total_vram_gb + " GB VRAM" }) : null,
+                              ],
+                            }),
+                            jsx("div", { className: "mt-0.5 truncate font-mono text-[11px] text-(--ui-text-quaternary)", children: t.base_url }),
+                          ],
+                        }),
+                        jsxs("div", {
+                          className: "flex shrink-0 items-center gap-1.5",
+                          children: [
+                            jsx(Button, {
+                              size: "xs",
+                              variant: "outline",
+                              onClick: () => {
+                                const found = (state.settings.targets || []).find((st) => st.id === t.id) || {
+                                  id: t.id, label: t.label, base_url: t.base_url, kind: t.kind,
+                                  vram_gb: (t.hardware && t.hardware.total_vram_gb) || 0,
+                                  ram_gb: (t.hardware && t.hardware.ram_gb) || 0,
+                                };
+                                setEditingTarget(found);
+                                setAddGpuMode(t.kind || "lan");
+                                setAddGpuOpen(true);
+                              },
+                              children: "Edit",
+                            }),
+                            fromSettings
+                              ? jsx(Button, { size: "xs", variant: "ghost", onClick: () => setRemoveConfirm({ kind: "target", id: t.id, label: t.label || t.id }), children: "Remove" })
+                              : jsx(Button, { size: "xs", variant: "ghost", onClick: () => triggerAgentAction("Remove target " + t.label, "Call model_forge_target_add with action=\"remove\" and id=" + JSON.stringify(t.id) + "."), children: "Remove…" }),
+                          ],
+                        }),
+                      ],
+                    }),
+                    live.length
+                      ? jsx("div", {
+                          className: "flex flex-wrap gap-1.5",
+                          children: live.map((e, i) => jsx(Badge, {
+                            key: i,
+                            variant: "success",
                             size: "xs",
-                            variant: "outline",
-                            onClick: () => {
-                              const found = (state.settings.targets || []).find((st) => st.id === t.id) || {
-                                id: t.id, label: t.label, base_url: t.base_url, kind: t.kind,
-                                vram_gb: (t.hardware && t.hardware.total_vram_gb) || 0,
-                                ram_gb: (t.hardware && t.hardware.ram_gb) || 0,
-                              };
-                              setEditingTarget(found);
-                              setAddGpuMode(t.kind || "lan");
-                              setAddGpuOpen(true);
-                            },
-                            children: "Edit",
-                          }),
-                          fromSettings
-                            ? jsx(Button, { size: "xs", variant: "ghost", onClick: () => setRemoveConfirm({ kind: "target", id: t.id, label: t.label || t.id }), children: "Remove" })
-                            : jsx(Button, { size: "xs", variant: "ghost", onClick: () => triggerAgentAction("Remove target " + t.label, "Call model_forge_target_add with action=\"remove\" and id=" + JSON.stringify(t.id) + "."), children: "Remove…" }),
-                        ],
-                      }),
-                    ],
-                  }),
-                  live.length
-                    ? jsx("div", { className: "flex flex-wrap gap-1.5", children: live.map((e, i) => jsx(Badge, { key: i, variant: "success", size: "xs", children: e.name + (e.detail ? " · " + e.detail : "") })) })
-                    : jsx(Hint, { children: "No engine answered at " + t.base_url + " during the last backend probe." }),
+                            children: engineDisplayName(e) + " · " + engineShortStatus(e),
+                          })),
+                        })
+                      : jsx(Hint, { children: "No engine answered at " + t.base_url + " during the last backend probe." }),
                 ],
               });
             }),
@@ -1494,52 +1654,83 @@ function ModelForgeWorkspace(props) {
     ],
   });
 
-  const renderEnginesTab = () => jsxs("div", {
-    className: "grid gap-4",
-    children: [
-      jsxs("div", {
-        className: "flex flex-wrap items-center justify-between gap-2",
-        children: [
-          jsx("div", { className: "text-xs text-(--ui-text-secondary)", children: "Start an installed local engine, install a vendor engine behind approval, or connect any running URL." }),
-          jsx(Button, { size: "sm", onClick: () => { setEditingTarget(null); setAddGpuMode("engine"); setAddGpuOpen(true); }, children: "Connect Engine URL" }),
-        ],
-      }),
-      jsx("div", {
-        className: "grid gap-2.5 md:grid-cols-2",
-        children: ENGINE_GUIDE.map((eng) => {
-          const live = runningEngines.find((r) => r.id === eng.id) || null;
-          const cli = (state.clis && state.clis[eng.id]) || null;
-          const installed = Boolean(cli && cli.installed);
-          const managedRunning = Boolean(cli && cli.managed_running);
-          return jsxs(Card, {
-            key: eng.id,
-            className: "flex flex-col justify-between gap-2.5",
-            children: [
-              jsxs("div", {
-                className: "grid gap-1",
-                children: [
-                  jsxs("div", {
-                    className: "flex items-center justify-between gap-2",
-                    children: [
-                      jsxs("div", {
-                        className: "flex items-center gap-2",
-                        children: [
-                          jsx(StatusDot, { tone: live ? "good" : installed ? "warn" : "muted" }),
-                          jsx("span", { className: "text-sm font-semibold text-(--ui-text-primary)", children: eng.name }),
-                        ],
-                      }),
-                      jsx(Badge, {
-                        variant: live ? "success" : installed ? "default" : "muted",
-                        size: "xs",
-                        children: live ? "Running" : installed ? "Installed (stopped)" : "Not detected",
-                      }),
-                    ],
-                  }),
-                  jsx("div", { className: "text-xs text-(--ui-text-secondary)", children: eng.summary }),
-                  jsx("div", { className: "text-[11px] text-(--ui-text-quaternary)", children: "Modalities: " + eng.modalities.join(", ") + " · port :" + eng.defaultPort }),
-                  live ? jsx("div", { className: "text-[11px] text-(--ui-accent)", children: "Active at " + (live.root || "") + (live.detail ? " — " + live.detail : "") }) : null,
-                ],
-              }),
+  const renderEnginesTab = () => {
+    const knownIds = new Set(ENGINE_GUIDE.map((g) => g.id));
+    const customLive = runningEngines.filter((r) => !knownIds.has(r.id));
+    return jsxs("div", {
+      className: "grid gap-4",
+      children: [
+        jsxs("div", {
+          className: "flex flex-wrap items-center justify-between gap-2",
+          children: [
+            jsx("div", { className: "text-xs text-(--ui-text-secondary)", children: "Start an installed local engine, install a vendor engine behind approval, or connect any running URL." }),
+            jsx(Button, { size: "sm", variant: "outline", onClick: () => { setEditingTarget(null); setAddGpuMode("engine"); setAddGpuOpen(true); }, children: "Connect Engine URL" }),
+          ],
+        }),
+        customLive.length > 0 ? jsxs(Card, {
+          className: "grid gap-2",
+          children: [
+            jsxs("div", {
+              className: "flex items-center justify-between gap-2",
+              children: [
+                jsx("div", { className: "text-xs font-semibold text-(--ui-text-primary)", children: "Active Custom & OpenAI-Compatible Servers (" + customLive.length + ")" }),
+                jsx(Badge, { variant: "success", size: "xs", children: "Online" }),
+              ],
+            }),
+            ...customLive.map((eng, i) => jsxs("div", {
+              key: "cl-" + i,
+              className: "flex flex-wrap items-center justify-between gap-2 border-t border-(--ui-stroke-tertiary) pt-2 text-xs",
+              children: [
+                jsxs("div", {
+                  className: "flex min-w-0 items-center gap-2",
+                  children: [
+                    jsx(SafeDot, { tone: "good" }),
+                    jsx("span", { className: "font-medium text-(--ui-text-primary)", children: eng.targetLabel + " — " + engineDisplayName(eng) }),
+                    jsx("span", { className: "truncate font-mono text-[11px] text-(--ui-text-quaternary)", children: eng.root }),
+                  ],
+                }),
+                jsx(Badge, { variant: "outline", size: "xs", children: engineShortStatus(eng) }),
+              ],
+            })),
+          ],
+        }) : null,
+        jsx("div", {
+          className: "grid gap-2.5",
+          style: { gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))" },
+          children: ENGINE_GUIDE.map((eng) => {
+            const live = runningEngines.find((r) => r.id === eng.id) || null;
+            const cli = (state.clis && state.clis[eng.id]) || null;
+            const installed = Boolean(cli && cli.installed);
+            const managedRunning = Boolean(cli && cli.managed_running);
+            return jsxs(Card, {
+              key: eng.id,
+              className: "flex flex-col justify-between gap-2.5",
+              children: [
+                jsxs("div", {
+                  className: "grid gap-1",
+                  children: [
+                    jsxs("div", {
+                      className: "flex items-center justify-between gap-2",
+                      children: [
+                        jsxs("div", {
+                          className: "flex min-w-0 items-center gap-2",
+                          children: [
+                            jsx(SafeDot, { tone: live ? "good" : installed ? "warn" : "muted" }),
+                            jsx("span", { className: "truncate text-sm font-semibold text-(--ui-text-primary)", children: eng.name }),
+                          ],
+                        }),
+                        jsx(Badge, {
+                          variant: live ? "success" : installed ? "default" : "muted",
+                          size: "xs",
+                          children: live ? "Running" : installed ? "Installed (stopped)" : "Not detected",
+                        }),
+                      ],
+                    }),
+                    jsx("div", { className: "text-xs text-(--ui-text-secondary)", children: eng.summary }),
+                    jsx("div", { className: "text-[11px] text-(--ui-text-quaternary)", children: "Modalities: " + eng.modalities.join(", ") + " · port :" + eng.defaultPort }),
+                    live ? jsx("div", { className: "truncate text-[11px] text-(--ui-accent)", children: "Active at " + (live.root || "") + " — " + engineShortStatus(live) }) : null,
+                  ],
+                }),
               jsxs("div", {
                 className: "flex flex-wrap items-center gap-1.5",
                 children: [
@@ -1591,9 +1782,10 @@ function ModelForgeWorkspace(props) {
             className: "flex items-center justify-between gap-2 border-t border-(--ui-stroke-tertiary) pt-2 text-xs",
             children: [
               jsxs("div", {
+                className: "min-w-0",
                 children: [
                   jsx("span", { className: "font-medium text-(--ui-text-primary)", children: d.label + " " }),
-                  jsx("span", { className: "font-mono text-[11px] text-(--ui-text-quaternary)", children: d.base_url }),
+                  jsx("span", { className: "truncate font-mono text-[11px] text-(--ui-text-quaternary)", children: d.base_url }),
                 ],
               }),
               jsx(Button, { size: "xs", variant: "ghost", onClick: () => setRemoveConfirm({ kind: "engine", label: d.label, base_url: d.base_url }), children: "Remove" }),
@@ -1603,6 +1795,7 @@ function ModelForgeWorkspace(props) {
       }) : null,
     ],
   });
+  };
 
   const renderWiringTab = () => {
     // Both OpenAI /v1 media servers AND raw ComfyUI endpoints work natively now!
@@ -1641,7 +1834,7 @@ function ModelForgeWorkspace(props) {
             jsxs("div", {
               className: "flex items-center justify-between",
               children: [
-                jsx("div", { className: "text-sm font-semibold text-(--ui-text-primary)", children: "Active Hermes Piping" }),
+                jsx("div", { className: "text-sm font-semibold text-(--ui-text-primary)", children: "Active Hermes Defaults" }),
                 jsx(Button, { size: "xs", variant: "outline", onClick: () => host.navigate("/settings?tab=providers"), children: "Providers Settings" }),
               ],
             }),
@@ -1653,12 +1846,13 @@ function ModelForgeWorkspace(props) {
                 jsx("div", { children: "Image provider: " + (activeWiring.image.provider || "default") + (imgUrlDraft ? " → " + imgUrlDraft : "") }),
                 jsx("div", { children: "Video provider: " + (activeWiring.video.provider || "default") + (vidUrlDraft ? " → " + vidUrlDraft : "") }),
               ],
-            }) : jsx(Hint, { children: "Click 'Use in Hermes' on any model in the Models tab to pipe it natively into Hermes." }),
+            }) : jsx(Hint, { children: "Click a model in the Models tab to route it into Hermes." }),
           ],
         }),
 
         jsxs("div", {
-          className: "grid gap-3 md:grid-cols-2",
+          className: "grid gap-3",
+          style: { gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))" },
           children: [
             jsxs(Card, {
               className: "grid gap-2.5",
@@ -1666,11 +1860,11 @@ function ModelForgeWorkspace(props) {
                 jsxs("div", {
                   className: "flex items-center justify-between",
                   children: [
-                    jsx("div", { className: "text-sm font-semibold text-(--ui-text-primary)", children: "Image Generation Pipe" }),
-                    jsx(Badge, { variant: imgUrlDraft ? "success" : "muted", size: "xs", children: imgUrlDraft ? "Configured" : "Not wired" }),
+                    jsx("div", { className: "text-sm font-semibold text-(--ui-text-primary)", children: "Image Generation" }),
+                    jsx(Badge, { variant: imgUrlDraft ? "success" : "muted", size: "xs", children: imgUrlDraft ? "Configured" : "Not set" }),
                   ],
                 }),
-                jsx("div", { className: "text-[11px] text-(--ui-text-tertiary)", children: "Accepts either a raw ComfyUI URL (e.g. http://127.0.0.1:8188 — native workflows!) or an OpenAI /v1 images API." }),
+                jsx("div", { className: "text-[11px] text-(--ui-text-tertiary)", children: "Accepts either a raw ComfyUI URL (e.g. http://127.0.0.1:8188 — direct workflows) or an OpenAI /v1 images API." }),
                 jsx(Input, { value: imgUrlDraft, onChange: (e) => setImgUrlDraft(e.target.value), placeholder: "http://127.0.0.1:8188 or http://gpu-box.example.com:8080/v1" }),
                 jsx(Input, { value: imgModelDraft, onChange: (e) => setImgModelDraft(e.target.value), placeholder: "Default model or workflow (blank = auto)" }),
                 mediaCandidates.length > 0 ? jsx("div", {
@@ -1680,7 +1874,7 @@ function ModelForgeWorkspace(props) {
                     size: "xs",
                     variant: "chip",
                     onClick: () => setImgUrlDraft(e.id === "comfyui" ? rootUrl(e.root) : rootUrl(e.root) + "/v1"),
-                    children: e.id === "comfyui" ? "Use ComfyUI (direct)" : "Use " + e.name,
+                    children: e.id === "comfyui" ? "Use ComfyUI (direct)" : "Use " + engineDisplayName(e),
                   })),
                 }) : null,
                 jsxs("div", {
@@ -1691,7 +1885,7 @@ function ModelForgeWorkspace(props) {
                       size: "xs",
                       variant: "outline",
                       disabled: !imgUrlDraft.trim(),
-                      onClick: () => triggerAgentAction("Activate Hermes Image Pipe", "Call model_forge_activate with model_id=" + JSON.stringify(imgModelDraft.trim() || "qwen-image-2.1") + ", surface=\"image\", target=" + JSON.stringify(selectedTarget) + ", and apply=true."),
+                      onClick: () => triggerAgentAction("Activate Hermes Image Provider", "Call model_forge_activate with model_id=" + JSON.stringify(imgModelDraft.trim() || "qwen-image-2.1") + ", surface=\"image\", target=" + JSON.stringify(selectedTarget) + ", and apply=true."),
                       children: "Set as Default…",
                     }),
                   ],
@@ -1705,11 +1899,11 @@ function ModelForgeWorkspace(props) {
                 jsxs("div", {
                   className: "flex items-center justify-between",
                   children: [
-                    jsx("div", { className: "text-sm font-semibold text-(--ui-text-primary)", children: "Video Generation Pipe" }),
-                    jsx(Badge, { variant: vidUrlDraft ? "success" : "muted", size: "xs", children: vidUrlDraft ? "Configured" : "Not wired" }),
+                    jsx("div", { className: "text-sm font-semibold text-(--ui-text-primary)", children: "Video Generation" }),
+                    jsx(Badge, { variant: vidUrlDraft ? "success" : "muted", size: "xs", children: vidUrlDraft ? "Configured" : "Not set" }),
                   ],
                 }),
-                jsx("div", { className: "text-[11px] text-(--ui-text-tertiary)", children: "Accepts either a raw ComfyUI URL (e.g. http://127.0.0.1:8188 — native workflows!) or an OpenAI /v1 videos API." }),
+                jsx("div", { className: "text-[11px] text-(--ui-text-tertiary)", children: "Accepts either a raw ComfyUI URL (e.g. http://127.0.0.1:8188 — direct workflows) or an OpenAI /v1 videos API." }),
                 jsx(Input, { value: vidUrlDraft, onChange: (e) => setVidUrlDraft(e.target.value), placeholder: "http://127.0.0.1:8188 or http://gpu-box.example.com:8080/v1" }),
                 jsx(Input, { value: vidModelDraft, onChange: (e) => setVidModelDraft(e.target.value), placeholder: "Default model or workflow (blank = auto)" }),
                 mediaCandidates.length > 0 ? jsx("div", {
@@ -1719,7 +1913,7 @@ function ModelForgeWorkspace(props) {
                     size: "xs",
                     variant: "chip",
                     onClick: () => setVidUrlDraft(e.id === "comfyui" ? rootUrl(e.root) : rootUrl(e.root) + "/v1"),
-                    children: e.id === "comfyui" ? "Use ComfyUI (direct)" : "Use " + e.name,
+                    children: e.id === "comfyui" ? "Use ComfyUI (direct)" : "Use " + engineDisplayName(e),
                   })),
                 }) : null,
                 jsxs("div", {
@@ -1730,7 +1924,7 @@ function ModelForgeWorkspace(props) {
                       size: "xs",
                       variant: "outline",
                       disabled: !vidUrlDraft.trim(),
-                      onClick: () => triggerAgentAction("Activate Hermes Video Pipe", "Call model_forge_activate with model_id=" + JSON.stringify(vidModelDraft.trim() || "ltx-2.5") + ", surface=\"video\", target=" + JSON.stringify(selectedTarget) + ", and apply=true."),
+                      onClick: () => triggerAgentAction("Activate Hermes Video Provider", "Call model_forge_activate with model_id=" + JSON.stringify(vidModelDraft.trim() || "ltx-2.5") + ", surface=\"video\", target=" + JSON.stringify(selectedTarget) + ", and apply=true."),
                       children: "Set as Default…",
                     }),
                   ],
@@ -1822,10 +2016,9 @@ function ModelForgeWorkspace(props) {
                 children: [
                   jsx(Codicon, { name: "layers", size: "1.1rem" }),
                   jsx("h1", { className: "text-lg font-semibold text-(--ui-text-primary)", children: "Model Forge" }),
-                  jsx(Badge, { variant: "success", size: "xs", children: "Unified" }),
                 ],
               }),
-              jsx("p", { className: "mt-0.5 text-xs text-(--ui-text-secondary)", children: "Local open-weight models for every modality — detected via backend, piped natively into Hermes." }),
+              jsx("p", { className: "mt-0.5 text-xs text-(--ui-text-secondary)", children: "Run local and remote open-weight models for chat, vision, images, video, and audio natively in Hermes." }),
             ],
           }),
           jsxs("div", {
@@ -1833,12 +2026,12 @@ function ModelForgeWorkspace(props) {
             children: [
               targetOptions.length > 1 ? jsx(SegmentedControl, {
                 value: selectedTarget,
-                onChange: (tid) => { setSelectedTarget(tid); runLiveBrowse({ target: tid, fresh: false }); },
+                onChange: (tid) => { setUserPickedTarget(true); setSelectedTarget(tid); runLiveBrowse({ target: tid, fresh: false }); },
                 sizing: "content",
                 options: targetOptions,
               }) : null,
               jsx(Button, { size: "sm", variant: "outline", onClick: () => { setEditingTarget(null); setAddGpuMode("lan"); setAddGpuOpen(true); }, children: "Add GPU / Server" }),
-              jsx(Button, { size: "sm", variant: "ghost", onClick: load, children: "Refresh" }),
+              jsx(Button, { size: "sm", variant: "outline", onClick: load, children: "Refresh" }),
             ],
           }),
         ],
@@ -1846,33 +2039,34 @@ function ModelForgeWorkspace(props) {
 
       // 3-Card Status Strip
       jsxs("div", {
-        className: "grid gap-2.5 sm:grid-cols-3",
+        className: "grid gap-2.5",
+        style: { gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" },
         children: [
           jsxs("button", {
             type: "button",
             onClick: () => setTab("compute"),
-            className: "rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary)/50 p-3 text-left hover:bg-(--chrome-action-hover)",
+            className: "min-w-0 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary)/50 p-3 text-left hover:bg-(--chrome-action-hover)",
             children: [
-              jsxs("div", { className: "flex items-center justify-between text-xs font-medium text-(--ui-text-primary)", children: ["GPU & Compute", jsx(StatusDot, { tone: (localHw && localHw.total_vram_gb > 0) || remoteTargets.length > 0 ? "good" : "warn" })] }),
-              jsx("div", { className: "mt-1 truncate text-[11px] text-(--ui-text-secondary)", children: remoteTargets.length > 0 ? localGpuSummary + " + " + remoteTargets.length + " remote" : localGpuSummary }),
+              jsxs("div", { className: "flex items-center justify-between gap-2 text-xs font-medium text-(--ui-text-primary)", children: ["GPU & Compute", jsx(SafeDot, { tone: (localHw && localHw.total_vram_gb > 0) || remoteTargets.length > 0 ? "good" : "warn" })] }),
+              jsx("div", { className: "mt-1 truncate text-[11px] text-(--ui-text-secondary)", children: remoteTargets.length > 0 ? (localHw && localHw.total_vram_gb > 0 ? localGpuSummary + " + " + remoteTargets.length + " remote" : plural(remoteTargets.length, "remote GPU", "remote GPUs") + " connected") : localGpuSummary }),
             ],
           }),
           jsxs("button", {
             type: "button",
             onClick: () => setHfOpen(true),
-            className: "rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary)/50 p-3 text-left hover:bg-(--chrome-action-hover)",
+            className: "min-w-0 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary)/50 p-3 text-left hover:bg-(--chrome-action-hover)",
             children: [
-              jsxs("div", { className: "flex items-center justify-between text-xs font-medium text-(--ui-text-primary)", children: ["Hugging Face", jsx(StatusDot, { tone: hfSet ? "good" : "muted" })] }),
-              jsx("div", { className: "mt-1 text-[11px] text-(--ui-text-secondary)", children: hfSet ? "Token connected" : "Add token for gated models" }),
+              jsxs("div", { className: "flex items-center justify-between gap-2 text-xs font-medium text-(--ui-text-primary)", children: ["Hugging Face", jsx(SafeDot, { tone: hfSet ? "good" : "muted" })] }),
+              jsx("div", { className: "mt-1 truncate text-[11px] text-(--ui-text-secondary)", children: hfSet ? "Token connected" : "Optional — add token for gated models" }),
             ],
           }),
           jsxs("button", {
             type: "button",
             onClick: () => setTab("engines"),
-            className: "rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary)/50 p-3 text-left hover:bg-(--chrome-action-hover)",
+            className: "min-w-0 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary)/50 p-3 text-left hover:bg-(--chrome-action-hover)",
             children: [
-              jsxs("div", { className: "flex items-center justify-between text-xs font-medium text-(--ui-text-primary)", children: ["Inference Engines", jsx(StatusDot, { tone: runningEngines.length > 0 ? "good" : "warn" })] }),
-              jsx("div", { className: "mt-1 truncate text-[11px] text-(--ui-text-secondary)", children: runningEngines.length > 0 ? runningEngines.length + " active (" + runningEngines.slice(0, 2).map((e) => e.name).join(", ") + ")" : "Click to start, install, or connect" }),
+              jsxs("div", { className: "flex items-center justify-between gap-2 text-xs font-medium text-(--ui-text-primary)", children: ["Inference Engines", jsx(SafeDot, { tone: runningEngines.length > 0 ? "good" : "warn" })] }),
+              jsx("div", { className: "mt-1 truncate text-[11px] text-(--ui-text-secondary)", children: runningEngines.length > 0 ? runningEngines.length + " active (" + runningEngines.slice(0, 2).map((e) => engineDisplayName(e)).join(", ") + ")" : "Click to start, install, or connect" }),
             ],
           }),
         ],
@@ -1892,7 +2086,7 @@ function ModelForgeWorkspace(props) {
           { id: "models", label: "Models" },
           { id: "compute", label: "Compute & GPUs" },
           { id: "engines", label: "Engines" },
-          { id: "wiring", label: "Hermes Piping & Keys" },
+          { id: "wiring", label: "Connections & Keys" },
           { id: "storage", label: "Storage & Memory" },
         ],
       }),
@@ -1953,7 +2147,7 @@ function ModelForgeWorkspace(props) {
 
 function CompactSidePane(props) {
   const ctx = props.ctx;
-  const [state, setState] = useState(null);
+  const [state, setState] = useState(() => lastUnifiedState);
   const load = () => { loadUnifiedState(ctx).then(setState); };
   useEffect(() => {
     load();
@@ -1970,23 +2164,35 @@ function CompactSidePane(props) {
       jsxs("div", {
         className: "flex items-center justify-between gap-2",
         children: [
-          jsx(Badge, { variant: liveCount > 0 ? "success" : "muted", children: liveCount > 0 ? liveCount + " engine(s) live" : "No engine active" }),
-          jsx(Button, { size: "xs", onClick: () => host.navigate(MODEL_FORGE_ROUTE), children: "Open Full View" }),
+          jsx(Badge, { variant: liveCount > 0 ? "success" : "muted", children: liveCount > 0 ? plural(liveCount, "engine", "engines") + " live" : "No engine active" }),
+          jsx(Button, { size: "xs", variant: "secondary", onClick: () => host.navigate(MODEL_FORGE_ROUTE), children: "Open Full View" }),
         ],
       }),
-      ...targets.map((t) => jsxs(Card, {
-        key: t.id,
-        className: "p-2.5 text-xs",
-        children: [
-          jsx("div", { className: "font-semibold text-(--ui-text-primary)", children: t.label || t.id }),
-          jsx("div", { className: "text-[11px] text-(--ui-text-tertiary)", children: t.base_url }),
-          ...((t.engines || []).filter((e) => e.available)).map((e, i) => jsxs("div", {
-            key: "e-" + i,
-            className: "mt-1 flex items-center gap-1.5 text-[11px] text-(--ui-text-secondary)",
-            children: [jsx(StatusDot, { tone: "good" }), e.name, e.detail ? " · " + e.detail : ""],
-          })),
-        ],
-      })),
+      ...targets.map((t) => {
+        const liveEngines = (t.engines || []).filter((e) => e.available);
+        return jsxs(Card, {
+          key: t.id,
+          className: "p-2.5 text-xs",
+          children: [
+            jsxs("div", {
+              className: "flex items-center justify-between gap-1.5",
+              children: [
+                jsx("div", { className: "truncate font-semibold text-(--ui-text-primary)", children: t.label || t.id }),
+                t.hardware && t.hardware.total_vram_gb ? jsx(Badge, { variant: "outline", size: "xs", children: t.hardware.total_vram_gb + " GB" }) : null,
+              ],
+            }),
+            jsx("div", { className: "truncate text-[11px] text-(--ui-text-tertiary)", children: t.base_url }),
+            ...liveEngines.map((e, i) => jsxs("div", {
+              key: "e-" + i,
+              className: "mt-1.5 flex min-w-0 items-center gap-1.5 text-[11px] text-(--ui-text-secondary)",
+              children: [
+                jsx(SafeDot, { tone: "good" }),
+                jsx("span", { className: "truncate", children: engineDisplayName(e) + " · " + engineShortStatus(e) }),
+              ],
+            })),
+          ],
+        });
+      }),
       jsx(ResourceView, { ctx }),
     ],
   });
