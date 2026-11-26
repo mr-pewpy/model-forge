@@ -83,7 +83,7 @@ One Model Forge experience on every Hermes surface:
 
 | Surface | What you get |
 |---|---|
-| **Desktop app** | Full `/model-forge` workspace page, sidebar nav entry, `Settings -> Plugins -> Model Forge` pages, and dockable cockpit pane — guided GPU/cloud/engine connection wizards (no raw JSON), in-GUI Hugging Face token setup (`model.save_key`), 5-package suite status, live engine models with one-click Hermes wiring, modality catalog with fit verdicts, installed storage + quiet collapsed Resource view, and broker residency. |
+| **Desktop app** | Unified package (`model-forge/desktop/plugin.js` beside `dashboard/plugin_api.py`): one install ships the full `/model-forge` workspace page (with a first-run quickstart hero), sidebar nav entry, `Settings -> Plugins -> Model Forge` pages, and dockable side pane. Uses `ctx.rest('/api/plugins/model-forge/*')` directly — zero browser CORS failures, zero chat-session limits, zero `shell.exec`, inline Hugging Face search, active pull progress, smart Start/Install/Connect engine cards, direct ComfyUI piping, and quiet collapsed Resource view. |
 | **Telegram** (and other gateway chats) | The `/model-forge` command — `cockpit`, `models [modality]`, `storage` (JSON rows) and `status`, `browse [modality]`, `broker`, `claim`, `release`, `swap`, `help` (plain-text rows built for chat) — plus every tool through the agent. |
 | **CLI / TUI** | The same `/model-forge` command and tools; model switching is core (`/model`, `hermes model`). |
 | **Web dashboard** | The Model Forge tab (`model-forge/dashboard/`): the same cockpit data — targets, engines, models, storage — as a read-only snapshot. |
@@ -440,22 +440,28 @@ alternative, and what would unblock each item — is in
   directory and in your engine-managed model directories (the Ollama models
   dir and the HuggingFace hub cache under your home directory);
   `model_forge_storage` with `action=delete` removes the user-approved files
-  and folders from those roots. The `/model-forge` cockpit command and the
-  dashboard tab are read-only: they return the same inventory data (never
-  delete or write) and issue the same read-only engine probes. The Desktop
-  plugin (`model-forge-desktop`) reads local host facts (`machine.facts`),
-  plugin settings/suite status (`plugins.manage`), and tool-registered targets
-  (read-only shell read), saves user-submitted target/engine/media settings via
-  `plugins.manage settings`, saves or removes `HF_TOKEN` via Hermes' official
-  `model.save_key` / `model.disconnect` credential routes, and routes
-  destructive deletes, engine installers, and model activations to Hermes chat
-  behind the human-approval gate. Your Hermes config is written only after
-  explicit approval: an approved activation writes the `model:` section plus a
-  `custom_providers` entry, and when activating vision, image, or video models
-  also writes `auxiliary.vision`, `image_gen` + `model-forge-image`, or
-  `video_gen` + `model-forge-video` (see Approvals); the `model-forge-providers`
-  package's `hermes model` setup step writes the chat sections after you pick
-  a model interactively.
+  and folders from those roots. The `/model-forge` cockpit command, the
+  dashboard tab, and the read-only `/api/plugins/model-forge/*` REST routes
+  (`/cockpit`, `/browse`, `POST /probe` with cloud-metadata host blocking,
+  `/jobs`, `/engines/local-cli`, `/residency`, `/resources`) perform reads only.
+  The unified Desktop UI (`model-forge/desktop/plugin.js`) uses `ctx.rest(...)`
+  with zero `shell.exec` and zero browser CORS probes, saves user-submitted
+  target/engine/media settings via `plugins.manage settings`, saves or removes
+  `HF_TOKEN` via Hermes' official `model.save_key` / `model.disconnect`
+  credential routes, and routes destructive deletes, engine installers, local
+  engine launches, and model activations to Hermes chat behind the
+  human-approval gate. The standalone companion `model-forge-desktop` remains
+  available for backward compatibility. Built-in `image_generate` and
+  `video_generate` providers in `model-forge` (and standalone
+  `model-forge-image` / `model-forge-video`) support both OpenAI `/v1` APIs
+  and direct ComfyUI `/prompt` workflows without a separate facade daemon. Your
+  Hermes config is written only after explicit approval: an approved activation
+  writes the `model:` section plus a `custom_providers` entry, and when
+  activating vision, image, or video models also writes `auxiliary.vision`,
+  `image_gen` + `model-forge-image`, or `video_gen` + `model-forge-video`
+  (mirrored onto `model-forge` settings for single-package installs); the
+  `model-forge-providers` package's `hermes model` setup step writes the chat
+  sections after you pick a model interactively.
 - **Approvals:** actions escalate to Hermes' human-approval gate and
   fail closed on denial or timeout — registering a compute target, writing
   Hermes model/provider config (`model.*`, `custom_providers`, `auxiliary.vision`,
@@ -465,7 +471,10 @@ alternative, and what would unblock each item — is in
   the prompt names the exact path and size), running a vendor engine
   installer (`model_forge_install` with `action=engine_install`,
   `execute=true`; the prompt shows the exact command, and denial or
-  timeout runs nothing), and any call that would START or RE-START an
+  timeout runs nothing), launching an installed local engine
+  (`model_forge_install` with `action=engine_start`, `execute=true` — loopback
+  `127.0.0.1` only, minimal env, provenance-tracked stop via
+  `action=engine_stop`), and any call that would START or RE-START an
   engine server process — a `model_forge_broker` `claim`/`swap`, a
   `release` whose restore re-loads a non-resident llama.cpp/vLLM model, or
   a `model_forge_generate_media` job whose GPU-lane claim/release would

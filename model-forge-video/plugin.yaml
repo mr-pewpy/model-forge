@@ -1,8 +1,8 @@
 name: model-forge-video
 kind: backend
-version: 1.3.1
+version: 2.0.0
 requires_hermes: ">=0.23.0"
-description: "Model Forge local video generation backend — routes video_generate to any OpenAI-compatible video job API (media gateways, engines with /v1/videos). Disclosure: sends prompts (and optional image inputs) to the single endpoint you configure, reads that endpoint's /models listing to resolve a default model, and polls its video job routes until the job settles. No other network, no telemetry."
+description: "Model Forge local video generation backend — routes video_generate to either a raw ComfyUI endpoint (native /prompt workflows, no separate facade required) or any OpenAI-compatible video job API (media gateways, engines with /v1/videos). Disclosure: sends prompts (and optional image inputs) to the single endpoint you configure, reads its /models or /system_stats listing, and polls its job routes until settled. No other network, no telemetry."
 author: anai (Pewpy)
 license: MIT
 python_dependencies:

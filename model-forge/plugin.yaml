@@ -1,21 +1,26 @@
 name: model-forge
-version: 1.3.1
+version: 2.0.0
 requires_hermes: ">=0.23.0"
 description: >-
-  Local models for every modality. Find your GPU, pick a model — chat, vision,
-  image, image edit, video, 3D, music, SFX, voice, OCR — and Model Forge finds
-  the right inference engine, pulls the model (or hands you the exact run
-  command), and wires it into
-  Hermes. Disclosure: probes only the engine endpoints you configure
-  (compute targets and declared engine endpoints) and the public HuggingFace
-  API; downloads model files into the plugin data dir (optional extra
-  download roots in settings) or triggers native HTTP pulls on your running
-  Ollama / Project Maya target; writes your Hermes config (default model,
-  custom_providers, auxiliary.vision, image_gen/model-forge-image, and
-  video_gen/model-forge-video) only after human approval — the same gate covers
-  target registration, storage deletion, and vendor engine installers.
-  Optional Hugging Face / ModelScope tokens are sent to their own hosts
-  only. No telemetry.
+  Unified local-AI platform for Hermes — one install ships all 8 tools, the
+  native Hermes Desktop workspace (/model-forge, Settings -> Plugins, side
+  pane, backend REST API with zero CORS or chat-session limits), and built-in
+  image_generate / video_generate providers supporting both OpenAI /v1 APIs
+  and direct ComfyUI /prompt workflows. Find your GPU, connect LAN or cloud
+  GPUs without JSON, search/pull models across every modality and engine
+  (llama.cpp, Ollama, Strata, Project Maya, vLLM, SGLang, ComfyUI, Exo), and
+  pipe them natively into Hermes. Disclosure: probes only user-configured
+  endpoints (refusing cloud metadata hosts) and the public HuggingFace API
+  (disabled with fresh=false); downloads weights into plugin data dir (or
+  extra download roots) or runs HTTP /api/pull on your Ollama / Maya target;
+  Desktop UI saves user-submitted settings via plugins.manage settings and
+  saves/removes HF_TOKEN via Hermes' model.save_key / model.disconnect; writes
+  Hermes config (model.*, custom_providers, auxiliary.vision, image_gen,
+  video_gen), registers targets, deletes storage, runs pinned checksum-verified
+  vendor installers, and launches loopback-only (127.0.0.1) local engines
+  (ollama, exo, vllm — minimal env, provenance-tracked stop) only after human
+  approval. Optional HF / ModelScope tokens are sent only to their own hosts.
+  No telemetry.
 author: anai (Pewpy)
 license: MIT
 config_schema:
@@ -45,6 +50,31 @@ config_schema:
       alongside auto-detected engines. Use Compute targets above when the
       machine's GPU/VRAM should price model fit; use this field when you
       only have an engine URL.
+  image_base_url:
+    type: str
+    default: ""
+    label: "Image generation endpoint URL (optional)"
+    description: >-
+      Base URL for native image_generate via Model Forge — either an OpenAI-
+      compatible /v1 images API (vLLM-Omni, SGLang Diffusion, media facade)
+      or a raw ComfyUI URL (e.g. http://127.0.0.1:8188).
+  image_default_model:
+    type: str
+    default: ""
+    label: "Default image model or workflow (optional)"
+    description: "Default image model/workflow id when none is named."
+  video_base_url:
+    type: str
+    default: ""
+    label: "Video generation endpoint URL (optional)"
+    description: >-
+      Base URL for native video_generate via Model Forge — either an OpenAI-
+      compatible /v1 videos API or a raw ComfyUI URL (e.g. http://127.0.0.1:8188).
+  video_default_model:
+    type: str
+    default: ""
+    label: "Default video model or workflow (optional)"
+    description: "Default video model/workflow id when none is named."
   download_roots:
     type: list
     default: []
